@@ -48,26 +48,36 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   useEffect(() => {
     const getProfile = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { router.push("/login"); return; }
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) { router.push("/login"); return; }
 
-      const { data, error } = await supabase
-        .from("profiles")
-        .select("full_name, role")
-        .eq("id", user.id)
-        .single();
+        const { data, error } = await supabase
+          .from("profiles")
+          .select("full_name, role")
+          .eq("id", user.id)
+          .single();
 
-      if (data) {
-        setProfile(data);
-      } else {
-        // Profile doesn't exist — create one with user role
-        const name = user.user_metadata?.full_name || user.user_metadata?.name || user.email?.split("@")[0] || "User";
-        await supabase.from("profiles").insert({
-          id: user.id,
-          full_name: name,
-          role: "user",
-        });
-        setProfile({ full_name: name, role: "user" });
+        if (data) {
+          setProfile(data);
+        } else {
+          // Profile doesn't exist — create one
+          const name = user.user_metadata?.full_name || user.user_metadata?.name || user.email?.split("@")[0] || "User";
+          const { error: insertErr } = await supabase.from("profiles").insert({
+            id: user.id,
+            full_name: name,
+            role: "user",
+          });
+          if (!insertErr) {
+            setProfile({ full_name: name, role: "user" });
+          } else {
+            // Insert failed — show with email as fallback
+            setProfile({ full_name: user.email || "User", role: "user" });
+          }
+        }
+      } catch {
+        // Graceful fallback
+        setProfile({ full_name: "User", role: "user" });
       }
     };
     getProfile();

@@ -125,7 +125,7 @@ export default function MapView({ center, incidents, destination, constructionZo
         })} />
 
         {/* Construction Zones */}
-        {constructionZones.map((zone) => (
+        {constructionZones.filter((z) => z.lat != null && z.lng != null).map((zone) => (
           <div key={zone.id}>
             <Circle center={[zone.lat, zone.lng]} radius={200} pathOptions={{ color: "#F97316", fillColor: "#F97316", fillOpacity: 0.2, weight: 2, dashArray: "5,5" }} />
             <Marker position={[zone.lat, zone.lng]} icon={L.divIcon({
@@ -139,7 +139,7 @@ export default function MapView({ center, incidents, destination, constructionZo
         ))}
 
         {/* Incidents */}
-        {incidents.map((inc) => (
+        {incidents.filter((inc) => inc.latitude != null && inc.longitude != null).map((inc) => (
           <div key={inc.id}>
             <Circle center={[inc.latitude, inc.longitude]} radius={inc.severity === "critical" ? 500 : inc.severity === "major" ? 300 : 150}
               pathOptions={{

@@ -225,7 +225,7 @@ export default function MapContent() {
             ))}
 
           {showIncidents &&
-            incidents.map((incident) => (
+            incidents.filter((i) => i.latitude != null && i.longitude != null).map((incident) => (
               <Marker
                 key={`inc-${incident.id}`}
                 position={[incident.latitude, incident.longitude]}

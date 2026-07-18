@@ -74,23 +74,18 @@ export default function UserDashboard() {
   // Fetch incidents + construction zones
   useEffect(() => {
     const fetchAll = async () => {
-      const [incidentsRes, constructionsRes] = await Promise.all([
-        supabase
-          .from("incidents")
-          .select("*")
-          .in("status", ["detected", "acknowledged", "responding"])
-          .order("created_at", { ascending: false })
-          .limit(50),
-        supabase
-          .from("construction_zones")
-          .select("*")
-          .eq("is_active", true),
-      ]);
+      // Fetch incidents
+      const { data: incData } = await supabase
+        .from("incidents")
+        .select("*")
+        .in("status", ["detected", "acknowledged", "responding"])
+        .order("created_at", { ascending: false })
+        .limit(50);
 
-      if (incidentsRes.data) {
-        setIncidents(incidentsRes.data);
+      if (incData) {
+        setIncidents(incData.filter((i: any) => i.latitude != null && i.longitude != null));
         if (userLocation) {
-          const withDist = incidentsRes.data.map((inc) => ({
+          const withDist = incData.filter((i: any) => i.latitude != null && i.longitude != null).map((inc: any) => ({
             ...inc,
             distance: calcDistance(userLocation.lat, userLocation.lng, inc.latitude, inc.longitude),
           }));
@@ -99,8 +94,15 @@ export default function UserDashboard() {
         }
       }
 
-      if (constructionsRes.data) {
-        setConstructionZones(constructionsRes.data);
+      // Fetch construction zones separately (table may not exist)
+      try {
+        const { data: czData } = await supabase
+          .from("construction_zones")
+          .select("*")
+          .eq("is_active", true);
+        if (czData) setConstructionZones(czData);
+      } catch {
+        // Table doesn't exist yet, ignore
       }
     };
 
@@ -110,6 +112,7 @@ export default function UserDashboard() {
       .channel("user-incidents")
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "incidents" }, (payload) => {
         const inc = payload.new as Incident;
+        if (inc.latitude == null || inc.longitude == null) return;
         setIncidents((prev) => [inc, ...prev]);
         if (userLocation) {
           const dist = calcDistance(userLocation.lat, userLocation.lng, inc.latitude, inc.longitude);
