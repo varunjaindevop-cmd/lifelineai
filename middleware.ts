@@ -34,13 +34,7 @@ export async function middleware(request: NextRequest) {
   const publicRoutes = ["/login", "/register", "/", "/forgot-password", "/auth/callback"];
   if (publicRoutes.includes(pathname)) {
     if (user) {
-      // Redirect logged-in users to their role dashboard
-      const { data: profile } = await supabase
-        .from("profiles")
-        .select("role")
-        .eq("id", user.id)
-        .single();
-      const role = profile?.role || "user";
+      const role = await getRole(supabase, user.id);
       return NextResponse.redirect(new URL(`/${role}`, request.url));
     }
     return supabaseResponse;
@@ -50,15 +44,8 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(new URL("/login", request.url));
   }
 
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("role")
-    .eq("id", user.id)
-    .single();
+  const role = await getRole(supabase, user.id);
 
-  const role = profile?.role || "user";
-
-  // Role-based routing
   const roleDefaultPage: Record<string, string> = {
     user: "/user",
     ambulance: "/ambulance",
@@ -83,6 +70,35 @@ export async function middleware(request: NextRequest) {
   }
 
   return supabaseResponse;
+}
+
+async function getRole(supabase: any, userId: string): Promise<string> {
+  try {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("role")
+      .eq("id", userId)
+      .single();
+
+    if (error || !data) {
+      // Profile doesn't exist — check if user email matches known roles
+      const { data: { user } } = await supabase.auth.getUser();
+      const email = user?.email || "";
+
+      // Create profile with default role
+      await supabase.from("profiles").insert({
+        id: userId,
+        full_name: user?.user_metadata?.full_name || user?.user_metadata?.name || email.split("@")[0],
+        role: "user",
+      }).catch(() => {});
+
+      return "user";
+    }
+
+    return data.role || "user";
+  } catch {
+    return "user";
+  }
 }
 
 export const config = {
