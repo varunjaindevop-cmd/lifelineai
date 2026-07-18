@@ -184,20 +184,17 @@ export default function UserDashboard() {
               <p className="text-xs text-muted-foreground">Alert authorities</p>
             </div>
           </button>
-          <a
-            href={`https://www.google.com/maps/@${userLocation?.lat || 22.7196},${userLocation?.lng || 75.8577},14z`}
-            target="_blank"
-            rel="noopener noreferrer"
+          <button
             className="bg-card p-4 rounded-xl border border-border flex items-center gap-3 hover:border-primary/50 transition-colors"
           >
-            <div className="w-10 h-10 bg-primary/20 rounded-lg flex items-center justify-center">
-              <Navigation className="w-5 h-5 text-primary" />
+            <div className="w-10 h-10 bg-green-500/20 rounded-lg flex items-center justify-center">
+              <Shield className="w-5 h-5 text-green-500" />
             </div>
             <div className="text-left">
-              <p className="font-medium text-sm">Open GPS</p>
-              <p className="text-xs text-muted-foreground">Navigate with Maps</p>
+              <p className="font-medium text-sm">Safety Zones</p>
+              <p className="text-xs text-muted-foreground">View safe areas</p>
             </div>
-          </a>
+          </button>
         </div>
 
         {/* Nearby Incidents */}
@@ -219,15 +216,12 @@ export default function UserDashboard() {
                       {inc.distance.toFixed(1)} km away • {new Date(inc.created_at).toLocaleTimeString()}
                     </p>
                   </div>
-                  <a
-                    href={`https://www.google.com/maps/dir/?api=1&destination=${inc.latitude},${inc.longitude}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
+                  <button
                     className="px-3 py-1.5 bg-primary/20 text-primary rounded-lg text-xs flex items-center gap-1 flex-shrink-0"
                   >
                     <Navigation size={12} />
-                    Go
-                  </a>
+                    Route
+                  </button>
                 </div>
               ))}
             </div>
