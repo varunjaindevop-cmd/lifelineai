@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import {
-  MapPin, AlertTriangle, Shield, Bell, Navigation, X, Plus, Send, Phone
+  MapPin, AlertTriangle, Shield, Bell, Navigation, X, Plus, Send, Phone, Search, Loader2, Construction
 } from "lucide-react";
 import { toast } from "sonner";
 import dynamic from "next/dynamic";
@@ -25,6 +25,20 @@ interface NearbyIncident extends Incident {
   distance: number;
 }
 
+interface SearchResult {
+  display_name: string;
+  lat: string;
+  lon: string;
+  type: string;
+}
+
+interface Construction {
+  id: string;
+  lat: number;
+  lng: number;
+  label: string;
+}
+
 export default function UserDashboard() {
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [nearby, setNearby] = useState<NearbyIncident[]>([]);
@@ -33,8 +47,19 @@ export default function UserDashboard() {
   const [reportType, setReportType] = useState("accident");
   const [reportDesc, setReportDesc] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
+  // Search state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [selectedDestination, setSelectedDestination] = useState<{ lat: number; lng: number; name: string } | null>(null);
+
+  // Construction zones
+  const [constructionZones, setConstructionZones] = useState<Construction[]>([]);
+
   const supabase = createClient();
 
+  // Get user location
   useEffect(() => {
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
@@ -46,19 +71,26 @@ export default function UserDashboard() {
     }
   }, []);
 
+  // Fetch incidents + construction zones
   useEffect(() => {
-    const fetchIncidents = async () => {
-      const { data } = await supabase
-        .from("incidents")
-        .select("*")
-        .in("status", ["detected", "acknowledged", "responding"])
-        .order("created_at", { ascending: false })
-        .limit(50);
+    const fetchAll = async () => {
+      const [incidentsRes, constructionsRes] = await Promise.all([
+        supabase
+          .from("incidents")
+          .select("*")
+          .in("status", ["detected", "acknowledged", "responding"])
+          .order("created_at", { ascending: false })
+          .limit(50),
+        supabase
+          .from("construction_zones")
+          .select("*")
+          .eq("is_active", true),
+      ]);
 
-      if (data) {
-        setIncidents(data);
+      if (incidentsRes.data) {
+        setIncidents(incidentsRes.data);
         if (userLocation) {
-          const withDist = data.map((inc) => ({
+          const withDist = incidentsRes.data.map((inc) => ({
             ...inc,
             distance: calcDistance(userLocation.lat, userLocation.lng, inc.latitude, inc.longitude),
           }));
@@ -66,9 +98,13 @@ export default function UserDashboard() {
           setNearby(withDist.filter((i) => i.distance < 10));
         }
       }
+
+      if (constructionsRes.data) {
+        setConstructionZones(constructionsRes.data);
+      }
     };
 
-    fetchIncidents();
+    fetchAll();
 
     const channel = supabase
       .channel("user-incidents")
@@ -87,6 +123,7 @@ export default function UserDashboard() {
     return () => { supabase.removeChannel(channel); };
   }, [userLocation]);
 
+  // Recalculate nearby
   useEffect(() => {
     if (userLocation && incidents.length > 0) {
       const withDist = incidents.map((inc) => ({
@@ -97,6 +134,39 @@ export default function UserDashboard() {
       setNearby(withDist.filter((i) => i.distance < 10));
     }
   }, [userLocation, incidents]);
+
+  // Search locations using Nominatim (free, no API key)
+  const handleSearch = useCallback(async (query: string) => {
+    if (query.length < 3) { setSearchResults([]); return; }
+    setSearching(true);
+    try {
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query + " Indore")}&format=json&limit=5&addressdetails=1`,
+        { headers: { "User-Agent": "LifelineAI/1.0" } }
+      );
+      const data = await res.json();
+      setSearchResults(data);
+    } catch {
+      setSearchResults([]);
+    }
+    setSearching(false);
+  }, []);
+
+  // Debounced search
+  useEffect(() => {
+    const timer = setTimeout(() => handleSearch(searchQuery), 400);
+    return () => clearTimeout(timer);
+  }, [searchQuery, handleSearch]);
+
+  const selectSearchResult = (result: SearchResult) => {
+    setSelectedDestination({
+      lat: parseFloat(result.lat),
+      lng: parseFloat(result.lon),
+      name: result.display_name.split(",")[0],
+    });
+    setSearchResults([]);
+    setSearchQuery(result.display_name.split(",")[0]);
+  };
 
   const calcDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
     const R = 6371;
@@ -146,11 +216,54 @@ export default function UserDashboard() {
         </div>
       </div>
 
-      {/* Map Container - Fixed height, not full screen */}
+      {/* Map Container */}
       <div className="h-[45vh] relative flex-shrink-0">
-        <MapView center={userLocation || { lat: 22.7196, lng: 75.8577 }} incidents={incidents} />
+        {/* Search Bar - Floating on Map */}
+        <div className="absolute top-3 left-3 right-3 z-[1000]">
+          <div className="bg-card/95 backdrop-blur-sm border border-border rounded-xl shadow-lg">
+            <div className="flex items-center gap-2 px-3 py-2">
+              <Search size={18} className="text-muted-foreground flex-shrink-0" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => { setSearchQuery(e.target.value); setSelectedDestination(null); }}
+                placeholder="Search location in Indore..."
+                className="flex-1 bg-transparent text-sm outline-none"
+              />
+              {searching && <Loader2 size={16} className="animate-spin text-muted-foreground" />}
+              {searchQuery && (
+                <button onClick={() => { setSearchQuery(""); setSearchResults([]); setSelectedDestination(null); }}>
+                  <X size={16} className="text-muted-foreground" />
+                </button>
+              )}
+            </div>
 
-        {/* Floating Safety Badge */}
+            {/* Search Results */}
+            {searchResults.length > 0 && (
+              <div className="border-t border-border max-h-48 overflow-auto">
+                {searchResults.map((result, i) => (
+                  <button
+                    key={i}
+                    onClick={() => selectSearchResult(result)}
+                    className="w-full px-4 py-2.5 text-left hover:bg-background transition-colors flex items-center gap-2 text-sm"
+                  >
+                    <MapPin size={14} className="text-muted-foreground flex-shrink-0" />
+                    <span className="truncate">{result.display_name.split(",").slice(0, 3).join(", ")}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <MapView
+          center={userLocation || { lat: 22.7196, lng: 75.8577 }}
+          incidents={incidents}
+          destination={selectedDestination}
+          constructionZones={constructionZones}
+        />
+
+        {/* Safety Badge */}
         <div className="absolute bottom-3 left-3 right-3 z-10">
           <div className="bg-card/95 backdrop-blur-sm border border-border rounded-xl px-4 py-3 shadow-lg flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -164,37 +277,44 @@ export default function UserDashboard() {
                 </p>
               </div>
             </div>
+            {constructionZones.length > 0 && (
+              <span className="px-2 py-1 bg-severity-major/20 text-severity-major rounded text-xs flex items-center gap-1">
+                <Construction size={12} />
+                {constructionZones.length} road work
+              </span>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Scrollable Content Below Map */}
+      {/* Scrollable Content */}
       <div className="flex-1 overflow-auto p-4 space-y-4">
         {/* Quick Actions */}
-        <div className="grid grid-cols-2 gap-3">
-          <button
-            onClick={() => setShowReport(true)}
-            className="bg-card p-4 rounded-xl border border-border flex items-center gap-3 hover:border-primary/50 transition-colors"
-          >
-            <div className="w-10 h-10 bg-severity-critical/20 rounded-lg flex items-center justify-center">
-              <AlertTriangle className="w-5 h-5 text-severity-critical" />
-            </div>
-            <div className="text-left">
-              <p className="font-medium text-sm">Report Incident</p>
-              <p className="text-xs text-muted-foreground">Alert authorities</p>
-            </div>
+        <div className="grid grid-cols-3 gap-3">
+          <button onClick={() => setShowReport(true)} className="bg-card p-3 rounded-xl border border-border flex flex-col items-center gap-1 hover:border-primary/50 transition-colors">
+            <AlertTriangle className="w-5 h-5 text-severity-critical" />
+            <p className="text-xs font-medium">Report</p>
           </button>
-          <button
-            className="bg-card p-4 rounded-xl border border-border flex items-center gap-3 hover:border-primary/50 transition-colors"
-          >
-            <div className="w-10 h-10 bg-green-500/20 rounded-lg flex items-center justify-center">
-              <Shield className="w-5 h-5 text-green-500" />
-            </div>
-            <div className="text-left">
-              <p className="font-medium text-sm">Safety Zones</p>
-              <p className="text-xs text-muted-foreground">View safe areas</p>
-            </div>
+          <button className="bg-card p-3 rounded-xl border border-border flex flex-col items-center gap-1 hover:border-primary/50 transition-colors">
+            <Shield className="w-5 h-5 text-green-500" />
+            <p className="text-xs font-medium">Safe Zones</p>
           </button>
+          <button className="bg-card p-3 rounded-xl border border-border flex flex-col items-center gap-1 hover:border-primary/50 transition-colors">
+            <Construction className="w-5 h-5 text-severity-major" />
+            <p className="text-xs font-medium">Road Work</p>
+          </button>
+        </div>
+
+        {/* Map Legend */}
+        <div className="bg-card p-3 rounded-xl border border-border">
+          <p className="text-xs font-medium mb-2 text-muted-foreground">MAP LEGEND</p>
+          <div className="flex flex-wrap gap-3 text-xs">
+            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-severity-critical" /> Critical</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-severity-major" /> Major</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-severity-minor" /> Minor</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-primary" /> You</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-severity-major" style={{ borderRadius: "2px" }} /> Road Work</span>
+          </div>
         </div>
 
         {/* Nearby Incidents */}
@@ -217,6 +337,7 @@ export default function UserDashboard() {
                     </p>
                   </div>
                   <button
+                    onClick={() => setSelectedDestination({ lat: inc.latitude, lng: inc.longitude, name: inc.incident_type.replace(/_/g, " ") })}
                     className="px-3 py-1.5 bg-primary/20 text-primary rounded-lg text-xs flex items-center gap-1 flex-shrink-0"
                   >
                     <Navigation size={12} />
@@ -245,6 +366,7 @@ export default function UserDashboard() {
                   <option value="fire">Fire</option>
                   <option value="medical">Medical Emergency</option>
                   <option value="suspicious">Suspicious Activity</option>
+                  <option value="construction">Road Work / Construction</option>
                 </select>
               </div>
               <div>
