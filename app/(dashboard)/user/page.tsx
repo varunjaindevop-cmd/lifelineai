@@ -93,7 +93,9 @@ export default function UserDashboard() {
       })
       .subscribe();
 
-    return () => supabase.removeChannel(channel);
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, [userLocation]);
 
   // Recalculate nearby when location changes

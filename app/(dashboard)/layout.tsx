@@ -51,13 +51,24 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { router.push("/login"); return; }
 
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from("profiles")
         .select("full_name, role")
         .eq("id", user.id)
         .single();
 
-      if (data) setProfile(data);
+      if (data) {
+        setProfile(data);
+      } else {
+        // Profile doesn't exist — create one with user role
+        const name = user.user_metadata?.full_name || user.user_metadata?.name || user.email?.split("@")[0] || "User";
+        await supabase.from("profiles").insert({
+          id: user.id,
+          full_name: name,
+          role: "user",
+        });
+        setProfile({ full_name: name, role: "user" });
+      }
     };
     getProfile();
   }, []);

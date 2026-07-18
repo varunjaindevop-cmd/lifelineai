@@ -68,7 +68,9 @@ export default function AmbulanceDashboard() {
       )
       .subscribe();
 
-    return () => supabase.removeChannel(channel);
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, []);
 
   const handleRespond = async (incidentId: string) => {

@@ -66,7 +66,9 @@ export default function AdminDashboard() {
       })
       .subscribe();
 
-    return () => supabase.removeChannel(channel);
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, []);
 
   const statCards = [
