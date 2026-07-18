@@ -109,7 +109,7 @@ export default function MapContent() {
     if (incidents.length > 0) {
       return [incidents[0].latitude, incidents[0].longitude] as [number, number];
     }
-    return [28.6139, 77.209] as [number, number];
+    return [22.7196, 75.8577] as [number, number];
   }, [cameras, incidents]);
 
   const getIncidentIcon = (severity: string) => {

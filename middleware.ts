@@ -31,42 +31,55 @@ export async function middleware(request: NextRequest) {
 
   const pathname = request.nextUrl.pathname;
 
-  // Public routes
-  const publicRoutes = ["/login", "/register", "/", "/forgot-password", "/reset-password", "/auth/callback"];
+  const publicRoutes = ["/login", "/register", "/", "/forgot-password", "/auth/callback"];
   if (publicRoutes.includes(pathname)) {
     if (user) {
-      return NextResponse.redirect(new URL("/admin", request.url));
+      // Redirect logged-in users to their role dashboard
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("role")
+        .eq("id", user.id)
+        .single();
+      const role = profile?.role || "user";
+      return NextResponse.redirect(new URL(`/${role}`, request.url));
     }
     return supabaseResponse;
   }
 
-  // Protected routes — require auth
   if (!user) {
     return NextResponse.redirect(new URL("/login", request.url));
   }
 
-  // Get user role
   const { data: profile } = await supabase
     .from("profiles")
     .select("role")
     .eq("id", user.id)
     .single();
 
-  const role = profile?.role || "admin";
+  const role = profile?.role || "user";
 
-  // Role-based route protection
+  // Role-based routing
+  const roleDefaultPage: Record<string, string> = {
+    user: "/user",
+    ambulance: "/ambulance",
+    admin: "/admin",
+    police: "/admin",
+    hospital: "/hospital",
+  };
+
   const roleRoutes: Record<string, string[]> = {
+    user: ["/user"],
+    ambulance: ["/ambulance", "/incidents"],
     admin: ["/admin", "/cameras", "/incidents", "/map"],
-    ambulance: ["/ambulance", "/incidents", "/map"],
-    police: ["/police", "/incidents", "/map"],
+    police: ["/admin", "/incidents", "/map"],
     hospital: ["/hospital", "/incidents"],
   };
 
-  const allowedRoutes = roleRoutes[role] || ["/admin"];
+  const allowedRoutes = roleRoutes[role] || ["/user"];
   const isAllowed = allowedRoutes.some((route) => pathname.startsWith(route));
 
   if (!isAllowed) {
-    return NextResponse.redirect(new URL(`/${role}`, request.url));
+    return NextResponse.redirect(new URL(roleDefaultPage[role] || "/user", request.url));
   }
 
   return supabaseResponse;

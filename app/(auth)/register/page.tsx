@@ -54,7 +54,7 @@ export default function RegisterPage() {
       const { error: profileError } = await supabase.from("profiles").insert({
         id: authData.user.id,
         full_name: fullName,
-        role: "admin",
+        role: "user",
       });
 
       if (profileError) {

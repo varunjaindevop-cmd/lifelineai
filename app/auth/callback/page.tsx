@@ -20,7 +20,6 @@ export default function AuthCallbackPage() {
 
       const user = data.session.user;
 
-      // Check if profile exists
       const { data: profile } = await supabase
         .from("profiles")
         .select("role")
@@ -28,16 +27,21 @@ export default function AuthCallbackPage() {
         .single();
 
       if (!profile) {
-        // New user from Google — create profile with default role
         await supabase.from("profiles").insert({
           id: user.id,
           full_name: user.user_metadata?.full_name || user.user_metadata?.name || "User",
-          role: "admin",
+          role: "user",
         });
-        router.push("/admin");
+        router.push("/user");
       } else {
-        // Existing user — go to their role dashboard
-        router.push(`/${profile.role}`);
+        const routeMap: Record<string, string> = {
+          user: "/user",
+          ambulance: "/ambulance",
+          admin: "/admin",
+          police: "/admin",
+          hospital: "/hospital",
+        };
+        router.push(routeMap[profile.role] || "/user");
       }
 
       router.refresh();
