@@ -32,7 +32,7 @@ export async function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
 
   // Public routes
-  const publicRoutes = ["/login", "/register", "/"];
+  const publicRoutes = ["/login", "/register", "/", "/forgot-password", "/reset-password"];
   if (publicRoutes.includes(pathname)) {
     if (user) {
       return NextResponse.redirect(new URL("/admin", request.url));
