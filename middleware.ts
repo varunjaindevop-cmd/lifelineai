@@ -1,6 +1,10 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
+// Known admin/ambulance emails (fallback if profile query fails)
+const ADMIN_EMAILS = ["varunjaindevop@gmail.com"];
+const AMBULANCE_EMAILS = ["varunnnnjain@gmail.com"];
+
 export async function middleware(request: NextRequest) {
   let supabaseResponse = NextResponse.next({ request });
 
@@ -34,7 +38,7 @@ export async function middleware(request: NextRequest) {
   const publicRoutes = ["/login", "/register", "/", "/forgot-password", "/auth/callback"];
   if (publicRoutes.includes(pathname)) {
     if (user) {
-      const role = await getRole(supabase, user.id);
+      const role = await getRole(supabase, user);
       return NextResponse.redirect(new URL(`/${role}`, request.url));
     }
     return supabaseResponse;
@@ -44,7 +48,7 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(new URL("/login", request.url));
   }
 
-  const role = await getRole(supabase, user.id);
+  const role = await getRole(supabase, user);
 
   const roleDefaultPage: Record<string, string> = {
     user: "/user",
@@ -72,33 +76,27 @@ export async function middleware(request: NextRequest) {
   return supabaseResponse;
 }
 
-async function getRole(supabase: any, userId: string): Promise<string> {
+async function getRole(supabase: any, user: any): Promise<string> {
+  const email = user.email || "";
+
+  // Try to get role from profiles table
   try {
     const { data, error } = await supabase
       .from("profiles")
       .select("role")
-      .eq("id", userId)
-      .single();
+      .eq("id", user.id)
+      .maybeSingle();
 
-    if (error || !data) {
-      // Profile doesn't exist — check if user email matches known roles
-      const { data: { user } } = await supabase.auth.getUser();
-      const email = user?.email || "";
-
-      // Create profile with default role
-      await supabase.from("profiles").insert({
-        id: userId,
-        full_name: user?.user_metadata?.full_name || user?.user_metadata?.name || email.split("@")[0],
-        role: "user",
-      }).catch(() => {});
-
-      return "user";
+    if (!error && data?.role) {
+      return data.role;
     }
+  } catch {}
 
-    return data.role || "user";
-  } catch {
-    return "user";
-  }
+  // Fallback: check known emails
+  if (ADMIN_EMAILS.includes(email)) return "admin";
+  if (AMBULANCE_EMAILS.includes(email)) return "ambulance";
+
+  return "user";
 }
 
 export const config = {
