@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
-import { AlertTriangle, MapPin, Clock, Navigation } from "lucide-react";
+import { AlertTriangle, MapPin, Clock, Navigation, Video, Play } from "lucide-react";
 import { toast } from "sonner";
 import Link from "next/link";
 
@@ -14,12 +14,15 @@ interface Incident {
   longitude: number;
   status: string;
   created_at: string;
-  detection_data: any;
+  video_clip_url?: string;
+  location_name?: string;
+  camera_id?: string;
 }
 
 export default function AmbulanceDashboard() {
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [loading, setLoading] = useState(true);
+  const [playingClip, setPlayingClip] = useState<string | null>(null);
   const supabase = createClient();
 
   useEffect(() => {
@@ -36,44 +39,36 @@ export default function AmbulanceDashboard() {
         .in("status", ["detected", "acknowledged", "responding"])
         .order("created_at", { ascending: false });
 
-      if (data) {
-        setIncidents(data);
-      }
+      if (data) setIncidents(data);
       setLoading(false);
     };
 
     fetchIncidents();
 
-    // Real-time subscription for new incidents
     const channel = supabase
-      .channel("ambulance-incidents")
+      .channel("ambulance-alerts")
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "incidents" },
         (payload) => {
-          const incident = payload.new as Incident;
-          // Only show accident-type incidents
+          const inc = payload.new as Incident;
           const accidentTypes = [
             "vehicle_collision",
             "pedestrian_collision",
             "pedestrian_fall",
             "fire_smoke",
           ];
-          if (accidentTypes.includes(incident.incident_type)) {
-            setIncidents((prev) => [incident, ...prev]);
+          if (accidentTypes.includes(inc.incident_type)) {
+            setIncidents((prev) => [inc, ...prev]);
             toast.error(
-              `🚨 NEW ${incident.severity.toUpperCase()} ${
-                incident.incident_type
-              } — Immediate response required!`
+              `NEW ${inc.severity.toUpperCase()} ${inc.incident_type.replace(/_/g, " ")}`
             );
           }
         }
       )
       .subscribe();
 
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    return () => supabase.removeChannel(channel);
   }, []);
 
   const handleRespond = async (incidentId: string) => {
@@ -94,77 +89,60 @@ export default function AmbulanceDashboard() {
       .eq("id", incidentId);
 
     setIncidents((prev) =>
-      prev.map((i) =>
-        i.id === incidentId ? { ...i, status: "responding" } : i
-      )
+      prev.map((i) => (i.id === incidentId ? { ...i, status: "responding" } : i))
     );
 
     toast.success("Response dispatched!");
   };
 
-  const getSeverityColor = (severity: string) => {
-    const colors: Record<string, string> = {
-      critical: "border-severity-critical bg-severity-critical/10",
-      major: "border-severity-major bg-severity-major/10",
-      minor: "border-severity-minor bg-severity-minor/10",
-    };
-    return colors[severity] || "border-border bg-card";
-  };
+  const critical = incidents.filter((i) => i.severity === "critical").length;
+  const major = incidents.filter((i) => i.severity === "major").length;
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold">Ambulance Dashboard</h1>
         <p className="text-muted-foreground">
-          Active incidents requiring medical response
+          Accident incidents requiring medical response
         </p>
       </div>
 
       {/* Quick Stats */}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-2 gap-4">
         <div className="bg-card p-4 rounded-xl border border-border text-center">
-          <p className="text-3xl font-bold text-severity-critical">
-            {incidents.filter((i) => i.severity === "critical").length}
-          </p>
+          <p className="text-3xl font-bold text-severity-critical">{critical}</p>
           <p className="text-sm text-muted-foreground">Critical</p>
         </div>
         <div className="bg-card p-4 rounded-xl border border-border text-center">
-          <p className="text-3xl font-bold text-severity-major">
-            {incidents.filter((i) => i.severity === "major").length}
-          </p>
+          <p className="text-3xl font-bold text-severity-major">{major}</p>
           <p className="text-sm text-muted-foreground">Major</p>
-        </div>
-        <div className="bg-card p-4 rounded-xl border border-border text-center">
-          <p className="text-3xl font-bold text-primary">
-            {incidents.filter((i) => i.status === "responding").length}
-          </p>
-          <p className="text-sm text-muted-foreground">Responding</p>
         </div>
       </div>
 
-      {/* Incident List */}
-      <div className="space-y-4">
-        {loading ? (
-          <div className="text-center py-12 text-muted-foreground">
-            Loading incidents...
-          </div>
-        ) : incidents.length === 0 ? (
-          <div className="text-center py-12 text-muted-foreground">
-            No active incidents. All clear!
-          </div>
-        ) : (
-          incidents.map((incident) => (
+      {/* Incident Cards */}
+      {loading ? (
+        <div className="text-center py-12 text-muted-foreground">Loading incidents...</div>
+      ) : incidents.length === 0 ? (
+        <div className="text-center py-12 text-muted-foreground">
+          No active incidents. All clear!
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {incidents.map((incident) => (
             <div
               key={incident.id}
-              className={`bg-card p-6 rounded-xl border-l-4 ${getSeverityColor(
-                incident.severity
-              )}`}
+              className={`bg-card p-5 rounded-xl border-l-4 ${
+                incident.severity === "critical"
+                  ? "border-severity-critical"
+                  : "border-severity-major"
+              }`}
             >
-              <div className="flex items-start justify-between">
-                <div className="space-y-2">
+              <div className="flex items-start justify-between gap-4">
+                <div className="space-y-3 flex-1">
+                  {/* Title */}
                   <div className="flex items-center gap-2">
                     <AlertTriangle className="w-5 h-5" />
-                    <h3 className="font-semibold text-lg">
+                    <h3 className="font-semibold text-lg capitalize">
                       {incident.incident_type.replace(/_/g, " ")}
                     </h3>
                     <span
@@ -177,45 +155,71 @@ export default function AmbulanceDashboard() {
                       {incident.severity}
                     </span>
                   </div>
+
+                  {/* Time & Location */}
                   <div className="flex items-center gap-4 text-sm text-muted-foreground">
                     <span className="flex items-center gap-1">
                       <MapPin size={14} />
-                      {incident.latitude.toFixed(4)},{" "}
-                      {incident.longitude.toFixed(4)}
+                      {incident.location_name ||
+                        `${incident.latitude.toFixed(4)}, ${incident.longitude.toFixed(4)}`}
                     </span>
                     <span className="flex items-center gap-1">
                       <Clock size={14} />
                       {new Date(incident.created_at).toLocaleTimeString()}
                     </span>
                   </div>
-                </div>
-                <div className="flex gap-2">
-                  <Link
-                    href={`/map?lat=${incident.latitude}&lng=${incident.longitude}`}
-                    className="px-3 py-2 bg-card border border-border rounded-lg hover:bg-background transition-colors text-sm"
-                  >
-                    <Navigation size={14} className="inline mr-1" />
-                    Navigate
-                  </Link>
-                  {incident.status !== "responding" && (
-                    <button
-                      onClick={() => handleRespond(incident.id)}
-                      className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors text-sm font-medium"
+
+                  {/* 30-Second Clip */}
+                  {incident.video_clip_url ? (
+                    <div className="bg-background rounded-lg overflow-hidden">
+                      <video
+                        src={incident.video_clip_url}
+                        controls
+                        preload="none"
+                        className="w-full max-h-48"
+                      />
+                      <div className="px-3 py-2 text-xs text-muted-foreground flex items-center gap-1">
+                        <Video size={12} />
+                        30-second incident clip (15s before + 15s after detection)
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="bg-background rounded-lg p-4 text-center text-sm text-muted-foreground">
+                      <Video size={20} className="mx-auto mb-1 opacity-50" />
+                      Clip processing...
+                    </div>
+                  )}
+
+                  {/* Actions */}
+                  <div className="flex gap-2">
+                    <Link
+                      href={`https://www.google.com/maps/dir/?api=1&destination=${incident.latitude},${incident.longitude}`}
+                      target="_blank"
+                      className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors text-sm flex items-center gap-2"
                     >
-                      Respond
-                    </button>
-                  )}
-                  {incident.status === "responding" && (
-                    <span className="px-4 py-2 bg-primary/20 text-primary rounded-lg text-sm font-medium">
-                      En Route
-                    </span>
-                  )}
+                      <Navigation size={14} />
+                      Navigate
+                    </Link>
+                    {incident.status !== "responding" && (
+                      <button
+                        onClick={() => handleRespond(incident.id)}
+                        className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors text-sm"
+                      >
+                        Respond
+                      </button>
+                    )}
+                    {incident.status === "responding" && (
+                      <span className="px-4 py-2 bg-primary/20 text-primary rounded-lg text-sm font-medium">
+                        En Route
+                      </span>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
-          ))
-        )}
-      </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
