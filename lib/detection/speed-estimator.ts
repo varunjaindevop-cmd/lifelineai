@@ -1,68 +1,87 @@
-// Vehicle speed estimation via perspective transform
-import { TrackedObject } from "../ai/types";
+// Vehicle speed estimation with auto-calibration
+// Uses Kalman-smoothed velocities + camera calibration
 
-interface CalibrationData {
-  referencePoints: [[number, number], [number, number]];
-  realDistanceMeters: number;
-}
+import { TrackedEntity } from "./kalman-tracker";
 
-// Calculate pixels per meter from calibration
-export function calculatePixelsPerMeter(
-  calibration: CalibrationData
+// Auto-calibrate pixels-per-meter from video frame
+// Assumes standard road lanes (~3.5m wide) and estimates road width from frame
+export function autoCalibrate(
+  videoWidth: number,
+  videoHeight: number,
+  envMode: "isolated" | "traffic" | "marketplace"
 ): number {
-  const [[x1, y1], [x2, y2]] = calibration.referencePoints;
-  const pixelDistance = Math.sqrt(
-    Math.pow(x2 - x1, 2) + Math.pow(y2 - y1, 2)
-  );
-  return pixelDistance / calibration.realDistanceMeters;
+  // Default assumptions based on environment
+  const assumptions = {
+    isolated: { lanes: 2, laneWidth: 3.5 },   // 2-lane road
+    traffic: { lanes: 3, laneWidth: 3.5 },     // 3-lane road
+    marketplace: { lanes: 1, laneWidth: 3.0 }, // narrow pedestrian road
+  };
+  
+  const { lanes, laneWidth } = assumptions[envMode];
+  const totalRoadWidthMeters = lanes * laneWidth;
+  
+  // Estimate road width in pixels
+  // Typical road occupies 40-60% of frame width in traffic cameras
+  const roadWidthFraction = envMode === "marketplace" ? 0.4 : 0.5;
+  const roadWidthPixels = videoWidth * roadWidthFraction;
+  
+  return roadWidthPixels / totalRoadWidthMeters;
 }
 
-// Calculate speed for a tracked object
-export function calculateVehicleSpeed(
-  obj: TrackedObject,
+// Convert Kalman speed (pixels/frame) to real km/h
+export function pixelSpeedToKmh(
+  entity: TrackedEntity,
   pixelsPerMeter: number,
-  fps: number
+  fps: number = 10
 ): number {
-  if (obj.trajectory.length < 2) return 0;
-
-  const lastTwo = obj.trajectory.slice(-2);
-  const dx = lastTwo[1].x - lastTwo[0].x;
-  const dy = lastTwo[1].y - lastTwo[0].y;
-  const pixelDistance = Math.sqrt(dx * dx + dy * dy);
-
-  const metersPerFrame = pixelDistance / pixelsPerMeter;
+  const pixelSpeed = entity.speed; // pixels/frame from Kalman filter
+  
+  if (pixelSpeed < 0.1) return 0;
+  
+  const metersPerFrame = pixelSpeed / pixelsPerMeter;
   const metersPerSecond = metersPerFrame * fps;
-  const kmh = Math.round(metersPerSecond * 3.6);
-
-  return kmh;
+  const kmh = metersPerSecond * 3.6;
+  
+  return Math.round(kmh);
 }
 
-// Apply perspective transform (simplified)
-export function perspectiveTransform(
-  point: [number, number],
-  srcPoints: [number, number][],
-  dstPoints: [number, number][]
-): [number, number] {
-  // Simplified homography - in production use a proper matrix library
-  const [x, y] = point;
+// Calculate speed with smoothing and history
+export function calculateRealSpeed(
+  entity: TrackedEntity,
+  pixelsPerMeter: number,
+  fps: number = 10
+): { current: number; average: number; max: number } {
+  const current = pixelSpeedToKmh(entity, pixelsPerMeter, fps);
+  
+  const speeds = entity.speedHistory.map(s => {
+    const mps = s / pixelsPerMeter * fps;
+    return Math.round(mps * 3.6);
+  });
+  
+  const average = speeds.length > 0 
+    ? Math.round(speeds.reduce((a, b) => a + b, 0) / speeds.length)
+    : 0;
+  
+  const max = speeds.length > 0
+    ? Math.round(Math.max(...speeds))
+    : 0;
+  
+  return { current, average, max };
+}
 
-  // Calculate affine approximation
-  const dx = dstPoints[1][0] - dstPoints[0][0];
-  const dy = dstPoints[1][1] - dstPoints[0][1];
-  const sx = srcPoints[1][0] - srcPoints[0][0];
-  const sy = srcPoints[1][1] - srcPoints[0][1];
-
-  const scale = Math.sqrt((dx * dx + dy * dy) / (sx * sx + sy * sy));
-  const angle = Math.atan2(dy, dx) - Math.atan2(sy, sx);
-
-  const cos = Math.cos(angle);
-  const sin = Math.sin(angle);
-
-  const rx = x - srcPoints[0][0];
-  const ry = y - srcPoints[0][1];
-
-  const tx = rx * cos * scale - ry * sin * scale + dstPoints[0][0];
-  const ty = rx * sin * scale + ry * cos * scale + dstPoints[0][1];
-
-  return [tx, ty];
+// Perspective-corrected speed (accounts for camera angle)
+// Objects further away appear to move slower — correct for this
+export function perspectiveCorrectedSpeed(
+  speed: number,
+  yPosition: number,
+  frameHeight: number
+): number {
+  // Objects lower in frame are closer (move faster in reality)
+  // Objects higher in frame are further (appear slower)
+  const normalizedY = yPosition / frameHeight; // 0 = top, 1 = bottom
+  
+  // Correction factor: 1.0 at bottom, up to 1.5 at top
+  const correction = 1.0 + (1.0 - normalizedY) * 0.5;
+  
+  return Math.round(speed * correction);
 }
