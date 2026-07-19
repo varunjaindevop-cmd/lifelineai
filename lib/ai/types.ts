@@ -54,4 +54,5 @@ export interface AnomalyResult {
   confidence: number;
   signals: AnomalySignal[];
   severity: 'critical' | 'major' | 'minor' | 'suspicious';
+  sceneContext?: 'isolated_road' | 'traffic' | 'marketplace';
 }

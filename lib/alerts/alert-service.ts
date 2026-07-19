@@ -50,6 +50,7 @@ export async function createIncident(data: IncidentData): Promise<string | null>
     "pedestrian_collision",
     "pedestrian_fall",
     "fire_smoke",
+    "traffic_disruption",
   ];
 
   if (accidentTypes.includes(data.incidentType)) {

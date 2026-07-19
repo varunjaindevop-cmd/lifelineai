@@ -10,7 +10,8 @@ export type IncidentType =
   | "vehicle_anomaly"
   | "loitering"
   | "suspicious_activity"
-  | "speeding";
+  | "speeding"
+  | "traffic_disruption";
 
 // Which roles get notified for each incident type
 export const NOTIFICATION_RULES: Record<IncidentType, string[]> = {
@@ -23,6 +24,7 @@ export const NOTIFICATION_RULES: Record<IncidentType, string[]> = {
   loitering: ["admin", "police"],
   suspicious_activity: ["admin", "police"],
   speeding: ["admin", "police"],
+  traffic_disruption: ["admin", "police", "ambulance"],
 };
 
 // Get roles that should be notified for an incident type
@@ -62,6 +64,7 @@ export function isAccidentType(incidentType: string): boolean {
     "pedestrian_collision",
     "pedestrian_fall",
     "fire_smoke",
+    "traffic_disruption",
   ];
   return accidentTypes.includes(incidentType);
 }

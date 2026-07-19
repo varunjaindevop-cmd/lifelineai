@@ -182,25 +182,44 @@ export default function VideoAnalysisPage() {
   };
 
   // ========== COLLISION DETECTION ==========
+  // Requires: (1) objects are moving, (2) they converge, (3) sustained proximity
+  // False positive suppression: parallel-moving vehicles in same direction = traffic, not collision
   const detectCollision = (blobs: Blob[]): { detected: boolean; confidence: number; a: Blob; b: Blob } | null => {
-    const vehicles = blobs.filter(b => b.class === "car" && b.frames >= 4);
-    const all = [...vehicles, ...blobs.filter(b => b.class === "person" && b.frames >= 4)];
+    // Only consider blobs tracked for enough frames AND moving
+    const vehicles = blobs.filter(b => b.class === "car" && b.frames >= 5);
+    const pedestrians = blobs.filter(b => b.class === "person" && b.frames >= 4);
+    const all = [...vehicles, ...pedestrians];
 
     for (let i = 0; i < all.length; i++) {
       for (let j = i + 1; j < all.length; j++) {
         const a = all[i], b = all[j];
+        // Skip person-person pairs
         if (a.class === "person" && b.class === "person") continue;
+
+        // Both objects must be moving
+        const speedA = Math.sqrt(a.vx**2 + a.vy**2);
+        const speedB = Math.sqrt(b.vx**2 + b.vy**2);
+        if (speedA < 0.5 && speedB < 0.5) continue;
 
         const dist = Math.sqrt((a.cx-b.cx)**2 + (a.cy-b.cy)**2);
         const combinedR = (a.w + b.w) / 2;
 
-        // Must be close
+        // Must be reasonably close
         if (dist > combinedR * 1.5) continue;
 
-        // Converging?
+        // Converging? Check if heading toward each other
         const dx = b.cx - a.cx, dy = b.cy - a.cy;
         const dotA = a.vx * dx + a.vy * dy;
-        const converging = dotA > 0;
+        const dotB = b.vx * (-dx) + b.vy * (-dy);
+        const converging = dotA > 0 || dotB > 0;
+
+        // Direction analysis — skip parallel movers (normal traffic)
+        const angleA = Math.atan2(a.vy, a.vx);
+        const angleB = Math.atan2(b.vy, b.vx);
+        const angleDiff = Math.abs(angleA - angleB);
+        const parallel = angleDiff < Math.PI * 0.25 || angleDiff > Math.PI * 1.75;
+        // Parallel + not very close = normal traffic behavior, skip
+        if (parallel && dist > combinedR * 0.5) continue;
 
         // Track sustained closeness
         const closeThresh = combinedR * 1.2;
@@ -213,31 +232,18 @@ export default function VideoAnalysisPage() {
         }
         const near = Math.min(a._near || 0, b._near || 0);
 
-        // Direction analysis
-        const angleA = Math.atan2(a.vy, a.vx);
-        const angleB = Math.atan2(b.vy, b.vx);
-        const angleDiff = Math.abs(angleA - angleB);
-        const parallel = angleDiff < Math.PI * 0.25 || angleDiff > Math.PI * 1.75;
-
-        if (parallel && dist > combinedR * 0.5) continue;
-
-        // Speed check — objects must be moving
-        const speedA = Math.sqrt(a.vx**2 + a.vy**2);
-        const speedB = Math.sqrt(b.vx**2 + b.vy**2);
-        const eitherMoving = speedA > 1 || speedB > 1;
-
         // Very close OR close+converging+sustained
-        const veryClose = dist < combinedR * 0.6;
-        const closeConverging = dist < closeThresh && converging && near >= 2;
+        const veryClose = dist < combinedR * 0.5;
+        const closeConverging = dist < closeThresh && converging && near >= 3;
 
-        if ((veryClose || closeConverging) && eitherMoving) {
+        if (veryClose || closeConverging) {
           const conf = Math.min(0.95,
-            0.4 * (1 - dist / (combinedR * 1.5)) +
-            0.25 * (converging ? 1 : 0.3) +
-            0.2 * Math.min(near / 3, 1) +
-            0.15 * (!parallel ? 1 : 0.3)
+            0.35 * (1 - dist / (combinedR * 1.5)) +
+            0.25 * (converging ? 1 : 0.2) +
+            0.2 * Math.min(near / 4, 1) +
+            0.2 * (!parallel ? 1 : 0.3)
           );
-          if (conf > 0.4) return { detected: true, confidence: conf, a, b };
+          if (conf > 0.45) return { detected: true, confidence: conf, a, b };
         }
       }
     }
@@ -248,13 +254,20 @@ export default function VideoAnalysisPage() {
   // For rush areas: detects anomalies in traffic flow patterns
   // Key insight: in traffic, ACCIDENTS cause FLOW DISRUPTIONS,
   // not just motion spikes. We detect when flow becomes abnormal.
+  // CRITICAL: Normal traffic has movement — we only alert on SUSTAINED disruptions.
 
   const flowHistoryRef = useRef<Float32Array[]>([]); // last N flow snapshots
+  const disruptionFramesRef = useRef(0); // how many consecutive frames show disruption
   const FLOW_GRID = 4; // 4x3 flow grid
+  const DISRUPTION_PERSIST_THRESHOLD = 8; // require ~8 consecutive disrupted frames (~1.6s at 5fps)
 
   const analyzeTrafficFlow = (tracked: Blob[]): { disrupted: boolean; confidence: number; reason: string } => {
     const validBlobs = tracked.filter(b => b.frames >= 3);
-    if (validBlobs.length < 3) return { disrupted: false, confidence: 0, reason: "" };
+    // Need enough objects to meaningfully analyze flow
+    if (validBlobs.length < 5) {
+      disruptionFramesRef.current = Math.max(0, disruptionFramesRef.current - 1);
+      return { disrupted: false, confidence: 0, reason: "" };
+    }
 
     // Build flow grid: average velocity per region
     const cellW = W / FLOW_GRID, cellH = H / 3;
@@ -295,14 +308,22 @@ export default function VideoAnalysisPage() {
     }
 
     const avgSpeed = cellCount > 0 ? totalSpeed / cellCount : 0;
-    if (avgSpeed < 0.5) return { disrupted: false, confidence: 0, reason: "" }; // too few moving objects
+    // If nothing is moving, no traffic anomaly — just an empty or static scene
+    if (avgSpeed < 0.3) {
+      disruptionFramesRef.current = Math.max(0, disruptionFramesRef.current - 2);
+      return { disrupted: false, confidence: 0, reason: "" };
+    }
 
     // Anomaly 1: Speed differential — one cell much slower than average (traffic blocked)
+    // In traffic, some cells being slower is NORMAL (e.g., vehicles stopping at light)
+    // We need a cell to be DRAMATICALLY slower while others are moving fast
     let maxSpeedDiff = 0;
     let slowCell = { r: 0, c: 0, speed: 0 };
+    let fastCells = 0;
     for (let r = 0; r < 3; r++) {
       for (let c = 0; c < FLOW_GRID; c++) {
         if (flowGrid[r][c].count > 0) {
+          if (speeds[r][c] > avgSpeed * 0.8) fastCells++;
           const diff = avgSpeed - speeds[r][c];
           if (diff > maxSpeedDiff) {
             maxSpeedDiff = diff;
@@ -311,10 +332,15 @@ export default function VideoAnalysisPage() {
         }
       }
     }
+    // Require: significant differential AND fast-moving cells nearby (traffic should be flowing elsewhere)
+    const speedBlocked = maxSpeedDiff > avgSpeed * 0.7 && avgSpeed > 2.0 && fastCells >= 2;
 
-    // Anomaly 2: Cluster detection — many objects in one cell (pile-up)
+    // Anomaly 2: Cluster detection — many objects piled up in one cell
+    // Normal dense traffic has objects distributed across cells
+    // A pile-up concentrates many objects in a single cell while being still
     let maxCluster = 0;
     let clusterCell = { r: 0, c: 0, count: 0 };
+    let clusterStoppedCount = 0;
     for (let r = 0; r < 3; r++) {
       for (let c = 0; c < FLOW_GRID; c++) {
         if (flowGrid[r][c].count > maxCluster) {
@@ -323,11 +349,23 @@ export default function VideoAnalysisPage() {
         }
       }
     }
-
+    // Count stopped blobs in the cluster cell
+    for (const blob of validBlobs) {
+      const gc = Math.min(Math.floor(blob.cx / cellW), FLOW_GRID - 1);
+      const gr = Math.min(Math.floor(blob.cy / cellH), 2);
+      if (gc === clusterCell.c && gr === clusterCell.r) {
+        const blobSpeed = Math.sqrt(blob.vx ** 2 + blob.vy ** 2);
+        if (blobSpeed < 1) clusterStoppedCount++;
+      }
+    }
     const avgCount = cellCount > 0 ? validBlobs.length / cellCount : 1;
+    // Pile-up: many objects concentrated in one cell AND they're stopped
+    const piledUp = maxCluster > avgCount * 2.5 && maxCluster >= 4 && clusterStoppedCount >= 3;
 
     // Anomaly 3: Direction chaos — objects in nearby cells moving in opposite directions
+    // In normal traffic, flow is somewhat coherent. Accident scenes cause chaotic movement.
     let chaosScore = 0;
+    let chaosPairs = 0;
     for (let r = 0; r < 3; r++) {
       for (let c = 0; c < FLOW_GRID; c++) {
         if (flowGrid[r][c].count === 0) continue;
@@ -343,27 +381,35 @@ export default function VideoAnalysisPage() {
           const dot = flowGrid[r][c].vx * n.vx + flowGrid[r][c].vy * n.vy;
           const magA = flowGrid[r][c].speed;
           const magB = n.speed;
-          if (magA > 1 && magB > 1) {
+          if (magA > 1.5 && magB > 1.5) {
             const cosAngle = dot / (magA * magB);
-            if (cosAngle < -0.3) chaosScore++; // opposite directions
+            if (cosAngle < -0.4) { chaosScore++; chaosPairs++; }
           }
         }
       }
     }
+    // Chaos needs multiple opposite-direction pairs AND enough moving objects
+    const chaotic = chaosScore >= 3 && validBlobs.length >= 5;
 
-    // Evaluate anomalies
-    const speedBlocked = maxSpeedDiff > avgSpeed * 0.6 && avgSpeed > 1.5;
-    const piledUp = maxCluster > avgCount * 2 && maxCluster >= 3;
-    const chaotic = chaosScore >= 2;
+    // Evaluate anomalies — require at least 2 indicators for disruption
+    const indicators = [speedBlocked, piledUp, chaotic].filter(Boolean).length;
 
     const confidence = Math.min(0.95,
       (speedBlocked ? 0.35 : 0) +
       (piledUp ? 0.3 : 0) +
-      (chaotic ? 0.2 : 0) +
-      (validBlobs.length > 5 ? 0.15 : 0)
+      (chaotic ? 0.25 : 0) +
+      (validBlobs.length > 8 ? 0.1 : 0)
     );
 
-    if (speedBlocked || piledUp || chaotic) {
+    // Track sustained disruption
+    if (indicators >= 2 || (indicators >= 1 && confidence > 0.5)) {
+      disruptionFramesRef.current++;
+    } else {
+      disruptionFramesRef.current = Math.max(0, disruptionFramesRef.current - 2);
+    }
+
+    // Only report disruption if it's been sustained
+    if (disruptionFramesRef.current >= DISRUPTION_PERSIST_THRESHOLD) {
       const reason = piledUp ? "pile-up" : speedBlocked ? "traffic blocked" : "flow disruption";
       return { disrupted: true, confidence, reason };
     }
@@ -469,6 +515,7 @@ export default function VideoAnalysisPage() {
     frameRef.current = 0;
     stateFrameRef.current = 0;
     cooldownRef.current = 0;
+    disruptionFramesRef.current = 0;
     stateRef.current = "monitoring";
     nextId = 1;
 
@@ -517,25 +564,34 @@ export default function VideoAnalysisPage() {
         const collision = analysisMode === "normal" ? detectCollision(tracked) : null;
         const trafficAnomaly = analysisMode === "traffic" ? analyzeTrafficFlow(tracked) : null;
 
-        // Also check accumulated change anomaly
+        // Also check accumulated change anomaly — but suppress in marketplace-like scenes
         const avgChange = gridChange / 48;
-        const accumAnomaly = avgChange > 0.04;
+        const validTracked = tracked.filter(b => b.frames >= 3);
+        const vehicleCount = validTracked.filter(b => b.class === "car").length;
+        const personCount = validTracked.filter(b => b.class === "person").length;
+        const isMarketplaceScene = personCount >= 3 && vehicleCount < 2;
+
+        // Accumulated change in marketplace is normal (people walking) — require higher threshold
+        const accumThreshold = isMarketplaceScene ? 0.08 : 0.04;
+        const accumAnomaly = avgChange > accumThreshold;
 
         const anyAnomaly = collision || trafficAnomaly?.disrupted || accumAnomaly;
 
         // Draw
         drawBoxes(tracked, collision);
-        setObjectCount(tracked.filter(b => b.frames >= 3).length);
+        setObjectCount(validTracked.length);
 
-        // State machine
+        // State machine — require sustained anomaly, not single-frame spikes
         stateFrameRef.current++;
         let st = stateRef.current;
 
         if (anyAnomaly) {
+          // Only advance state if anomaly persists for multiple frames
           if (st === "monitoring") st = "watching";
-          else if (st === "watching") st = "confirming";
-          else if (st === "confirming") st = "alert";
-        } else if (!demoMode && frameRef.current % 4 === 0) {
+          else if (st === "watching" && stateFrameRef.current > 5) st = "confirming";
+          else if (st === "confirming" && stateFrameRef.current > 10) st = "alert";
+        } else if (!demoMode && frameRef.current % 6 === 0) {
+          // Decay: only step down every 6 frames to avoid oscillation
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
 
@@ -548,15 +604,43 @@ export default function VideoAnalysisPage() {
 
         if (st === "alert" && stateRef.current !== "alert" && cooldownRef.current <= 0) {
           cooldownRef.current = 40;
-          createIncident({
-            type: trafficAnomaly?.disrupted ? "vehicle_collision" : "vehicle_collision",
-            severity: ((collision?.confidence || trafficAnomaly?.confidence || 0)) > 0.65 ? "critical" : "major",
-            confidence: collision?.confidence || trafficAnomaly?.confidence || 0.7,
-            timestamp: new Date().toISOString(),
-            latitude: LAT + (Math.random()-0.5)*0.01,
-            longitude: LNG + (Math.random()-0.5)*0.01,
-          });
-          setTimeout(() => { stateRef.current = "monitoring"; stateFrameRef.current = 0; setState("monitoring"); }, 5000);
+
+          // Determine correct incident type based on what was detected
+          let incidentType = "vehicle_collision";
+          let severity = "major";
+
+          if (trafficAnomaly?.disrupted) {
+            // Traffic flow disruption — classify by cause
+            incidentType = trafficAnomaly.reason === "pile-up" ? "vehicle_collision" : "traffic_disruption";
+            severity = (trafficAnomaly.confidence || 0) > 0.65 ? "critical" : "major";
+          } else if (collision) {
+            // Direct collision detected
+            const isPedCollision = collision.a.class === "person" || collision.b.class === "person";
+            incidentType = isPedCollision ? "pedestrian_collision" : "vehicle_collision";
+            severity = collision.confidence > 0.7 ? "critical" : collision.confidence > 0.5 ? "major" : "minor";
+          } else if (accumAnomaly && isMarketplaceScene) {
+            // In marketplace, accumulated change alone is NOT an accident
+            // Only trigger if there's also collision evidence — suppress otherwise
+            incidentType = ""; // will skip below
+          }
+
+          // Only create incident if we have a valid type
+          if (incidentType) {
+            createIncident({
+              type: incidentType,
+              severity,
+              confidence: collision?.confidence || trafficAnomaly?.confidence || 0.7,
+              timestamp: new Date().toISOString(),
+              latitude: LAT + (Math.random()-0.5)*0.01,
+              longitude: LNG + (Math.random()-0.5)*0.01,
+            });
+            setTimeout(() => { stateRef.current = "monitoring"; stateFrameRef.current = 0; setState("monitoring"); }, 5000);
+          } else {
+            // Suppress alert — reset to monitoring
+            stateRef.current = "monitoring";
+            stateFrameRef.current = 0;
+            setState("monitoring");
+          }
         }
 
         stateRef.current = st;
@@ -586,6 +670,7 @@ export default function VideoAnalysisPage() {
     frameRef.current = 0;
     stateFrameRef.current = 0;
     cooldownRef.current = 0;
+    disruptionFramesRef.current = 0;
     setObjectCount(0);
   };
 

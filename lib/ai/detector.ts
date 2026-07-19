@@ -1,7 +1,7 @@
 import { Detection, TrackedObject, AnomalyResult, QualityMetrics } from "./types";
 import { analyzeQuality, getAdaptiveConfig, preprocessImage, applyCLAHE, denoise, sharpen } from "../detection/preprocess";
 import { trackObjects, createNewObjects } from "./object-tracker";
-import { detectAnomalies } from "./anomaly-rules";
+import { detectAnomalies, estimateSceneContext, SceneContext } from "./anomaly-rules";
 import { DetectionStateMachine, getSeverity } from "./state-machine";
 
 export class AccidentDetector {
@@ -76,8 +76,9 @@ export class AccidentDetector {
       }
     }
 
-    // Detect anomalies
-    const anomalies = detectAnomalies(this.trackedObjects, sceneChangeScore);
+    // Detect anomalies with scene context
+    const sceneContext = estimateSceneContext(this.trackedObjects);
+    const anomalies = detectAnomalies(this.trackedObjects, sceneChangeScore, sceneContext);
     const topAnomaly = anomalies.length > 0 ? anomalies[0] : null;
 
     // Process through state machine
