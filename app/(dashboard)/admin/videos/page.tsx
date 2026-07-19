@@ -280,17 +280,41 @@ export default function VideoAnalysisPage() {
     const scheduleDetection = (vid: HTMLVideoElement) => {
       if (isDetecting || !modelRef.current || vid.paused || vid.ended) return;
       const now = Date.now();
-      if (now - lastDetectTime < 300) return; // 3 FPS detection
+      if (now - lastDetectTime < 300) return;
       isDetecting = true;
       lastDetectTime = now;
       modelRef.current.detect(vid).then((preds: any[]) => {
-        latestDetections = preds
-          .filter((p: any) => p.class in COCO_MAP && p.score > 0.25) // lower threshold
+        // Filter by class and score
+        const filtered = preds
+          .filter((p: any) => p.class in COCO_MAP && p.score > 0.25)
           .map((p: any) => {
             const [x, y, w, h] = p.bbox;
             return { class: COCO_MAP[p.class], cx: x + w / 2, cy: y + h / 2, w, h, confidence: p.score };
           });
-        console.log(`[SAGE] COCO-SSD: ${preds.length} raw → ${latestDetections.length} filtered`);
+
+        // Merge duplicate detections of same class that overlap heavily
+        const merged: typeof filtered = [];
+        const used = new Set<number>();
+        for (let i = 0; i < filtered.length; i++) {
+          if (used.has(i)) continue;
+          let best = filtered[i];
+          for (let j = i + 1; j < filtered.length; j++) {
+            if (used.has(j)) continue;
+            if (filtered[i].class !== filtered[j].class) continue;
+            // Check center distance — if very close, it's the same object
+            const d = Math.sqrt((best.cx - filtered[j].cx) ** 2 + (best.cy - filtered[j].cy) ** 2);
+            const avgSize = (best.w + best.h + filtered[j].w + filtered[j].h) / 4;
+            if (d < avgSize * 0.5) {
+              // Merge: keep the higher confidence one
+              if (filtered[j].confidence > best.confidence) best = filtered[j];
+              used.add(j);
+            }
+          }
+          merged.push(best);
+        }
+
+        latestDetections = merged;
+        console.log(`[SAGE] COCO-SSD: ${preds.length} raw → ${filtered.length} filtered → ${merged.length} merged`);
       }).catch((e: any) => {
         console.error("[SAGE] COCO-SSD error:", e);
       }).finally(() => { isDetecting = false; });
