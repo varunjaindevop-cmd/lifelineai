@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
-import { Camera, AlertTriangle, Building2, Users, TrendingUp, Clock } from "lucide-react";
+import { Camera, AlertTriangle, Building2, Users, TrendingUp, Clock, Video } from "lucide-react";
 import { toast } from "sonner";
 import Link from "next/link";
 
@@ -155,11 +155,16 @@ export default function AdminDashboard() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <Link href="/cameras" className="bg-card p-5 rounded-xl border border-border hover:border-primary/50 transition-colors">
           <Camera className="w-7 h-7 text-primary mb-2" />
           <h3 className="font-semibold">Cameras</h3>
           <p className="text-sm text-muted-foreground">Manage CCTV feeds</p>
+        </Link>
+        <Link href="/admin/videos" className="bg-card p-5 rounded-xl border border-border hover:border-primary/50 transition-colors">
+          <Video className="w-7 h-7 text-severity-major mb-2" />
+          <h3 className="font-semibold">Video Analysis</h3>
+          <p className="text-sm text-muted-foreground">AI clip analysis &amp; detection</p>
         </Link>
         <Link href="/incidents" className="bg-card p-5 rounded-xl border border-border hover:border-primary/50 transition-colors">
           <AlertTriangle className="w-7 h-7 text-severity-major mb-2" />

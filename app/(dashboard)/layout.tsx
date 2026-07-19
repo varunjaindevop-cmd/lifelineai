@@ -5,7 +5,7 @@ import { useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
 import {
-  Shield, Map, AlertTriangle, Camera, LogOut, Menu, X, Home, Phone
+  Shield, Map, AlertTriangle, Camera, LogOut, Menu, X, Home, Phone, Video
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -25,6 +25,7 @@ const NAV_ITEMS: Record<string, { label: string; href: string; icon: any }[]> = 
   admin: [
     { label: "Dashboard", href: "/admin", icon: Home },
     { label: "Cameras", href: "/cameras", icon: Camera },
+    { label: "Video Analysis", href: "/admin/videos", icon: Video },
     { label: "Incidents", href: "/incidents", icon: AlertTriangle },
     { label: "Live Map", href: "/map", icon: Map },
   ],

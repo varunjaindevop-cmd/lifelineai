@@ -368,15 +368,38 @@ export default function CameraFeedPage() {
                 onChange={handleFileUpload}
                 className="hidden"
               />
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                className="text-sm text-primary hover:underline"
-              >
-                📹 Upload video file for demo
-              </button>
-              {selectedFile && (
-                <span className="ml-2 text-sm text-muted-foreground">
-                  {selectedFile.name}
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="text-sm text-primary hover:underline"
+                >
+                  Upload video file
+                </button>
+                <span className="text-muted-foreground text-xs">or try demo clips:</span>
+                {[
+                  { name: "Accident", src: "/videos/accident_sample.mp4" },
+                  { name: "Camera 2", src: "/videos/camera2_demo.mp4" },
+                  { name: "Camera 4", src: "/videos/camera4_demo.mp4" },
+                  { name: "Check", src: "/videos/checking.mp4" },
+                ].map((demo) => (
+                  <button
+                    key={demo.name}
+                    onClick={() => {
+                      if (videoRef.current) {
+                        videoRef.current.src = demo.src;
+                        videoRef.current.play();
+                        setSelectedFile(new File([], demo.name));
+                      }
+                    }}
+                    className="px-2 py-1 bg-primary/10 text-primary rounded text-xs hover:bg-primary/20 transition-colors"
+                  >
+                    {demo.name}
+                  </button>
+                ))}
+              </div>
+              {selectedFile && selectedFile.name && (
+                <span className="mt-2 block text-sm text-muted-foreground">
+                  Loaded: {selectedFile.name}
                 </span>
               )}
             </div>

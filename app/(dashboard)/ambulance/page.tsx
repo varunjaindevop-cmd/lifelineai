@@ -188,7 +188,9 @@ export default function AmbulanceDashboard() {
                   ) : (
                     <div className="bg-background rounded-lg p-4 text-center text-sm text-muted-foreground">
                       <Video size={20} className="mx-auto mb-1 opacity-50" />
-                      Clip processing...
+                      {incident.location_name?.startsWith("Demo Clip:")
+                        ? "Video analysis incident — view details in Admin > Video Analysis"
+                        : "Clip processing..."}
                     </div>
                   )}
 
