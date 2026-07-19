@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import {
   ArrowLeft, Video, Play, Pause, AlertTriangle, Clock,
-  Navigation, RotateCcw, Loader2, Zap,
+  Navigation, RotateCcw, Loader2, Zap, Eye,
 } from "lucide-react";
 import Link from "next/link";
 import { toast } from "sonner";
@@ -24,13 +24,6 @@ interface IncidentAlert {
   longitude: number;
 }
 
-interface MotionMetrics {
-  totalEnergy: number;       // total motion in frame (0-1)
-  maxRegionEnergy: number;   // hottest region (0-1)
-  motionGradient: number;    // how fast motion is changing
-  hotspots: { x: number; y: number; energy: number; w: number; h: number }[];
-}
-
 const VIDEO_CLIPS: VideoClip[] = [
   { name: "accident_sample.mp4", src: "/videos/accident_sample.mp4", description: "Vehicle collision scenario" },
   { name: "camera2_demo.mp4", src: "/videos/camera2_demo.mp4", description: "Traffic monitoring demo" },
@@ -41,14 +34,17 @@ const VIDEO_CLIPS: VideoClip[] = [
 const DEMO_LAT = 22.7196;
 const DEMO_LNG = 75.8577;
 
+const GRID_COLS = 8;
+const GRID_ROWS = 6;
+
 export default function VideoAnalysisPage() {
   const [selectedClip, setSelectedClip] = useState<VideoClip | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [videoReady, setVideoReady] = useState(false);
   const [incidents, setIncidents] = useState<IncidentAlert[]>([]);
   const [currentState, setCurrentState] = useState("monitoring");
-  const [motionMetrics, setMotionMetrics] = useState<MotionMetrics | null>(null);
-  const [motionHistory, setMotionHistory] = useState<number[]>([]);
+  const [regionHeatmap, setRegionHeatmap] = useState<number[]>([]);
+  const [motionScore, setMotionScore] = useState(0);
   const [demoMode, setDemoMode] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -58,13 +54,24 @@ export default function VideoAnalysisPage() {
   const frameCountRef = useRef(0);
   const stateFrameRef = useRef(0);
   const alertCooldownRef = useRef(0);
-  const prevFrameRef = useRef<ImageData | null>(null);
-  const motionHistoryRef = useRef<number[]>([]);
-  const bgModelRef = useRef<Float32Array | null>(null); // running background model
   const supabase = createClient();
 
+  // Accumulated region change map — THE KEY INNOVATION
+  // Instead of instantaneous motion, we ACCUMULATE changes over time.
+  // Passing car: accumulates briefly, then decays → low value
+  // Accident: accumulates and STAYS → high value triggers alert
+  const accumulatedMapRef = useRef<Float32Array>(new Float32Array(GRID_COLS * GRID_ROWS));
+  const prevGrayMapRef = useRef<Float32Array | null>(null);
+  const baselineGrayRef = useRef<Float32Array | null>(null);
+  const frameNumRef = useRef(0);
+
   useEffect(() => {
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -83,166 +90,161 @@ export default function VideoAnalysisPage() {
     return analysisCanvasRef.current;
   }, []);
 
-  const captureFrame = useCallback((): ImageData | null => {
-    const video = videoRef.current;
-    if (!video || video.paused || video.ended || video.readyState < 2) return null;
-    const canvas = getAnalysisCanvas();
-    canvas.width = 320;
-    canvas.height = 240;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return null;
-    ctx.drawImage(video, 0, 0, 320, 240);
-    return ctx.getImageData(0, 0, 320, 240);
-  }, [getAnalysisCanvas]);
+  // Convert frame to low-res grayscale grid (8x6 regions)
+  const frameToGrid = useCallback((frame: ImageData): Float32Array => {
+    const w = frame.width;
+    const h = frame.height;
+    const data = frame.data;
+    const grid = new Float32Array(GRID_COLS * GRID_ROWS);
+    const cellW = Math.floor(w / GRID_COLS);
+    const cellH = Math.floor(h / GRID_ROWS);
 
-  // ========== MOTION ENERGY ANALYSIS ==========
-  // This is how real surveillance systems detect accidents —
-  // by measuring anomalous motion patterns, not by identifying objects.
-
-  const analyzeMotion = useCallback((currFrame: ImageData, prevFrame: ImageData, frameNum: number): MotionMetrics => {
-    const w = currFrame.width;
-    const h = currFrame.height;
-    const curr = currFrame.data;
-    const prev = prevFrame.data;
-    const totalPixels = w * h;
-
-    // Step 1: Compute per-pixel motion magnitude
-    const motionMap = new Float32Array(totalPixels);
-    let totalMotion = 0;
-    let maxMotion = 0;
-
-    for (let i = 0; i < totalPixels; i++) {
-      const idx = i * 4;
-      const grayCurr = curr[idx] * 0.299 + curr[idx + 1] * 0.587 + curr[idx + 2] * 0.114;
-      const grayPrev = prev[idx] * 0.299 + prev[idx + 1] * 0.587 + prev[idx + 2] * 0.114;
-      const diff = Math.abs(grayCurr - grayPrev) / 255;
-      motionMap[i] = diff;
-      totalMotion += diff;
-      if (diff > maxMotion) maxMotion = diff;
-    }
-
-    const totalEnergy = totalMotion / totalPixels;
-
-    // Step 2: Update background model (slow-moving average)
-    if (!bgModelRef.current) {
-      bgModelRef.current = new Float32Array(totalPixels);
-      for (let i = 0; i < totalPixels; i++) {
-        bgModelRef.current[i] = curr[i * 4] * 0.299 + curr[i * 4 + 1] * 0.587 + curr[i * 4 + 2] * 0.114;
-      }
-    } else {
-      const alpha = 0.02; // slow adaptation
-      for (let i = 0; i < totalPixels; i++) {
-        const gray = curr[i * 4] * 0.299 + curr[i * 4 + 1] * 0.587 + curr[i * 4 + 2] * 0.114;
-        bgModelRef.current[i] = bgModelRef.current[i] * (1 - alpha) + gray * alpha;
-      }
-    }
-
-    // Step 3: Find hotspots (regions with concentrated motion)
-    const blockSize = 32;
-    const hotspots: MotionMetrics["hotspots"] = [];
-
-    for (let by = 0; by < h; by += blockSize) {
-      for (let bx = 0; bx < w; bx += blockSize) {
-        let regionMotion = 0;
+    for (let gy = 0; gy < GRID_ROWS; gy++) {
+      for (let gx = 0; gx < GRID_COLS; gx++) {
+        let sum = 0;
         let count = 0;
+        const startX = gx * cellW;
+        const startY = gy * cellH;
 
-        for (let dy = 0; dy < blockSize && by + dy < h; dy++) {
-          for (let dx = 0; dx < blockSize && bx + dx < w; dx++) {
-            regionMotion += motionMap[(by + dy) * w + (bx + dx)];
-            count++;
+        for (let dy = 0; dy < cellH; dy += 2) {
+          for (let dx = 0; dx < cellW; dx += 2) {
+            const px = startX + dx;
+            const py = startY + dy;
+            if (px < w && py < h) {
+              const idx = (py * w + px) * 4;
+              sum += data[idx] * 0.299 + data[idx + 1] * 0.587 + data[idx + 2] * 0.114;
+              count++;
+            }
           }
         }
+        grid[gy * GRID_COLS + gx] = count > 0 ? sum / count : 128;
+      }
+    }
+    return grid;
+  }, []);
 
-        const avgRegionMotion = count > 0 ? regionMotion / count : 0;
+  // ========== CORE DETECTION: Accumulated Region Change ==========
+  // This is fundamentally different from motion energy:
+  // - Motion energy = instant snapshot → noisy, false alarms
+  // - Accumulated change = tracks PERMANENT scene changes over time
+  //
+  // How it works:
+  // 1. Each frame, compute per-region difference from previous frame
+  // 2. ADD the difference to an accumulated map (never resets to zero)
+  // 3. DECAY the map slowly (multiply by 0.98 each frame)
+  // 4. A region with HIGH accumulated change = something PERMANENTLY changed there
+  //
+  // Why this works:
+  // - Car passing: difference appears then disappears → accumulation stays low
+  // - Crowd walking: small gradual changes → accumulation stays moderate
+  // - Accident: sudden large change that PERSISTS → accumulation spikes
 
-        if (avgRegionMotion > 0.08) { // significant motion in this region
-          hotspots.push({
-            x: bx, y: by,
-            energy: avgRegionMotion,
-            w: Math.min(blockSize, w - bx),
-            h: Math.min(blockSize, h - by),
-          });
-        }
+  const analyzeAccumulated = useCallback((currentGrid: Float32Array): {
+    regionChanges: number[];
+    maxRegion: number;
+    totalChange: number;
+    spikeRegion: number;
+  } => {
+    const grid = accumulatedMapRef.current;
+    const prev = prevGrayMapRef.current;
+    const DECAY = 0.97; // slow decay — changes accumulate over time
+
+    let totalChange = 0;
+    let maxRegion = 0;
+    let spikeRegion = -1;
+
+    const regionChanges: number[] = [];
+
+    for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
+      // Frame-to-frame difference
+      const frameDiff = prev ? Math.abs(currentGrid[i] - prev[i]) / 255 : 0;
+
+      // Accumulate: add new difference, decay old
+      grid[i] = grid[i] * DECAY + frameDiff * 2; // multiply by 2 to boost signal
+
+      // Clamp to prevent overflow
+      if (grid[i] > 1) grid[i] = 1;
+
+      regionChanges.push(grid[i]);
+      totalChange += grid[i];
+
+      if (grid[i] > maxRegion) {
+        maxRegion = grid[i];
+        spikeRegion = i;
       }
     }
 
-    // Sort hotspots by energy, keep top 5
-    hotspots.sort((a, b) => b.energy - a.energy);
-    const topHotspots = hotspots.slice(0, 5);
+    prevGrayMapRef.current = new Float32Array(currentGrid);
 
-    const maxRegionEnergy = topHotspots.length > 0 ? topHotspots[0].energy : 0;
-
-    // Step 4: Motion gradient (how fast total motion is changing)
-    const history = motionHistoryRef.current;
-    history.push(totalEnergy);
-    if (history.length > 20) history.shift();
-
-    let motionGradient = 0;
-    if (history.length >= 5) {
-      const recent = history.slice(-5).reduce((a, b) => a + b, 0) / 5;
-      const older = history.slice(0, 5).reduce((a, b) => a + b, 0) / 5;
-      motionGradient = older > 0 ? (recent - older) / older : 0;
-    }
-
-    return { totalEnergy, maxRegionEnergy, motionGradient, hotspots: topHotspots };
+    return { regionChanges, maxRegion, totalChange, spikeRegion };
   }, []);
 
-  // ========== ACCIDENT DETECTION ==========
-  // Key insight: accidents cause SUSTAINED energy spikes (3+ frames).
-  // A car passing is a brief 1-2 frame blip. People walking = gradual rise.
-  // We require the spike to PERSIST before triggering.
+  // Detect accident from accumulated changes
+  const detectAccident = useCallback((analysis: {
+    regionChanges: number[];
+    maxRegion: number;
+    totalChange: number;
+    spikeRegion: number;
+  }, frameNum: number): { detected: boolean; confidence: number } => {
+    const fn = frameNum;
 
-  const spikeFrameRef = useRef(0); // how many consecutive frames have been spiking
+    // Need baseline frames to settle
+    if (fn < 12) return { detected: false, confidence: 0 };
 
-  const detectAccident = useCallback((metrics: MotionMetrics, frameNum: number): { detected: boolean; confidence: number; type: string } => {
-    const history = motionHistoryRef.current;
+    const avgChange = analysis.totalChange / (GRID_COLS * GRID_ROWS);
 
-    if (history.length < 8) return { detected: false, confidence: 0, type: "" };
-
-    // Baseline = average of frames 4-8 ago (well before current activity)
-    const baselineSlice = history.slice(Math.max(0, history.length - 8), Math.max(0, history.length - 3));
-    const baselineAvg = baselineSlice.length > 0 ? baselineSlice.reduce((a, b) => a + b, 0) / baselineSlice.length : 0.01;
-
-    const currentEnergy = metrics.totalEnergy;
-
-    // Spike ratio
-    const spikeRatio = baselineAvg > 0.001 ? currentEnergy / baselineAvg : currentEnergy > 0.02 ? 5 : 0;
-
-    // Frame-to-frame jump: how FAST did energy increase?
-    // Accident = sudden jump (1 frame). Car passing = gradual (3-4 frames).
-    const prevEnergy = history.length >= 2 ? history[history.length - 2] : baselineAvg;
-    const frameJump = prevEnergy > 0.001 ? currentEnergy / prevEnergy : 1;
-    const suddenJump = frameJump > 1.5; // >50% increase in single frame = sudden
-
-    // Sustained check: must be spiking for 2+ consecutive frames
-    const isSpikeNow = spikeRatio > 1.6 && currentEnergy > 0.012;
-    if (isSpikeNow) {
-      spikeFrameRef.current++;
+    // Update baseline (average of older accumulated values)
+    if (!baselineGrayRef.current) {
+      baselineGrayRef.current = new Float32Array([avgChange]);
     } else {
-      spikeFrameRef.current = Math.max(0, spikeFrameRef.current - 1);
+      const history = baselineGrayRef.current;
+      // Keep last 30 values
+      if (history.length > 30) {
+        const newArr = new Float32Array(30);
+        newArr.set(history.subarray(history.length - 29));
+        newArr[29] = avgChange;
+        baselineGrayRef.current = newArr;
+      } else {
+        const newArr = new Float32Array(history.length + 1);
+        newArr.set(history);
+        newArr[history.length] = avgChange;
+        baselineGrayRef.current = newArr;
+      }
     }
 
-    const sustainedSpike = spikeFrameRef.current >= 2; // sustained for 2+ frames
+    const baseline = baselineGrayRef.current;
+    const baselineAvg = baseline.length > 5
+      ? baseline.slice(0, baseline.length - 5).reduce((a, b) => a + b, 0) / (baseline.length - 5)
+      : 0.01;
+
+    // Spike ratio: current accumulated change vs baseline
+    const spikeRatio = baselineAvg > 0.001 ? avgChange / baselineAvg : avgChange > 0.02 ? 5 : 0;
+
+    // Hot region: one specific region has much higher accumulation than others
+    const otherAvg = (analysis.totalChange - analysis.maxRegion) / Math.max(GRID_COLS * GRID_ROWS - 1, 1);
+    const hotRegionRatio = otherAvg > 0.001 ? analysis.maxRegion / otherAvg : 1;
 
     // Confidence
     const confidence = Math.min(0.95,
       Math.min(spikeRatio / 3, 1) * 0.4 +
-      (suddenJump ? 0.25 : 0) +
-      (sustainedSpike ? 0.25 : 0) +
-      (currentEnergy > 0.03 ? 0.1 : 0)
+      Math.min(hotRegionRatio / 5, 1) * 0.3 +
+      (analysis.maxRegion > 0.1 ? 0.2 : 0) +
+      (avgChange > 0.02 ? 0.1 : 0)
     );
 
-    // Detection: sustained spike OR sudden large spike
-    const detected = (sustainedSpike && spikeRatio > 1.6) || (suddenJump && spikeRatio > 2.0 && currentEnergy > 0.02);
+    // Detection: accumulated change spiked AND there's a hot region
+    const detected = (spikeRatio > 2.0 && analysis.maxRegion > 0.05) ||
+                     (spikeRatio > 3.0) || // very large spike overrides
+                     (hotRegionRatio > 4 && analysis.maxRegion > 0.08); // concentrated change
 
-    return { detected, confidence, type: "vehicle_collision" };
+    return { detected, confidence };
   }, []);
 
-  // Draw motion visualization on canvas
-  const drawMotionOverlay = (metrics: MotionMetrics | null) => {
+  // Draw heatmap overlay
+  const drawHeatmap = (regionChanges: number[]) => {
     const canvas = canvasRef.current;
     const video = videoRef.current;
-    if (!canvas || !video || !metrics) return;
+    if (!canvas || !video) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
@@ -250,47 +252,44 @@ export default function VideoAnalysisPage() {
     canvas.height = video.videoHeight || 480;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    const scaleX = canvas.width / 320;
-    const scaleY = canvas.height / 240;
+    const cellW = canvas.width / GRID_COLS;
+    const cellH = canvas.height / GRID_ROWS;
 
-    // Draw hotspots as semi-transparent overlays
-    for (const spot of metrics.hotspots) {
-      const intensity = Math.min(spot.energy * 5, 1);
-      const color = intensity > 0.6 ? `rgba(255, 0, 0, ${intensity * 0.4})` :
-                    intensity > 0.3 ? `rgba(255, 165, 0, ${intensity * 0.3})` :
-                    `rgba(255, 255, 0, ${intensity * 0.2})`;
+    for (let i = 0; i < regionChanges.length; i++) {
+      const gx = i % GRID_COLS;
+      const gy = Math.floor(i / GRID_COLS);
+      const val = Math.min(regionChanges[i] * 4, 1); // boost visibility
 
-      ctx.fillStyle = color;
-      ctx.fillRect(spot.x * scaleX, spot.y * scaleY, spot.w * scaleX, spot.h * scaleY);
+      if (val > 0.05) {
+        const r = Math.floor(val * 255);
+        const g = Math.floor((1 - val) * 100);
+        ctx.fillStyle = `rgba(${r}, ${g}, 0, ${val * 0.5})`;
+        ctx.fillRect(gx * cellW, gy * cellH, cellW, cellH);
 
-      // Border for significant hotspots
-      if (intensity > 0.4) {
-        ctx.strokeStyle = intensity > 0.6 ? "red" : "orange";
-        ctx.lineWidth = 2;
-        ctx.strokeRect(spot.x * scaleX, spot.y * scaleY, spot.w * scaleX, spot.h * scaleY);
-
-        // Label
-        ctx.fillStyle = "white";
-        ctx.font = "bold 12px Arial";
-        ctx.fillText(`${(intensity * 100).toFixed(0)}%`, spot.x * scaleX + 4, spot.y * scaleY + 16);
+        if (val > 0.3) {
+          ctx.strokeStyle = `rgba(255, 0, 0, ${val * 0.7})`;
+          ctx.lineWidth = 2;
+          ctx.strokeRect(gx * cellW, gy * cellH, cellW, cellH);
+        }
       }
     }
 
-    // Motion energy bar at bottom
-    const barY = canvas.height - 30;
-    const barWidth = canvas.width;
-    const energyWidth = Math.min(metrics.totalEnergy * barWidth * 10, barWidth);
-    ctx.fillStyle = "rgba(0,0,0,0.6)";
-    ctx.fillRect(0, barY, barWidth, 25);
-    ctx.fillStyle = metrics.totalEnergy > 0.05 ? "#ef4444" : metrics.totalEnergy > 0.02 ? "#f59e0b" : "#22c55e";
-    ctx.fillRect(0, barY, energyWidth, 25);
+    // Score bar at bottom
+    const barH = 20;
+    const barY = canvas.height - barH;
+    ctx.fillStyle = "rgba(0,0,0,0.7)";
+    ctx.fillRect(0, barY, canvas.width, barH);
+    const score = regionChanges.reduce((a, b) => a + b, 0) / regionChanges.length;
+    const barWidth = Math.min(score * canvas.width * 8, canvas.width);
+    ctx.fillStyle = score > 0.05 ? "#ef4444" : score > 0.02 ? "#f59e0b" : "#22c55e";
+    ctx.fillRect(0, barY, barWidth, barH);
     ctx.fillStyle = "white";
     ctx.font = "11px Arial";
-    ctx.fillText(`Motion: ${(metrics.totalEnergy * 100).toFixed(1)}%`, 8, barY + 16);
+    ctx.fillText(`Accumulated Change: ${(score * 100).toFixed(1)}%`, 8, barY + 14);
   };
 
-  const createIncidentFromDetection = async (alert: IncidentAlert) => {
-    const { data: incident, error } = await supabase
+  const createIncident = async (alert: IncidentAlert) => {
+    const { data: incident } = await supabase
       .from("incidents")
       .insert({
         severity: alert.severity,
@@ -299,16 +298,12 @@ export default function VideoAnalysisPage() {
         longitude: alert.longitude,
         location_name: `Video Analysis: ${selectedClip?.name}`,
         detection_confidence: alert.confidence,
-        detection_data: { source: "motion_energy", clip: selectedClip?.name },
+        detection_data: { source: "accumulated_change", clip: selectedClip?.name },
         video_clip_url: selectedClip?.src || null,
         status: "detected",
       })
       .select()
       .single();
-
-    if (error) {
-      console.error("Incident insert error:", error);
-    }
 
     setIncidents((prev) => [...prev, alert]);
     toast.error(`ACCIDENT DETECTED: ${alert.type.replace(/_/g, " ")} (${alert.severity}) — dispatching ambulance!`);
@@ -318,12 +313,8 @@ export default function VideoAnalysisPage() {
         type: "broadcast",
         event: "new_incident",
         payload: {
-          incident_id: incident.id,
-          severity: alert.severity,
-          incident_type: alert.type,
-          latitude: alert.latitude,
-          longitude: alert.longitude,
-          video_clip_url: selectedClip?.src,
+          incident_id: incident.id, severity: alert.severity, incident_type: alert.type,
+          latitude: alert.latitude, longitude: alert.longitude, video_clip_url: selectedClip?.src,
           message: `ACCIDENT from video analysis: ${alert.type.replace(/_/g, " ")}`,
         },
       });
@@ -337,10 +328,16 @@ export default function VideoAnalysisPage() {
     try { await video.play(); } catch {
       video.muted = false;
       try { await video.play(); } catch {
-        toast.error("Could not play video. Try again.");
+        toast.error("Could not play video.");
         return;
       }
     }
+
+    // Reset all state
+    accumulatedMapRef.current.fill(0);
+    prevGrayMapRef.current = null;
+    baselineGrayRef.current = null;
+    frameNumRef.current = 0;
 
     setVideoReady(true);
     setIsAnalyzing(true);
@@ -350,34 +347,44 @@ export default function VideoAnalysisPage() {
     stateFrameRef.current = 0;
     frameCountRef.current = 0;
     alertCooldownRef.current = 0;
-    prevFrameRef.current = null;
-    motionHistoryRef.current = [];
-    bgModelRef.current = null;
-    spikeFrameRef.current = 0;
-    setMotionHistory([]);
+    setRegionHeatmap([]);
+    setMotionScore(0);
 
     await new Promise((r) => setTimeout(r, 300));
 
-    intervalRef.current = setInterval(() => {
-      const frame = captureFrame();
-      if (!frame) return;
+    // Main analysis loop — wrapped in try/catch to prevent crashes
+    const runLoop = () => {
+      try {
+        if (!videoRef.current || videoRef.current.paused || videoRef.current.ended) return;
 
-      frameCountRef.current++;
-      const fn = frameCountRef.current;
+        const video = videoRef.current;
+        const canvas = getAnalysisCanvas();
+        canvas.width = 320;
+        canvas.height = 240;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
 
-      if (alertCooldownRef.current > 0) alertCooldownRef.current--;
+        ctx.drawImage(video, 0, 0, 320, 240);
+        const frame = ctx.getImageData(0, 0, 320, 240);
 
-      let metrics: MotionMetrics | null = null;
-      if (prevFrameRef.current) {
-        metrics = analyzeMotion(frame, prevFrameRef.current, fn);
-        setMotionMetrics(metrics);
-        setMotionHistory([...motionHistoryRef.current]);
+        frameNumRef.current++;
+        frameCountRef.current++;
+        const fn = frameNumRef.current;
 
-        // Draw overlay
-        drawMotionOverlay(metrics);
+        if (alertCooldownRef.current > 0) alertCooldownRef.current--;
 
-        // Detect accident
-        const result = detectAccident(metrics, fn);
+        // Convert to grid and analyze
+        const grid = frameToGrid(frame);
+        const analysis = analyzeAccumulated(grid);
+
+        setRegionHeatmap(analysis.regionChanges);
+        setMotionScore(analysis.totalChange / (GRID_COLS * GRID_ROWS));
+
+        // Draw heatmap
+        drawHeatmap(analysis.regionChanges);
+
+        // Detect
+        const result = detectAccident(analysis, fn);
 
         stateFrameRef.current++;
         let state = stateRef.current;
@@ -386,14 +393,10 @@ export default function VideoAnalysisPage() {
           if (state === "monitoring") state = "watching";
           else if (state === "watching") state = "confirming";
           else if (state === "confirming") state = "alert";
-        } else if (!demoMode) {
-          // Decay in real mode
-          if (state !== "monitoring" && fn % 4 === 0) {
-            state = state === "alert" ? "confirming" : state === "confirming" ? "watching" : "monitoring";
-          }
+        } else if (!demoMode && fn % 5 === 0) {
+          state = state === "alert" ? "confirming" : state === "confirming" ? "watching" : "monitoring";
         }
 
-        // Demo mode: time-based
         if (demoMode) {
           const sf = stateFrameRef.current;
           if (sf === 15 && state === "monitoring") state = "watching";
@@ -401,19 +404,16 @@ export default function VideoAnalysisPage() {
           if (sf >= 35 && state === "confirming") state = "alert";
         }
 
-        // Trigger alert — 10s cooldown so real accident after false alarm still triggers
         if (state === "alert" && stateRef.current !== "alert" && alertCooldownRef.current <= 0) {
-          alertCooldownRef.current = 40; // 10 seconds
-
-          createIncidentFromDetection({
-            type: result.type || "vehicle_collision",
+          alertCooldownRef.current = 40;
+          createIncident({
+            type: "vehicle_collision",
             severity: result.confidence > 0.7 ? "critical" : "major",
             confidence: result.confidence,
             timestamp: new Date().toISOString(),
             latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
             longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
           });
-
           setTimeout(() => {
             stateRef.current = "monitoring";
             stateFrameRef.current = 0;
@@ -423,14 +423,21 @@ export default function VideoAnalysisPage() {
 
         stateRef.current = state;
         setCurrentState(state);
+      } catch (err) {
+        console.error("Analysis frame error:", err);
       }
 
-      prevFrameRef.current = frame;
-    }, 250);
+      // Schedule next frame — always reschedules unless stopped
+      if (isAnalyzing && videoRef.current && !videoRef.current.paused) {
+        intervalRef.current = setTimeout(runLoop, 250) as unknown as NodeJS.Timeout;
+      }
+    };
+
+    runLoop();
   };
 
   const stopAnalysis = () => {
-    if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+    if (intervalRef.current) { clearTimeout(intervalRef.current); intervalRef.current = null; }
     if (videoRef.current) { videoRef.current.pause(); videoRef.current.currentTime = 0; }
     setIsAnalyzing(false);
     setCurrentState("monitoring");
@@ -440,15 +447,14 @@ export default function VideoAnalysisPage() {
   const resetClip = () => {
     stopAnalysis();
     setIncidents([]);
-    setMotionMetrics(null);
-    setMotionHistory([]);
-    prevFrameRef.current = null;
-    frameCountRef.current = 0;
+    setRegionHeatmap([]);
+    setMotionScore(0);
+    accumulatedMapRef.current.fill(0);
+    prevGrayMapRef.current = null;
+    baselineGrayRef.current = null;
+    frameNumRef.current = 0;
     stateFrameRef.current = 0;
     alertCooldownRef.current = 0;
-    motionHistoryRef.current = [];
-    bgModelRef.current = null;
-    spikeFrameRef.current = 0;
   };
 
   const stateColors: Record<string, string> = {
@@ -466,7 +472,7 @@ export default function VideoAnalysisPage() {
 
       <div>
         <h1 className="text-2xl font-bold">Video Analysis</h1>
-        <p className="text-muted-foreground">Motion energy anomaly detection — accidents auto-dispatch ambulance</p>
+        <p className="text-muted-foreground">Accumulated region change detection — detects permanent scene changes</p>
       </div>
 
       {!selectedClip ? (
@@ -481,10 +487,6 @@ export default function VideoAnalysisPage() {
                 <div className="flex-1 min-w-0">
                   <h3 className="font-semibold truncate">{clip.name}</h3>
                   <p className="text-sm text-muted-foreground mt-1">{clip.description}</p>
-                  <div className="mt-3 flex items-center gap-2">
-                    <span className="px-2 py-1 bg-primary/20 text-primary rounded text-xs">AI Analysis</span>
-                    <span className="px-2 py-1 bg-background rounded text-xs">{clip.src}</span>
-                  </div>
                 </div>
               </div>
             </button>
@@ -513,17 +515,10 @@ export default function VideoAnalysisPage() {
                   )}
 
                   {isAnalyzing && (
-                    <>
-                      <div className="absolute top-4 left-4 flex items-center gap-2">
-                        <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
-                        <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">Motion Analysis Active</span>
-                      </div>
-                      {motionMetrics && (
-                        <div className="absolute top-4 right-4 bg-black/60 px-3 py-1 rounded text-sm">
-                          Energy: {(motionMetrics.totalEnergy * 100).toFixed(1)}%
-                        </div>
-                      )}
-                    </>
+                    <div className="absolute top-4 left-4 flex items-center gap-2">
+                      <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
+                      <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">Analyzing</span>
+                    </div>
                   )}
                 </div>
 
@@ -559,7 +554,6 @@ export default function VideoAnalysisPage() {
             </div>
 
             <div className="space-y-4">
-              {/* Detection State */}
               <div className="bg-card p-4 rounded-xl border border-border">
                 <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> Detection State</h3>
                 <div className="space-y-2">
@@ -572,75 +566,43 @@ export default function VideoAnalysisPage() {
                 </div>
               </div>
 
-              {/* Motion Energy */}
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2"><Zap size={16} /> Motion Energy</h3>
-                {motionMetrics ? (
+                <h3 className="font-semibold mb-3 flex items-center gap-2"><Eye size={16} /> Region Analysis</h3>
+                {regionHeatmap.length > 0 ? (
                   <div className="space-y-3">
                     <div>
                       <div className="flex justify-between text-sm mb-1">
-                        <span className="text-muted-foreground">Total Energy</span>
-                        <span className={motionMetrics.totalEnergy > 0.05 ? "text-red-500 font-bold" : ""}>
-                          {(motionMetrics.totalEnergy * 100).toFixed(1)}%
+                        <span className="text-muted-foreground">Accumulated Change</span>
+                        <span className={motionScore > 0.05 ? "text-red-500 font-bold" : ""}>
+                          {(motionScore * 100).toFixed(1)}%
                         </span>
                       </div>
                       <div className="w-full bg-background rounded-full h-2">
-                        <div className={`h-2 rounded-full transition-all ${motionMetrics.totalEnergy > 0.05 ? "bg-red-500" : motionMetrics.totalEnergy > 0.02 ? "bg-yellow-500" : "bg-green-500"}`}
-                          style={{ width: `${Math.min(motionMetrics.totalEnergy * 500, 100)}%` }} />
+                        <div className={`h-2 rounded-full transition-all ${motionScore > 0.05 ? "bg-red-500" : motionScore > 0.02 ? "bg-yellow-500" : "bg-green-500"}`}
+                          style={{ width: `${Math.min(motionScore * 500, 100)}%` }} />
                       </div>
                     </div>
-                    <div>
-                      <div className="flex justify-between text-sm mb-1">
-                        <span className="text-muted-foreground">Hotspot Intensity</span>
-                        <span className={motionMetrics.maxRegionEnergy > 0.15 ? "text-red-500 font-bold" : ""}>
-                          {(motionMetrics.maxRegionEnergy * 100).toFixed(1)}%
-                        </span>
-                      </div>
-                      <div className="w-full bg-background rounded-full h-2">
-                        <div className={`h-2 rounded-full transition-all ${motionMetrics.maxRegionEnergy > 0.15 ? "bg-red-500" : "bg-green-500"}`}
-                          style={{ width: `${Math.min(motionMetrics.maxRegionEnergy * 300, 100)}%` }} />
-                      </div>
-                    </div>
-                    <div className="flex justify-between text-sm">
-                      <span className="text-muted-foreground">Gradient</span>
-                      <span className={motionMetrics.motionGradient > 0.5 ? "text-orange-500" : ""}>
-                        {motionMetrics.motionGradient > 0 ? "+" : ""}{(motionMetrics.motionGradient * 100).toFixed(0)}%
-                      </span>
-                    </div>
-                    <div className="flex justify-between text-sm">
-                      <span className="text-muted-foreground">Hotspots</span>
-                      <span>{motionMetrics.hotspots.length}</span>
+                    {/* Mini heatmap grid */}
+                    <div className="grid grid-cols-8 gap-px">
+                      {regionHeatmap.map((val, i) => (
+                        <div key={i} className="aspect-square rounded-sm"
+                          style={{
+                            backgroundColor: val > 0.1 ? `rgb(${Math.floor(val * 500)}, 0, 0)` :
+                              val > 0.03 ? `rgb(${Math.floor(val * 2000)}, ${Math.floor(val * 500)}, 0)` :
+                                `rgb(0, ${Math.floor(val * 2000)}, 0)`,
+                          }} />
+                      ))}
                     </div>
                   </div>
                 ) : (
-                  <p className="text-sm text-muted-foreground">{isAnalyzing ? "Analyzing motion..." : "Start analysis"}</p>
+                  <p className="text-sm text-muted-foreground">{isAnalyzing ? "Building baseline..." : "Start analysis"}</p>
                 )}
               </div>
 
-              {/* Motion History Chart */}
-              <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3">Motion Timeline</h3>
-                <div className="h-16 flex items-end gap-px">
-                  {motionHistory.length === 0 ? (
-                    <p className="text-xs text-muted-foreground w-full text-center">No data yet</p>
-                  ) : (
-                    motionHistory.map((val, i) => (
-                      <div key={i} className="flex-1 rounded-t"
-                        style={{
-                          height: `${Math.min(val * 800, 100)}%`,
-                          backgroundColor: val > 0.05 ? "#ef4444" : val > 0.02 ? "#f59e0b" : "#22c55e",
-                          opacity: 0.5 + (i / motionHistory.length) * 0.5,
-                        }} />
-                    ))
-                  )}
-                </div>
-              </div>
-
-              {/* Incidents */}
               <div className="bg-card p-4 rounded-xl border border-border">
                 <h3 className="font-semibold mb-3">Detected Incidents</h3>
                 {incidents.length === 0 ? (
-                  <p className="text-sm text-muted-foreground">{isAnalyzing ? "Monitoring for accidents..." : "No incidents detected"}</p>
+                  <p className="text-sm text-muted-foreground">{isAnalyzing ? "Monitoring..." : "No incidents"}</p>
                 ) : (
                   <div className="space-y-2">
                     {incidents.map((inc, i) => (
@@ -650,7 +612,6 @@ export default function VideoAnalysisPage() {
                           <span className="text-sm font-medium capitalize">{inc.type.replace(/_/g, " ")}</span>
                         </div>
                         <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
-                          <span className="capitalize">{inc.severity}</span>
                           <span>{(inc.confidence * 100).toFixed(0)}%</span>
                           <span className="flex items-center gap-1"><Clock size={10} />{new Date(inc.timestamp).toLocaleTimeString()}</span>
                         </div>
