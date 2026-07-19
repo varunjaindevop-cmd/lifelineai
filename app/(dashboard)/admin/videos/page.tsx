@@ -258,8 +258,10 @@ export default function VideoAnalysisPage() {
 
   const flowHistoryRef = useRef<Float32Array[]>([]); // last N flow snapshots
   const disruptionFramesRef = useRef(0); // how many consecutive frames show disruption
+  const consecutiveAnomalyRef = useRef(0); // consecutive frames with real anomaly evidence
   const FLOW_GRID = 4; // 4x3 flow grid
   const DISRUPTION_PERSIST_THRESHOLD = 8; // require ~8 consecutive disrupted frames (~1.6s at 5fps)
+  const STATE_ADVANCE_THRESHOLD = 15; // require 15 consecutive anomaly frames before going from confirming->alert
 
   const analyzeTrafficFlow = (tracked: Blob[]): { disrupted: boolean; confidence: number; reason: string } => {
     const validBlobs = tracked.filter(b => b.frames >= 3);
@@ -516,6 +518,7 @@ export default function VideoAnalysisPage() {
     stateFrameRef.current = 0;
     cooldownRef.current = 0;
     disruptionFramesRef.current = 0;
+    consecutiveAnomalyRef.current = 0;
     stateRef.current = "monitoring";
     nextId = 1;
 
@@ -575,21 +578,34 @@ export default function VideoAnalysisPage() {
         const accumThreshold = isMarketplaceScene ? 0.08 : 0.04;
         const accumAnomaly = avgChange > accumThreshold;
 
-        const anyAnomaly = collision || trafficAnomaly?.disrupted || accumAnomaly;
+        // In traffic mode, motion is EXPECTED. Only real anomaly evidence counts:
+        // - collision (direct impact detected)
+        // - trafficAnomaly.disrupted (sustained flow disruption)
+        // accumulated change alone should NOT trigger alerts in traffic mode
+        const hasRealAnomaly = analysisMode === "traffic"
+          ? !!(collision || trafficAnomaly?.disrupted)
+          : !!(collision || trafficAnomaly?.disrupted || accumAnomaly);
 
         // Draw
         drawBoxes(tracked, collision);
         setObjectCount(validTracked.length);
 
+        // Track consecutive anomaly frames — must be truly sustained
+        if (hasRealAnomaly) {
+          consecutiveAnomalyRef.current++;
+        } else {
+          consecutiveAnomalyRef.current = 0;
+        }
+
         // State machine — require sustained anomaly, not single-frame spikes
         stateFrameRef.current++;
         let st = stateRef.current;
 
-        if (anyAnomaly) {
-          // Only advance state if anomaly persists for multiple frames
+        if (hasRealAnomaly && consecutiveAnomalyRef.current >= 3) {
+          // Only advance state if real anomaly has persisted for multiple frames
           if (st === "monitoring") st = "watching";
-          else if (st === "watching" && stateFrameRef.current > 5) st = "confirming";
-          else if (st === "confirming" && stateFrameRef.current > 10) st = "alert";
+          else if (st === "watching" && consecutiveAnomalyRef.current >= 8) st = "confirming";
+          else if (st === "confirming" && consecutiveAnomalyRef.current >= STATE_ADVANCE_THRESHOLD) st = "alert";
         } else if (!demoMode && frameRef.current % 6 === 0) {
           // Decay: only step down every 6 frames to avoid oscillation
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
@@ -603,7 +619,8 @@ export default function VideoAnalysisPage() {
         }
 
         if (st === "alert" && stateRef.current !== "alert" && cooldownRef.current <= 0) {
-          cooldownRef.current = 40;
+          cooldownRef.current = 90; // 18 seconds at 5fps — long cooldown for traffic
+          consecutiveAnomalyRef.current = 0; // reset after alert
 
           // Determine correct incident type based on what was detected
           let incidentType = "vehicle_collision";
@@ -618,10 +635,9 @@ export default function VideoAnalysisPage() {
             const isPedCollision = collision.a.class === "person" || collision.b.class === "person";
             incidentType = isPedCollision ? "pedestrian_collision" : "vehicle_collision";
             severity = collision.confidence > 0.7 ? "critical" : collision.confidence > 0.5 ? "major" : "minor";
-          } else if (accumAnomaly && isMarketplaceScene) {
-            // In marketplace, accumulated change alone is NOT an accident
-            // Only trigger if there's also collision evidence — suppress otherwise
-            incidentType = ""; // will skip below
+          } else {
+            // No real evidence — suppress
+            incidentType = "";
           }
 
           // Only create incident if we have a valid type
@@ -634,7 +650,7 @@ export default function VideoAnalysisPage() {
               latitude: LAT + (Math.random()-0.5)*0.01,
               longitude: LNG + (Math.random()-0.5)*0.01,
             });
-            setTimeout(() => { stateRef.current = "monitoring"; stateFrameRef.current = 0; setState("monitoring"); }, 5000);
+            setTimeout(() => { stateRef.current = "monitoring"; stateFrameRef.current = 0; setState("monitoring"); }, 10000);
           } else {
             // Suppress alert — reset to monitoring
             stateRef.current = "monitoring";
@@ -671,6 +687,7 @@ export default function VideoAnalysisPage() {
     stateFrameRef.current = 0;
     cooldownRef.current = 0;
     disruptionFramesRef.current = 0;
+    consecutiveAnomalyRef.current = 0;
     setObjectCount(0);
   };
 
