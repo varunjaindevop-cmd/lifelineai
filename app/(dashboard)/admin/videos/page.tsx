@@ -4,244 +4,247 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import {
   ArrowLeft, Video, Play, Pause, AlertTriangle, Clock,
-  Navigation, RotateCcw, Loader2, Zap, Eye,
+  Navigation, RotateCcw, Loader2, Zap,
 } from "lucide-react";
 import Link from "next/link";
 import { toast } from "sonner";
 
-interface VideoClip {
-  name: string;
-  src: string;
-  description: string;
-}
-
-interface IncidentAlert {
-  type: string;
-  severity: string;
-  confidence: number;
-  timestamp: string;
-  latitude: number;
-  longitude: number;
-}
+interface VideoClip { name: string; src: string; description: string }
+interface IncidentAlert { type: string; severity: string; confidence: number; timestamp: string; latitude: number; longitude: number }
+interface Blob { id: number; cx: number; cy: number; w: number; h: number; vx: number; vy: number; frames: number; lastSeen: number; class: string; positions: {x:number;y:number}[]; _near?: number }
 
 const VIDEO_CLIPS: VideoClip[] = [
-  { name: "accident_sample.mp4", src: "/videos/accident_sample.mp4", description: "Vehicle collision scenario" },
-  { name: "camera2_demo.mp4", src: "/videos/camera2_demo.mp4", description: "Traffic monitoring demo" },
-  { name: "camera4_demo.mp4", src: "/videos/camera4_demo.mp4", description: "Intersection monitoring demo" },
-  { name: "checking.mp4", src: "/videos/checking.mp4", description: "System verification clip" },
+  { name: "accident_sample.mp4", src: "/videos/accident_sample.mp4", description: "Vehicle collision" },
+  { name: "camera2_demo.mp4", src: "/videos/camera2_demo.mp4", description: "Traffic monitoring" },
+  { name: "camera4_demo.mp4", src: "/videos/camera4_demo.mp4", description: "Intersection monitoring" },
+  { name: "checking.mp4", src: "/videos/checking.mp4", description: "System check" },
 ];
 
-const DEMO_LAT = 22.7196;
-const DEMO_LNG = 75.8577;
-
-const GRID_COLS = 8;
-const GRID_ROWS = 6;
+const LAT = 22.7196, LNG = 75.8577;
+const W = 320, H = 240;
+let nextId = 1;
 
 export default function VideoAnalysisPage() {
   const [selectedClip, setSelectedClip] = useState<VideoClip | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [videoReady, setVideoReady] = useState(false);
   const [incidents, setIncidents] = useState<IncidentAlert[]>([]);
-  const [currentState, setCurrentState] = useState("monitoring");
-  const [regionHeatmap, setRegionHeatmap] = useState<number[]>([]);
-  const [motionScore, setMotionScore] = useState(0);
+  const [state, setState] = useState("monitoring");
   const [demoMode, setDemoMode] = useState(false);
+  const [objectCount, setObjectCount] = useState(0);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const analysisCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const tmpCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const rafRef = useRef<number>(0);
+  const blobsRef = useRef<Blob[]>([]);
   const stateRef = useRef("monitoring");
-  const frameCountRef = useRef(0);
+  const frameRef = useRef(0);
   const stateFrameRef = useRef(0);
-  const alertCooldownRef = useRef(0);
+  const cooldownRef = useRef(0);
+  const prevGridRef = useRef<Float32Array | null>(null);
+  const accumRef = useRef<Float32Array>(new Float32Array(48));
   const supabase = createClient();
 
-  // Accumulated region change map — THE KEY INNOVATION
-  // Instead of instantaneous motion, we ACCUMULATE changes over time.
-  // Passing car: accumulates briefly, then decays → low value
-  // Accident: accumulates and STAYS → high value triggers alert
-  const accumulatedMapRef = useRef<Float32Array>(new Float32Array(GRID_COLS * GRID_ROWS));
-  const prevGrayMapRef = useRef<Float32Array | null>(null);
-  const baselineGrayRef = useRef<Float32Array | null>(null);
-  const frameNumRef = useRef(0);
+  useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
+  useEffect(() => { setVideoReady(false); const t = setTimeout(() => setVideoReady(true), 8000); return () => clearTimeout(t); }, [selectedClip]);
 
-  useEffect(() => {
-    return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-    };
+  const getTmp = useCallback(() => {
+    if (!tmpCanvasRef.current) tmpCanvasRef.current = document.createElement("canvas");
+    return tmpCanvasRef.current;
   }, []);
 
-  useEffect(() => {
-    setVideoReady(false);
-    const timeout = setTimeout(() => setVideoReady(true), 8000);
-    return () => clearTimeout(timeout);
-  }, [selectedClip]);
-
-  const handleVideoReady = () => setVideoReady(true);
-  const handleVideoError = () => {
-    setTimeout(() => { if (videoRef.current) videoRef.current.load(); }, 1000);
+  // Convert frame to 8x6 grid of grayscale averages
+  const toGrid = (data: Uint8ClampedArray, w: number, h: number): Float32Array => {
+    const g = new Float32Array(48);
+    const cw = Math.floor(w / 8), ch = Math.floor(h / 6);
+    for (let r = 0; r < 6; r++) for (let c = 0; c < 8; c++) {
+      let s = 0, n = 0;
+      for (let dy = 0; dy < ch; dy += 2) for (let dx = 0; dx < cw; dx += 2) {
+        const i = ((r * ch + dy) * w + (c * cw + dx)) * 4;
+        s += data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114; n++;
+      }
+      g[r * 8 + c] = n > 0 ? s / n : 128;
+    }
+    return g;
   };
 
-  const getAnalysisCanvas = useCallback(() => {
-    if (!analysisCanvasRef.current) analysisCanvasRef.current = document.createElement("canvas");
-    return analysisCanvasRef.current;
-  }, []);
+  // Find motion blobs from frame difference
+  const findBlobs = (curr: Uint8ClampedArray, prev: Uint8ClampedArray, w: number, h: number): { cx: number; cy: number; w: number; h: number; mass: number }[] => {
+    const diff = new Uint8Array(w * h);
+    for (let i = 0; i < diff.length; i++) {
+      const j = i * 4;
+      const g1 = curr[j]*0.299 + curr[j+1]*0.587 + curr[j+2]*0.114;
+      const g2 = prev[j]*0.299 + prev[j+1]*0.587 + prev[j+2]*0.114;
+      diff[i] = Math.abs(g1 - g2) > 20 ? 1 : 0;
+    }
 
-  // Convert frame to low-res grayscale grid (8x6 regions)
-  const frameToGrid = useCallback((frame: ImageData): Float32Array => {
-    const w = frame.width;
-    const h = frame.height;
-    const data = frame.data;
-    const grid = new Float32Array(GRID_COLS * GRID_ROWS);
-    const cellW = Math.floor(w / GRID_COLS);
-    const cellH = Math.floor(h / GRID_ROWS);
+    // Dilate
+    const dil = new Uint8Array(w * h);
+    const K = 4;
+    for (let y = K; y < h - K; y++) for (let x = K; x < w - K; x++) {
+      let mx = 0;
+      for (let dy = -K; dy <= K; dy += 2) for (let dx = -K; dx <= K; dx += 2)
+        if (diff[(y+dy)*w+(x+dx)] > mx) mx = diff[(y+dy)*w+(x+dx)];
+      dil[y*w+x] = mx;
+    }
 
-    for (let gy = 0; gy < GRID_ROWS; gy++) {
-      for (let gx = 0; gx < GRID_COLS; gx++) {
-        let sum = 0;
-        let count = 0;
-        const startX = gx * cellW;
-        const startY = gy * cellH;
-
-        for (let dy = 0; dy < cellH; dy += 2) {
-          for (let dx = 0; dx < cellW; dx += 2) {
-            const px = startX + dx;
-            const py = startY + dy;
-            if (px < w && py < h) {
-              const idx = (py * w + px) * 4;
-              sum += data[idx] * 0.299 + data[idx + 1] * 0.587 + data[idx + 2] * 0.114;
-              count++;
-            }
-          }
+    // Connected components
+    const vis = new Uint8Array(w * h);
+    const blobs: { cx: number; cy: number; w: number; h: number; mass: number }[] = [];
+    for (let y = K; y < h - K; y += 3) for (let x = K; x < w - K; x += 3) {
+      if (vis[y*w+x] || !dil[y*w+x]) continue;
+      let x0=x,x1=x,y0=y,y1=y,sx=0,sy=0,n=0;
+      const q = [x,y]; vis[y*w+x]=1;
+      while (q.length) {
+        const qx=q.shift()!, qy=q.shift()!;
+        sx+=qx; sy+=qy; n++;
+        if(qx<x0)x0=qx; if(qx>x1)x1=qx; if(qy<y0)y0=qy; if(qy>y1)y1=qy;
+        for (const [ddx,ddy] of [[-3,0],[3,0],[0,-3],[0,3]]) {
+          const nx=qx+ddx, ny=qy+ddy;
+          if (nx>=0&&nx<w&&ny>=0&&ny<h&&!vis[ny*w+nx]&&dil[ny*w+nx]) { vis[ny*w+nx]=1; q.push(nx,ny); }
         }
-        grid[gy * GRID_COLS + gx] = count > 0 ? sum / count : 128;
       }
-    }
-    return grid;
-  }, []);
-
-  // ========== CORE DETECTION: Accumulated Region Change ==========
-  // This is fundamentally different from motion energy:
-  // - Motion energy = instant snapshot → noisy, false alarms
-  // - Accumulated change = tracks PERMANENT scene changes over time
-  //
-  // How it works:
-  // 1. Each frame, compute per-region difference from previous frame
-  // 2. ADD the difference to an accumulated map (never resets to zero)
-  // 3. DECAY the map slowly (multiply by 0.98 each frame)
-  // 4. A region with HIGH accumulated change = something PERMANENTLY changed there
-  //
-  // Why this works:
-  // - Car passing: difference appears then disappears → accumulation stays low
-  // - Crowd walking: small gradual changes → accumulation stays moderate
-  // - Accident: sudden large change that PERSISTS → accumulation spikes
-
-  const analyzeAccumulated = useCallback((currentGrid: Float32Array): {
-    regionChanges: number[];
-    maxRegion: number;
-    totalChange: number;
-    spikeRegion: number;
-  } => {
-    const grid = accumulatedMapRef.current;
-    const prev = prevGrayMapRef.current;
-    const DECAY = 0.97; // slow decay — changes accumulate over time
-
-    let totalChange = 0;
-    let maxRegion = 0;
-    let spikeRegion = -1;
-
-    const regionChanges: number[] = [];
-
-    for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
-      // Frame-to-frame difference
-      const frameDiff = prev ? Math.abs(currentGrid[i] - prev[i]) / 255 : 0;
-
-      // Accumulate: add new difference, decay old
-      grid[i] = grid[i] * DECAY + frameDiff * 2; // multiply by 2 to boost signal
-
-      // Clamp to prevent overflow
-      if (grid[i] > 1) grid[i] = 1;
-
-      regionChanges.push(grid[i]);
-      totalChange += grid[i];
-
-      if (grid[i] > maxRegion) {
-        maxRegion = grid[i];
-        spikeRegion = i;
-      }
+      const bw=x1-x0, bh=y1-y0, area=bw*bh;
+      if (n < 25 || area < 300) continue;
+      blobs.push({ cx: sx/n, cy: sy/n, w: bw, h: bh, mass: area });
     }
 
-    prevGrayMapRef.current = new Float32Array(currentGrid);
+    // Merge overlapping blobs
+    const merged: typeof blobs = [];
+    const used = new Set<number>();
+    for (let i = 0; i < blobs.length; i++) {
+      if (used.has(i)) continue;
+      let b = blobs[i];
+      for (let j = i+1; j < blobs.length; j++) {
+        if (used.has(j)) continue;
+        const d = Math.sqrt((b.cx-blobs[j].cx)**2 + (b.cy-blobs[j].cy)**2);
+        if (d < Math.max(b.w, blobs[j].w) * 1.5) {
+          // Merge
+          const totalMass = b.mass + blobs[j].mass;
+          b = {
+            cx: (b.cx*b.mass + blobs[j].cx*blobs[j].mass) / totalMass,
+            cy: (b.cy*b.mass + blobs[j].cy*blobs[j].mass) / totalMass,
+            w: Math.max(b.w, blobs[j].w),
+            h: Math.max(b.h, blobs[j].h),
+            mass: totalMass,
+          };
+          used.add(j);
+        }
+      }
+      merged.push(b);
+      used.add(i);
+    }
 
-    return { regionChanges, maxRegion, totalChange, spikeRegion };
-  }, []);
+    return merged;
+  };
 
-  // Detect accident from accumulated changes
-  const detectAccident = useCallback((analysis: {
-    regionChanges: number[];
-    maxRegion: number;
-    totalChange: number;
-    spikeRegion: number;
-  }, frameNum: number): { detected: boolean; confidence: number } => {
-    const fn = frameNum;
+  // Track blobs across frames
+  const trackBlobs = (detections: { cx: number; cy: number; w: number; h: number; mass: number }[], frame: number): Blob[] => {
+    const tracked = blobsRef.current;
+    const matched = new Set<number>();
 
-    // Need baseline frames to settle
-    if (fn < 12) return { detected: false, confidence: 0 };
-
-    const avgChange = analysis.totalChange / (GRID_COLS * GRID_ROWS);
-
-    // Update baseline (average of older accumulated values)
-    if (!baselineGrayRef.current) {
-      baselineGrayRef.current = new Float32Array([avgChange]);
-    } else {
-      const history = baselineGrayRef.current;
-      // Keep last 30 values
-      if (history.length > 30) {
-        const newArr = new Float32Array(30);
-        newArr.set(history.subarray(history.length - 29));
-        newArr[29] = avgChange;
-        baselineGrayRef.current = newArr;
-      } else {
-        const newArr = new Float32Array(history.length + 1);
-        newArr.set(history);
-        newArr[history.length] = avgChange;
-        baselineGrayRef.current = newArr;
+    for (const blob of tracked) {
+      let best = -1, bestD = 50;
+      for (let i = 0; i < detections.length; i++) {
+        if (matched.has(i)) continue;
+        const d = Math.sqrt((blob.cx-detections[i].cx)**2 + (blob.cy-detections[i].cy)**2);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      if (best >= 0) {
+        const det = detections[best];
+        blob.vx = det.cx - blob.cx;
+        blob.vy = det.cy - blob.cy;
+        blob.cx = det.cx; blob.cy = det.cy;
+        blob.w = det.w; blob.h = det.h;
+        blob.frames++;
+        blob.lastSeen = frame;
+        blob.positions.push({ x: det.cx, y: det.cy });
+        if (blob.positions.length > 10) blob.positions.shift();
+        matched.add(best);
       }
     }
 
-    const baseline = baselineGrayRef.current;
-    const baselineAvg = baseline.length > 5
-      ? baseline.slice(0, baseline.length - 5).reduce((a, b) => a + b, 0) / (baseline.length - 5)
-      : 0.01;
+    // New blobs for unmatched
+    for (let i = 0; i < detections.length; i++) {
+      if (matched.has(i)) continue;
+      const d = detections[i];
+      tracked.push({
+        id: nextId++, cx: d.cx, cy: d.cy, w: d.w, h: d.h,
+        vx: 0, vy: 0, frames: 1, lastSeen: frame,
+        class: d.w / Math.max(d.h, 1) > 1.2 ? "car" : "person",
+        positions: [{ x: d.cx, y: d.cy }],
+      });
+    }
 
-    // Spike ratio: current accumulated change vs baseline
-    const spikeRatio = baselineAvg > 0.001 ? avgChange / baselineAvg : avgChange > 0.02 ? 5 : 0;
+    blobsRef.current = tracked.filter(b => frame - b.lastSeen < 5);
+    return blobsRef.current;
+  };
 
-    // Hot region: one specific region has much higher accumulation than others
-    const otherAvg = (analysis.totalChange - analysis.maxRegion) / Math.max(GRID_COLS * GRID_ROWS - 1, 1);
-    const hotRegionRatio = otherAvg > 0.001 ? analysis.maxRegion / otherAvg : 1;
+  // ========== COLLISION DETECTION ==========
+  const detectCollision = (blobs: Blob[]): { detected: boolean; confidence: number; a: Blob; b: Blob } | null => {
+    const vehicles = blobs.filter(b => b.class === "car" && b.frames >= 4);
+    const all = [...vehicles, ...blobs.filter(b => b.class === "person" && b.frames >= 4)];
 
-    // Confidence
-    const confidence = Math.min(0.95,
-      Math.min(spikeRatio / 3, 1) * 0.4 +
-      Math.min(hotRegionRatio / 5, 1) * 0.3 +
-      (analysis.maxRegion > 0.1 ? 0.2 : 0) +
-      (avgChange > 0.02 ? 0.1 : 0)
-    );
+    for (let i = 0; i < all.length; i++) {
+      for (let j = i + 1; j < all.length; j++) {
+        const a = all[i], b = all[j];
+        if (a.class === "person" && b.class === "person") continue;
 
-    // Detection: accumulated change spiked AND there's a hot region
-    const detected = (spikeRatio > 2.0 && analysis.maxRegion > 0.05) ||
-                     (spikeRatio > 3.0) || // very large spike overrides
-                     (hotRegionRatio > 4 && analysis.maxRegion > 0.08); // concentrated change
+        const dist = Math.sqrt((a.cx-b.cx)**2 + (a.cy-b.cy)**2);
+        const combinedR = (a.w + b.w) / 2;
 
-    return { detected, confidence };
-  }, []);
+        // Must be close
+        if (dist > combinedR * 1.5) continue;
 
-  // Draw heatmap overlay
-  const drawHeatmap = (regionChanges: number[]) => {
+        // Converging?
+        const dx = b.cx - a.cx, dy = b.cy - a.cy;
+        const dotA = a.vx * dx + a.vy * dy;
+        const converging = dotA > 0;
+
+        // Track sustained closeness
+        const closeThresh = combinedR * 1.2;
+        if (dist < closeThresh) {
+          a._near = (a._near || 0) + 1;
+          b._near = (b._near || 0) + 1;
+        } else {
+          a._near = Math.max(0, (a._near || 0) - 1);
+          b._near = Math.max(0, (b._near || 0) - 1);
+        }
+        const near = Math.min(a._near || 0, b._near || 0);
+
+        // Direction analysis
+        const angleA = Math.atan2(a.vy, a.vx);
+        const angleB = Math.atan2(b.vy, b.vx);
+        const angleDiff = Math.abs(angleA - angleB);
+        const parallel = angleDiff < Math.PI * 0.25 || angleDiff > Math.PI * 1.75;
+
+        if (parallel && dist > combinedR * 0.5) continue;
+
+        // Speed check — objects must be moving
+        const speedA = Math.sqrt(a.vx**2 + a.vy**2);
+        const speedB = Math.sqrt(b.vx**2 + b.vy**2);
+        const eitherMoving = speedA > 1 || speedB > 1;
+
+        // Very close OR close+converging+sustained
+        const veryClose = dist < combinedR * 0.6;
+        const closeConverging = dist < closeThresh && converging && near >= 2;
+
+        if ((veryClose || closeConverging) && eitherMoving) {
+          const conf = Math.min(0.95,
+            0.4 * (1 - dist / (combinedR * 1.5)) +
+            0.25 * (converging ? 1 : 0.3) +
+            0.2 * Math.min(near / 3, 1) +
+            0.15 * (!parallel ? 1 : 0.3)
+          );
+          if (conf > 0.4) return { detected: true, confidence: conf, a, b };
+        }
+      }
+    }
+    return null;
+  };
+
+  // Draw bounding boxes on video
+  const drawBoxes = (tracked: Blob[], collision: ReturnType<typeof detectCollision>) => {
     const canvas = canvasRef.current;
     const video = videoRef.current;
     if (!canvas || !video) return;
@@ -252,209 +255,207 @@ export default function VideoAnalysisPage() {
     canvas.height = video.videoHeight || 480;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    const cellW = canvas.width / GRID_COLS;
-    const cellH = canvas.height / GRID_ROWS;
+    const sx = canvas.width / W, sy = canvas.height / H;
 
-    for (let i = 0; i < regionChanges.length; i++) {
-      const gx = i % GRID_COLS;
-      const gy = Math.floor(i / GRID_COLS);
-      const val = Math.min(regionChanges[i] * 4, 1); // boost visibility
+    for (const blob of tracked) {
+      if (blob.frames < 3) continue;
+      const x = (blob.cx - blob.w/2) * sx;
+      const y = (blob.cy - blob.h/2) * sy;
+      const w = blob.w * sx;
+      const h = blob.h * sy;
 
-      if (val > 0.05) {
-        const r = Math.floor(val * 255);
-        const g = Math.floor((1 - val) * 100);
-        ctx.fillStyle = `rgba(${r}, ${g}, 0, ${val * 0.5})`;
-        ctx.fillRect(gx * cellW, gy * cellH, cellW, cellH);
+      const isCollision = collision && (collision.a.id === blob.id || collision.b.id === blob.id);
+      const color = isCollision ? "#ef4444" : blob.class === "car" ? "#22c55e" : "#3b82f6";
 
-        if (val > 0.3) {
-          ctx.strokeStyle = `rgba(255, 0, 0, ${val * 0.7})`;
-          ctx.lineWidth = 2;
-          ctx.strokeRect(gx * cellW, gy * cellH, cellW, cellH);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = isCollision ? 3 : 2;
+      ctx.strokeRect(x, y, w, h);
+
+      const speed = Math.round(Math.sqrt(blob.vx**2 + blob.vy**2) * 5);
+      const label = `${blob.class} ${blob.frames}f ${speed}km/h`;
+      ctx.font = "bold 12px Arial";
+      const tw = ctx.measureText(label).width;
+      ctx.fillStyle = color;
+      ctx.fillRect(x, y - 18, tw + 8, 18);
+      ctx.fillStyle = "white";
+      ctx.fillText(label, x + 4, y - 5);
+
+      // Trail
+      if (blob.positions.length > 2) {
+        ctx.beginPath();
+        ctx.strokeStyle = `${color}66`;
+        ctx.lineWidth = 1;
+        for (let i = 0; i < blob.positions.length; i++) {
+          const px = blob.positions[i].x * sx, py = blob.positions[i].y * sy;
+          i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
         }
+        ctx.stroke();
       }
     }
 
-    // Score bar at bottom
-    const barH = 20;
-    const barY = canvas.height - barH;
+    // Score bar
+    const score = accumRef.current.reduce((a,b) => a+b, 0) / 48;
+    const barY = canvas.height - 22;
     ctx.fillStyle = "rgba(0,0,0,0.7)";
-    ctx.fillRect(0, barY, canvas.width, barH);
-    const score = regionChanges.reduce((a, b) => a + b, 0) / regionChanges.length;
-    const barWidth = Math.min(score * canvas.width * 8, canvas.width);
-    ctx.fillStyle = score > 0.05 ? "#ef4444" : score > 0.02 ? "#f59e0b" : "#22c55e";
-    ctx.fillRect(0, barY, barWidth, barH);
+    ctx.fillRect(0, barY, canvas.width, 22);
+    ctx.fillStyle = score > 0.04 ? "#ef4444" : score > 0.02 ? "#f59e0b" : "#22c55e";
+    ctx.fillRect(0, barY, Math.min(score * canvas.width * 5, canvas.width), 22);
     ctx.fillStyle = "white";
     ctx.font = "11px Arial";
-    ctx.fillText(`Accumulated Change: ${(score * 100).toFixed(1)}%`, 8, barY + 14);
+    ctx.fillText(`Objects: ${tracked.filter(b=>b.frames>=3).length} | Change: ${(score*100).toFixed(1)}%`, 8, barY + 15);
   };
 
   const createIncident = async (alert: IncidentAlert) => {
-    const { data: incident } = await supabase
-      .from("incidents")
-      .insert({
-        severity: alert.severity,
-        incident_type: alert.type,
-        latitude: alert.latitude,
-        longitude: alert.longitude,
-        location_name: `Video Analysis: ${selectedClip?.name}`,
-        detection_confidence: alert.confidence,
-        detection_data: { source: "accumulated_change", clip: selectedClip?.name },
-        video_clip_url: selectedClip?.src || null,
-        status: "detected",
-      })
-      .select()
-      .single();
+    const { data: inc } = await supabase.from("incidents").insert({
+      severity: alert.severity, incident_type: alert.type,
+      latitude: alert.latitude, longitude: alert.longitude,
+      location_name: `Video Analysis: ${selectedClip?.name}`,
+      detection_confidence: alert.confidence,
+      detection_data: { source: "blob_tracking", clip: selectedClip?.name },
+      video_clip_url: selectedClip?.src || null,
+      status: "detected",
+    }).select().single();
 
-    setIncidents((prev) => [...prev, alert]);
-    toast.error(`ACCIDENT DETECTED: ${alert.type.replace(/_/g, " ")} (${alert.severity}) — dispatching ambulance!`);
+    setIncidents(prev => [...prev, alert]);
+    toast.error(`ACCIDENT: ${alert.type.replace(/_/g," ")} (${alert.severity})`);
 
-    if (incident) {
+    if (inc) {
       supabase.channel("alerts:ambulance").send({
-        type: "broadcast",
-        event: "new_incident",
-        payload: {
-          incident_id: incident.id, severity: alert.severity, incident_type: alert.type,
+        type: "broadcast", event: "new_incident",
+        payload: { incident_id: inc.id, severity: alert.severity, incident_type: alert.type,
           latitude: alert.latitude, longitude: alert.longitude, video_clip_url: selectedClip?.src,
-          message: `ACCIDENT from video analysis: ${alert.type.replace(/_/g, " ")}`,
-        },
+          message: `ACCIDENT: ${alert.type.replace(/_/g," ")}` },
       });
     }
   };
 
   const startAnalysis = async () => {
     if (!videoRef.current || !selectedClip) return;
-
     const video = videoRef.current;
-    try { await video.play(); } catch {
-      video.muted = false;
-      try { await video.play(); } catch {
-        toast.error("Could not play video.");
-        return;
-      }
-    }
+    try { await video.play(); } catch { video.muted = false; try { await video.play(); } catch { toast.error("Cannot play video"); return; } }
 
-    // Reset all state
-    accumulatedMapRef.current.fill(0);
-    prevGrayMapRef.current = null;
-    baselineGrayRef.current = null;
-    frameNumRef.current = 0;
+    // Reset
+    blobsRef.current = [];
+    prevGridRef.current = null;
+    accumRef.current.fill(0);
+    frameRef.current = 0;
+    stateFrameRef.current = 0;
+    cooldownRef.current = 0;
+    stateRef.current = "monitoring";
+    nextId = 1;
 
     setVideoReady(true);
     setIsAnalyzing(true);
     setIncidents([]);
-    setCurrentState("monitoring");
-    stateRef.current = "monitoring";
-    stateFrameRef.current = 0;
-    frameCountRef.current = 0;
-    alertCooldownRef.current = 0;
-    setRegionHeatmap([]);
-    setMotionScore(0);
+    setState("monitoring");
+    setObjectCount(0);
 
-    await new Promise((r) => setTimeout(r, 300));
+    let prevFrameData: Uint8ClampedArray | null = null;
 
-    // Main analysis loop — wrapped in try/catch to prevent crashes
-    const runLoop = () => {
+    const loop = () => {
       try {
         if (!videoRef.current || videoRef.current.paused || videoRef.current.ended) return;
 
-        const video = videoRef.current;
-        const canvas = getAnalysisCanvas();
-        canvas.width = 320;
-        canvas.height = 240;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
+        const tmp = getTmp();
+        tmp.width = W; tmp.height = H;
+        const ctx = tmp.getContext("2d")!;
+        ctx.drawImage(video, 0, 0, W, H);
+        const imgData = ctx.getImageData(0, 0, W, H);
+        const data = imgData.data;
 
-        ctx.drawImage(video, 0, 0, 320, 240);
-        const frame = ctx.getImageData(0, 0, 320, 240);
+        frameRef.current++;
+        if (cooldownRef.current > 0) cooldownRef.current--;
 
-        frameNumRef.current++;
-        frameCountRef.current++;
-        const fn = frameNumRef.current;
+        // Accumulated change for anomaly detection
+        const grid = toGrid(data, W, H);
+        const prev = prevGridRef.current;
+        let gridChange = 0;
+        for (let i = 0; i < 48; i++) {
+          const diff = prev ? Math.abs(grid[i] - prev[i]) / 255 : 0;
+          accumRef.current[i] = accumRef.current[i] * 0.97 + diff * 2;
+          gridChange += accumRef.current[i];
+        }
+        prevGridRef.current = grid;
 
-        if (alertCooldownRef.current > 0) alertCooldownRef.current--;
+        // Find motion blobs
+        let tracked: Blob[] = [];
+        if (prevFrameData) {
+          const detections = findBlobs(data, prevFrameData, W, H);
+          tracked = trackBlobs(detections, frameRef.current);
+        }
+        prevFrameData = new Uint8ClampedArray(data);
 
-        // Convert to grid and analyze
-        const grid = frameToGrid(frame);
-        const analysis = analyzeAccumulated(grid);
+        // Detect collision
+        const collision = detectCollision(tracked);
 
-        setRegionHeatmap(analysis.regionChanges);
-        setMotionScore(analysis.totalChange / (GRID_COLS * GRID_ROWS));
+        // Also check accumulated change anomaly
+        const avgChange = gridChange / 48;
+        const accumAnomaly = avgChange > 0.04; // sustained change threshold
 
-        // Draw heatmap
-        drawHeatmap(analysis.regionChanges);
+        // Draw
+        drawBoxes(tracked, collision);
+        setObjectCount(tracked.filter(b => b.frames >= 3).length);
 
-        // Detect
-        const result = detectAccident(analysis, fn);
-
+        // State machine
         stateFrameRef.current++;
-        let state = stateRef.current;
+        let st = stateRef.current;
 
-        if (result.detected) {
-          if (state === "monitoring") state = "watching";
-          else if (state === "watching") state = "confirming";
-          else if (state === "confirming") state = "alert";
-        } else if (!demoMode && fn % 5 === 0) {
-          state = state === "alert" ? "confirming" : state === "confirming" ? "watching" : "monitoring";
+        if (collision || accumAnomaly) {
+          if (st === "monitoring") st = "watching";
+          else if (st === "watching") st = "confirming";
+          else if (st === "confirming") st = "alert";
+        } else if (!demoMode && frameRef.current % 4 === 0) {
+          st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
 
         if (demoMode) {
           const sf = stateFrameRef.current;
-          if (sf === 15 && state === "monitoring") state = "watching";
-          if (sf === 25 && state === "watching") state = "confirming";
-          if (sf >= 35 && state === "confirming") state = "alert";
+          if (sf === 15 && st === "monitoring") st = "watching";
+          if (sf === 25 && st === "watching") st = "confirming";
+          if (sf >= 35 && st === "confirming") st = "alert";
         }
 
-        if (state === "alert" && stateRef.current !== "alert" && alertCooldownRef.current <= 0) {
-          alertCooldownRef.current = 40;
+        if (st === "alert" && stateRef.current !== "alert" && cooldownRef.current <= 0) {
+          cooldownRef.current = 40;
           createIncident({
-            type: "vehicle_collision",
-            severity: result.confidence > 0.7 ? "critical" : "major",
-            confidence: result.confidence,
+            type: collision ? "vehicle_collision" : "vehicle_collision",
+            severity: (collision?.confidence || 0) > 0.65 ? "critical" : "major",
+            confidence: collision?.confidence || 0.7,
             timestamp: new Date().toISOString(),
-            latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
-            longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
+            latitude: LAT + (Math.random()-0.5)*0.01,
+            longitude: LNG + (Math.random()-0.5)*0.01,
           });
-          setTimeout(() => {
-            stateRef.current = "monitoring";
-            stateFrameRef.current = 0;
-            setCurrentState("monitoring");
-          }, 5000);
+          setTimeout(() => { stateRef.current = "monitoring"; stateFrameRef.current = 0; setState("monitoring"); }, 5000);
         }
 
-        stateRef.current = state;
-        setCurrentState(state);
-      } catch (err) {
-        console.error("Analysis frame error:", err);
-      }
+        stateRef.current = st;
+        setState(st);
+      } catch(e) { console.error(e); }
 
-      // Schedule next frame — always reschedules unless stopped
-      if (isAnalyzing && videoRef.current && !videoRef.current.paused) {
-        intervalRef.current = setTimeout(runLoop, 250) as unknown as NodeJS.Timeout;
-      }
+      rafRef.current = requestAnimationFrame(loop);
     };
 
-    runLoop();
+    rafRef.current = requestAnimationFrame(loop);
   };
 
   const stopAnalysis = () => {
-    if (intervalRef.current) { clearTimeout(intervalRef.current); intervalRef.current = null; }
+    cancelAnimationFrame(rafRef.current);
     if (videoRef.current) { videoRef.current.pause(); videoRef.current.currentTime = 0; }
     setIsAnalyzing(false);
-    setCurrentState("monitoring");
+    setState("monitoring");
     stateRef.current = "monitoring";
   };
 
   const resetClip = () => {
     stopAnalysis();
     setIncidents([]);
-    setRegionHeatmap([]);
-    setMotionScore(0);
-    accumulatedMapRef.current.fill(0);
-    prevGrayMapRef.current = null;
-    baselineGrayRef.current = null;
-    frameNumRef.current = 0;
+    blobsRef.current = [];
+    prevGridRef.current = null;
+    accumRef.current.fill(0);
+    frameRef.current = 0;
     stateFrameRef.current = 0;
-    alertCooldownRef.current = 0;
+    cooldownRef.current = 0;
+    setObjectCount(0);
   };
 
   const stateColors: Record<string, string> = {
@@ -469,23 +470,22 @@ export default function VideoAnalysisPage() {
       <Link href="/admin" className="inline-flex items-center gap-2 text-muted-foreground hover:text-foreground">
         <ArrowLeft size={16} /> Back to Admin
       </Link>
-
       <div>
         <h1 className="text-2xl font-bold">Video Analysis</h1>
-        <p className="text-muted-foreground">Accumulated region change detection — detects permanent scene changes</p>
+        <p className="text-muted-foreground">Object tracking + accumulated change detection</p>
       </div>
 
       {!selectedClip ? (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {VIDEO_CLIPS.map((clip) => (
+          {VIDEO_CLIPS.map(clip => (
             <button key={clip.name} onClick={() => setSelectedClip(clip)}
               className="bg-card p-5 rounded-xl border border-border hover:border-primary/50 transition-colors text-left">
               <div className="flex items-start gap-4">
                 <div className="w-16 h-16 bg-background rounded-lg flex items-center justify-center shrink-0">
                   <Video className="w-8 h-8 text-primary" />
                 </div>
-                <div className="flex-1 min-w-0">
-                  <h3 className="font-semibold truncate">{clip.name}</h3>
+                <div>
+                  <h3 className="font-semibold">{clip.name}</h3>
                   <p className="text-sm text-muted-foreground mt-1">{clip.description}</p>
                 </div>
               </div>
@@ -498,53 +498,35 @@ export default function VideoAnalysisPage() {
             className="text-sm text-primary hover:underline">&larr; Choose different clip</button>
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div className="lg:col-span-2 space-y-4">
+            <div className="lg:col-span-2">
               <div className="bg-card rounded-xl border border-border overflow-hidden">
                 <div className="aspect-video bg-black relative">
-                  <video ref={videoRef} src={selectedClip.src}
-                    className="w-full h-full object-contain" playsInline muted loop
-                    onLoadedData={handleVideoReady} onCanPlay={handleVideoReady} onError={handleVideoError} />
+                  <video ref={videoRef} src={selectedClip.src} className="w-full h-full object-contain"
+                    playsInline muted loop onLoadedData={() => setVideoReady(true)} onCanPlay={() => setVideoReady(true)} />
                   <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ pointerEvents: "none" }} />
-
-                  {!videoReady && (
-                    <div className="absolute inset-0 flex items-center justify-center bg-black/50">
-                      <div className="flex items-center gap-2 text-white">
-                        <Loader2 className="w-5 h-5 animate-spin" /> <span className="text-sm">Loading video...</span>
-                      </div>
-                    </div>
-                  )}
-
-                  {isAnalyzing && (
-                    <div className="absolute top-4 left-4 flex items-center gap-2">
-                      <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
-                      <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">Analyzing</span>
-                    </div>
-                  )}
+                  {!videoReady && <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+                    <div className="flex items-center gap-2 text-white"><Loader2 className="w-5 h-5 animate-spin" /> Loading...</div>
+                  </div>}
+                  {isAnalyzing && <div className="absolute top-4 left-4 flex items-center gap-2">
+                    <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
+                    <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">Tracking {objectCount} objects</span>
+                  </div>}
                 </div>
-
                 <div className="p-4 border-t border-border flex items-center gap-3 flex-wrap">
                   {!isAnalyzing ? (
                     <button onClick={startAnalysis} disabled={!videoReady}
                       className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2 disabled:opacity-50">
-                      {videoReady ? <Play size={16} /> : <Loader2 size={16} className="animate-spin" />}
-                      {videoReady ? "Start Analysis" : "Loading..."}
+                      {videoReady ? <><Play size={16} /> Start Analysis</> : <><Loader2 size={16} className="animate-spin" /> Loading...</>}
                     </button>
                   ) : (
                     <>
-                      <button onClick={stopAnalysis} className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors flex items-center gap-2">
-                        <Pause size={16} /> Stop
-                      </button>
-                      <button onClick={resetClip} className="px-4 py-2 bg-card border border-border rounded-lg hover:bg-background transition-colors flex items-center gap-2">
-                        <RotateCcw size={16} /> Reset
-                      </button>
+                      <button onClick={stopAnalysis} className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors flex items-center gap-2"><Pause size={16} /> Stop</button>
+                      <button onClick={resetClip} className="px-4 py-2 bg-card border border-border rounded-lg hover:bg-background transition-colors flex items-center gap-2"><RotateCcw size={16} /> Reset</button>
                     </>
                   )}
                   <label className="flex items-center gap-2 text-sm cursor-pointer select-none ml-auto">
-                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${demoMode ? "bg-yellow-500/20 text-yellow-500" : "bg-green-500/20 text-green-500"}`}>
-                      {demoMode ? "DEMO" : "REAL"}
-                    </span>
-                    <div onClick={() => !isAnalyzing && setDemoMode(!demoMode)}
-                      className={`w-10 h-5 rounded-full transition-colors relative ${demoMode ? "bg-yellow-500" : "bg-green-600"}`}>
+                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${demoMode ? "bg-yellow-500/20 text-yellow-500" : "bg-green-500/20 text-green-500"}`}>{demoMode ? "DEMO" : "REAL"}</span>
+                    <div onClick={() => !isAnalyzing && setDemoMode(!demoMode)} className={`w-10 h-5 rounded-full transition-colors relative ${demoMode ? "bg-yellow-500" : "bg-green-600"}`}>
                       <div className={`w-4 h-4 bg-white rounded-full absolute top-0.5 transition-transform ${demoMode ? "translate-x-5" : "translate-x-0.5"}`} />
                     </div>
                     <span className="text-muted-foreground">{selectedClip.name}</span>
@@ -555,73 +537,49 @@ export default function VideoAnalysisPage() {
 
             <div className="space-y-4">
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> Detection State</h3>
+                <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> State</h3>
                 <div className="space-y-2">
-                  {["monitoring", "watching", "confirming", "alert"].map((state) => (
-                    <div key={state} className={`flex items-center gap-2 p-2 rounded ${currentState === state ? stateColors[state] : "text-muted-foreground"}`}>
-                      <div className={`w-2 h-2 rounded-full ${currentState === state ? "bg-current animate-pulse" : "bg-border"}`} />
-                      <span className="text-sm capitalize">{state}</span>
+                  {["monitoring","watching","confirming","alert"].map(s => (
+                    <div key={s} className={`flex items-center gap-2 p-2 rounded ${state===s ? stateColors[s] : "text-muted-foreground"}`}>
+                      <div className={`w-2 h-2 rounded-full ${state===s ? "bg-current animate-pulse" : "bg-border"}`} />
+                      <span className="text-sm capitalize">{s}</span>
                     </div>
                   ))}
                 </div>
               </div>
 
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2"><Eye size={16} /> Region Analysis</h3>
-                {regionHeatmap.length > 0 ? (
-                  <div className="space-y-3">
-                    <div>
-                      <div className="flex justify-between text-sm mb-1">
-                        <span className="text-muted-foreground">Accumulated Change</span>
-                        <span className={motionScore > 0.05 ? "text-red-500 font-bold" : ""}>
-                          {(motionScore * 100).toFixed(1)}%
-                        </span>
-                      </div>
-                      <div className="w-full bg-background rounded-full h-2">
-                        <div className={`h-2 rounded-full transition-all ${motionScore > 0.05 ? "bg-red-500" : motionScore > 0.02 ? "bg-yellow-500" : "bg-green-500"}`}
-                          style={{ width: `${Math.min(motionScore * 500, 100)}%` }} />
-                      </div>
-                    </div>
-                    {/* Mini heatmap grid */}
-                    <div className="grid grid-cols-8 gap-px">
-                      {regionHeatmap.map((val, i) => (
-                        <div key={i} className="aspect-square rounded-sm"
-                          style={{
-                            backgroundColor: val > 0.1 ? `rgb(${Math.floor(val * 500)}, 0, 0)` :
-                              val > 0.03 ? `rgb(${Math.floor(val * 2000)}, ${Math.floor(val * 500)}, 0)` :
-                                `rgb(0, ${Math.floor(val * 2000)}, 0)`,
-                          }} />
-                      ))}
-                    </div>
-                  </div>
-                ) : (
-                  <p className="text-sm text-muted-foreground">{isAnalyzing ? "Building baseline..." : "Start analysis"}</p>
-                )}
+                <h3 className="font-semibold mb-3 flex items-center gap-2"><Zap size={16} /> Scene Change</h3>
+                <div className="grid grid-cols-8 gap-px">
+                  {Array.from(accumRef.current).map((v, i) => (
+                    <div key={i} className="aspect-square rounded-sm" style={{
+                      backgroundColor: v > 0.08 ? `rgb(${Math.min(255,Math.floor(v*2000))},0,0)` :
+                        v > 0.03 ? `rgb(${Math.min(255,Math.floor(v*1500))},${Math.floor(v*500)},0)` :
+                          `rgb(0,${Math.min(255,Math.floor(v*3000))},0)`
+                    }} />
+                  ))}
+                </div>
               </div>
 
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3">Detected Incidents</h3>
+                <h3 className="font-semibold mb-3">Incidents</h3>
                 {incidents.length === 0 ? (
-                  <p className="text-sm text-muted-foreground">{isAnalyzing ? "Monitoring..." : "No incidents"}</p>
-                ) : (
-                  <div className="space-y-2">
-                    {incidents.map((inc, i) => (
-                      <div key={i} className={`p-3 rounded-lg border-l-4 ${inc.severity === "critical" ? "border-red-500 bg-red-500/10" : "border-orange-500 bg-orange-500/10"}`}>
-                        <div className="flex items-center gap-2">
-                          <AlertTriangle size={14} className={inc.severity === "critical" ? "text-red-500" : "text-orange-500"} />
-                          <span className="text-sm font-medium capitalize">{inc.type.replace(/_/g, " ")}</span>
-                        </div>
-                        <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
-                          <span>{(inc.confidence * 100).toFixed(0)}%</span>
-                          <span className="flex items-center gap-1"><Clock size={10} />{new Date(inc.timestamp).toLocaleTimeString()}</span>
-                        </div>
-                        <Link href="/ambulance" className="mt-2 inline-flex items-center gap-1 text-xs text-primary hover:underline">
-                          <Navigation size={10} /> View on Ambulance Dashboard
-                        </Link>
-                      </div>
-                    ))}
+                  <p className="text-sm text-muted-foreground">{isAnalyzing ? "Monitoring..." : "None"}</p>
+                ) : incidents.map((inc, i) => (
+                  <div key={i} className={`p-3 rounded-lg border-l-4 mb-2 ${inc.severity === "critical" ? "border-red-500 bg-red-500/10" : "border-orange-500 bg-orange-500/10"}`}>
+                    <div className="flex items-center gap-2">
+                      <AlertTriangle size={14} className="text-red-500" />
+                      <span className="text-sm font-medium capitalize">{inc.type.replace(/_/g," ")}</span>
+                    </div>
+                    <div className="flex gap-3 mt-1 text-xs text-muted-foreground">
+                      <span>{(inc.confidence*100).toFixed(0)}%</span>
+                      <span className="flex items-center gap-1"><Clock size={10} />{new Date(inc.timestamp).toLocaleTimeString()}</span>
+                    </div>
+                    <Link href="/ambulance" className="mt-1 inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                      <Navigation size={10} /> Ambulance Dashboard
+                    </Link>
                   </div>
-                )}
+                ))}
               </div>
             </div>
           </div>
