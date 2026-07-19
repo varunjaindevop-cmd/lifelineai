@@ -58,29 +58,35 @@ function scoreIsolated(a: TrackedEntity, b: TrackedEntity): { score: number; rea
   const d = dist(a, b);
   const cr = combinedR(a, b);
 
+  // Must be close
   if (d > cr * 2) return null;
 
   let score = 0;
   const reasons: string[] = [];
 
-  // Overlap: +0.6
-  if (isOverlapping(a, b)) { score += 0.6; reasons.push("overlap"); }
+  // Overlap: +0.5
+  if (isOverlapping(a, b)) { score += 0.5; reasons.push("overlap"); }
 
-  // Deceleration: +0.4 each
-  if (hasDecelerated(a)) { score += 0.4; reasons.push("A_decel"); }
-  if (hasDecelerated(b)) { score += 0.4; reasons.push("B_decel"); }
+  // Deceleration: +0.4 each (REQUIRED — overlap alone is not enough)
+  const aDecel = hasDecelerated(a);
+  const bDecel = hasDecelerated(b);
+  if (aDecel) { score += 0.4; reasons.push("A_decel"); }
+  if (bDecel) { score += 0.4; reasons.push("B_decel"); }
 
-  // Touching (within 0.7x radius): +0.2
+  // Without at least one deceleration, overlap is just proximity
+  if (!aDecel && !bDecel) return null;
+
+  // Touching: +0.2
   if (d < cr * 0.7) { score += 0.2; reasons.push("touching"); }
 
-  // Passing penalty: both moving + same direction
+  // Passing penalty
   if (a.speed > 1 && b.speed > 1) {
     const angleDiff = Math.abs(a.heading - b.heading);
     const wrapped = angleDiff > Math.PI ? 2 * Math.PI - angleDiff : angleDiff;
     if (wrapped < Math.PI * 0.35) { score -= 0.6; reasons.push("PASSING"); }
   }
 
-  if (score < 0.4) return null;
+  if (score < 0.5) return null;
   return { score: Math.min(score, 1), reason: reasons.join("+") };
 }
 

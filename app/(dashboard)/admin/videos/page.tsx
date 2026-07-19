@@ -369,20 +369,21 @@ export default function VideoAnalysisPage() {
 
         drawFrame(validEntities, ttcPairs, evidence, video.videoWidth || 640, video.videoHeight || 480);
 
-        // State machine — simple: overlap for N frames = alert
-        const hasCollision = evidence.some(e => e.type === "collision");
+        // State machine
+        const hasCollision = evidence.length > 0;
 
         if (hasCollision) consecutiveAnomalyRef.current++;
-        else consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 1);
+        else consecutiveAnomalyRef.current = 0; // instant reset when no collision
 
         let st = stateRef.current;
 
-        if (consecutiveAnomalyRef.current >= 2) {
-          if (st === "monitoring") st = "watching";
-          else if (st === "watching" && consecutiveAnomalyRef.current >= 4) st = "confirming";
-          else if (st === "confirming" && consecutiveAnomalyRef.current >= 6) st = "alert";
-        } else if (now % 2000 < 20) {
-          st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
+        // Alert immediately on collision (no waiting)
+        if (hasCollision && consecutiveAnomalyRef.current >= 2) {
+          st = "alert";
+        }
+        // Instant decay when no collision
+        else if (!hasCollision) {
+          st = "monitoring";
         }
 
         // Alert
