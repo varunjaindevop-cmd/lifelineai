@@ -28,6 +28,7 @@ interface Detection {
   bbox: [number, number, number, number];
   speed?: number;
   id?: number;
+  consecutiveFramesNear?: number;
 }
 
 interface IncidentAlert {
@@ -41,7 +42,7 @@ interface IncidentAlert {
 
 interface TrackedBlob {
   id: number;
-  class: "person" | "car";
+  class: "person" | "car" | "bike";
   cx: number;
   cy: number;
   w: number;
@@ -50,6 +51,9 @@ interface TrackedBlob {
   vy: number;
   framesTracked: number;
   lastSeen: number;
+  speedKmh: number;           // smoothed speed in km/h
+  consecutiveFramesNear: number; // how many frames two objects have been close
+  prevPositions: { x: number; y: number }[]; // last N positions for speed smoothing
 }
 
 const VIDEO_CLIPS: VideoClip[] = [
@@ -160,7 +164,7 @@ export default function VideoAnalysisPage() {
       const sy2 = y2 * scaleY;
       const sw = sx2 - sx1;
       const sh = sy2 - sy1;
-      const color = det.class === "person" ? "#3B82F6" : "#22C55E";
+      const color = det.class === "person" ? "#3B82F6" : det.class === "bike" ? "#F97316" : "#22C55E";
 
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
@@ -265,21 +269,45 @@ export default function VideoAnalysisPage() {
       }
     }
 
-    // Classify blobs: wider = car, taller/narrower = person
+    // Classify blobs using aspect ratio + area heuristics
     const dets: Detection[] = blobs.map((blob) => {
       const aspectRatio = blob.w / Math.max(blob.h, 1);
-      const isCar = aspectRatio > 1.2 || blob.area > 1500;
-      const classification = isCar ? "car" : "person";
-      const confidence = Math.min(0.95, 0.5 + blob.area / 5000);
+      const heightRatio = blob.h / Math.max(blob.w, 1);
 
-      // Estimate speed from blob size (larger = closer = faster apparent motion)
-      const speed = isCar ? Math.floor(30 + blob.area / 100) : undefined;
+      // Classification logic:
+      // Person: tall & narrow (heightRatio > 1.4), small area
+      // Bike/motorbike: narrow, medium area, aspect ratio ~1
+      // Car: wide (aspectRatio > 1.1), large area
+      let classification: "person" | "car" | "bike";
+      let confidence: number;
+
+      if (blob.area > 2000 && aspectRatio > 1.1) {
+        // Large + wide = car
+        classification = "car";
+        confidence = Math.min(0.95, 0.65 + blob.area / 8000);
+      } else if (heightRatio > 1.4 && blob.area < 1500) {
+        // Tall + narrow + small = person
+        classification = "person";
+        confidence = Math.min(0.90, 0.6 + blob.area / 3000);
+      } else if (blob.area > 800 && blob.area < 2000 && aspectRatio > 0.6 && aspectRatio < 1.4) {
+        // Medium size, roughly square = bike/motorbike
+        classification = "bike";
+        confidence = Math.min(0.85, 0.55 + blob.area / 4000);
+      } else if (blob.area > 1500) {
+        // Large but not wide enough — still likely a car at angle
+        classification = "car";
+        confidence = Math.min(0.90, 0.6 + blob.area / 6000);
+      } else {
+        // Default: small blob = person
+        classification = "person";
+        confidence = Math.min(0.85, 0.5 + blob.area / 2000);
+      }
 
       return {
         class: classification,
         confidence,
         bbox: [blob.x, blob.y, blob.x + blob.w, blob.y + blob.h] as [number, number, number, number],
-        speed,
+        speed: classification === "car" ? 0 : undefined, // speed computed in trackBlobs from velocity
       };
     });
 
@@ -289,7 +317,7 @@ export default function VideoAnalysisPage() {
         class: b.class,
         confidence: 0.7,
         bbox: [b.cx - b.w / 2, b.cy - b.h / 2, b.cx + b.w / 2, b.cy + b.h / 2] as [number, number, number, number],
-        speed: b.class === "car" ? Math.floor(Math.sqrt(b.vx ** 2 + b.vy ** 2) * 10) : undefined,
+        speed: b.class === "car" ? b.speedKmh : undefined,
         id: b.id,
       }));
     }
@@ -301,11 +329,12 @@ export default function VideoAnalysisPage() {
   const trackBlobs = useCallback((dets: Detection[], frameNum: number): Detection[] => {
     const tracked = trackedBlobsRef.current;
     const matched = new Set<number>();
+    const FPS = 4; // analysis runs at ~4fps
 
     // Match existing tracked blobs to new detections by proximity
     for (const blob of tracked) {
       let bestIdx = -1;
-      let bestDist = 80; // max matching distance
+      let bestDist = 60;
 
       for (let i = 0; i < dets.length; i++) {
         if (matched.has(i)) continue;
@@ -329,12 +358,38 @@ export default function VideoAnalysisPage() {
         blob.cy = newCy;
         blob.w = d.bbox[2] - d.bbox[0];
         blob.h = d.bbox[3] - d.bbox[1];
-        blob.class = d.class as "person" | "car";
+        blob.class = d.class as "person" | "car" | "bike";
         blob.framesTracked++;
         blob.lastSeen = frameNum;
         matched.add(bestIdx);
+
+        // Compute speed from centroid displacement
+        // pixels-per-frame → assume ~50 pixels per meter (typical CCTV at 10-15m distance)
+        const PPM = 50;
+        const pixelDist = Math.sqrt(blob.vx ** 2 + blob.vy ** 2);
+        const metersPerFrame = pixelDist / PPM;
+        const metersPerSecond = metersPerFrame * FPS;
+        const rawSpeedKmh = metersPerSecond * 3.6;
+
+        // Smooth with exponential moving average
+        blob.prevPositions.push({ x: newCx, y: newCy });
+        if (blob.prevPositions.length > 8) blob.prevPositions.shift();
+
+        // If we have at least 3 positions, compute smoothed speed
+        if (blob.prevPositions.length >= 3) {
+          const positions = blob.prevPositions;
+          const oldest = positions[0];
+          const newest = positions[positions.length - 1];
+          const totalDist = Math.sqrt((newest.x - oldest.x) ** 2 + (newest.y - oldest.y) ** 2);
+          const totalFrames = positions.length - 1;
+          const avgPixelPerFrame = totalDist / totalFrames;
+          const smoothedSpeedKmh = (avgPixelPerFrame / PPM) * FPS * 3.6;
+          // Clamp to realistic range (5-120 km/h for urban CCTV)
+          blob.speedKmh = Math.round(Math.max(5, Math.min(120, smoothedSpeedKmh)));
+        } else {
+          blob.speedKmh = Math.round(Math.max(5, Math.min(120, rawSpeedKmh)));
+        }
       } else {
-        // Blob not seen this frame — keep its last position but age it
         blob.framesTracked = 0;
       }
     }
@@ -343,29 +398,34 @@ export default function VideoAnalysisPage() {
     for (let i = 0; i < dets.length; i++) {
       if (matched.has(i)) continue;
       const d = dets[i];
+      const cx = (d.bbox[0] + d.bbox[2]) / 2;
+      const cy = (d.bbox[1] + d.bbox[3]) / 2;
       tracked.push({
         id: nextBlobId++,
-        class: d.class as "person" | "car",
-        cx: (d.bbox[0] + d.bbox[2]) / 2,
-        cy: (d.bbox[1] + d.bbox[3]) / 2,
+        class: d.class as "person" | "car" | "bike",
+        cx,
+        cy,
         w: d.bbox[2] - d.bbox[0],
         h: d.bbox[3] - d.bbox[1],
         vx: 0,
         vy: 0,
         framesTracked: 1,
         lastSeen: frameNum,
+        speedKmh: 0,
+        consecutiveFramesNear: 0,
+        prevPositions: [{ x: cx, y: cy }],
       });
     }
 
-    // Remove blobs not seen for 10 frames
-    trackedBlobsRef.current = tracked.filter((b) => frameNum - b.lastSeen < 10);
+    // Remove blobs not seen for 8 frames
+    trackedBlobsRef.current = tracked.filter((b) => frameNum - b.lastSeen < 8);
 
     // Return detections based on tracked blobs
     return trackedBlobsRef.current.map((b) => ({
       class: b.class,
       confidence: Math.min(0.95, 0.6 + b.framesTracked * 0.03),
       bbox: [b.cx - b.w / 2, b.cy - b.h / 2, b.cx + b.w / 2, b.cy + b.h / 2] as [number, number, number, number],
-      speed: b.class === "car" ? Math.floor(Math.sqrt(b.vx ** 2 + b.vy ** 2) * 10) : undefined,
+      speed: b.class === "car" ? b.speedKmh : undefined,
       id: b.id,
     }));
   }, []);
@@ -384,31 +444,58 @@ export default function VideoAnalysisPage() {
   };
 
   const checkForAccident = (tracked: TrackedBlob[], sceneScore: number): IncidentAlert | null => {
-    const cars = tracked.filter((b) => b.class === "car" && b.framesTracked >= 2);
-    const persons = tracked.filter((b) => b.class === "person" && b.framesTracked >= 2);
+    const vehicles = tracked.filter((b) => (b.class === "car" || b.class === "bike") && b.framesTracked >= 3);
+    const persons = tracked.filter((b) => b.class === "person" && b.framesTracked >= 3);
+    const cars = tracked.filter((b) => b.class === "car" && b.framesTracked >= 3);
 
-    // Car-car collision: check all pairs
-    for (let i = 0; i < cars.length; i++) {
-      for (let j = i + 1; j < cars.length; j++) {
-        const a = cars[i];
-        const b = cars[j];
-        const dist = Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2);
-        const minDist = (a.w + b.w) / 2;
+    // Vehicle-vehicle collision: require ACTUAL bounding box overlap + sustained proximity
+    for (let i = 0; i < vehicles.length; i++) {
+      for (let j = i + 1; j < vehicles.length; j++) {
+        const a = vehicles[i];
+        const b = vehicles[j];
 
-        // Overlap
+        // Bounding box overlap (actual intersection, not just proximity)
         const overlapX = Math.max(0, Math.min(a.cx + a.w / 2, b.cx + b.w / 2) - Math.max(a.cx - a.w / 2, b.cx - b.w / 2));
         const overlapY = Math.max(0, Math.min(a.cy + a.h / 2, b.cy + b.h / 2) - Math.max(a.cy - a.h / 2, b.cy - b.h / 2));
-        const overlap = overlapX * overlapY;
+        const overlapArea = overlapX * overlapY;
+        const aArea = a.w * a.h;
+        const bArea = b.w * b.h;
+        const iou = aArea + bArea > 0 ? overlapArea / (aArea + bArea - overlapArea) : 0;
 
-        // Relative velocity (converging = dangerous)
-        const dvx = a.vx - b.vx;
-        const dvy = a.vy - b.vy;
-        const relSpeed = Math.sqrt(dvx * dvx + dvy * dvy);
-        const converging = (a.vx * (b.cx - a.cx) + a.vy * (b.cy - a.cy)) < 0;
+        // Center distance
+        const dist = Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2);
+        const minDist = (a.w + b.w) / 2 * 0.7; // 70% of combined half-widths
 
-        if (overlap > 50 || dist < minDist * 1.5) {
-          const confidence = Math.min(0.95, 0.3 + (overlap > 0 ? 0.3 : 0) + (dist < minDist ? 0.2 : 0) + (converging ? 0.15 : 0) + sceneScore * 0.5);
-          if (confidence > 0.45) {
+        // Converging check: are they moving toward each other?
+        const toBx = b.cx - a.cx;
+        const toBy = b.cy - a.cy;
+        const dotProduct = a.vx * toBx + a.vy * toBy;
+        const converging = dotProduct > 0; // positive = moving toward each other
+
+        // Track sustained proximity (required for real collision)
+        if (dist < minDist * 2) {
+          a.consecutiveFramesNear++;
+          b.consecutiveFramesNear++;
+        } else {
+          a.consecutiveFramesNear = Math.max(0, a.consecutiveFramesNear - 1);
+          b.consecutiveFramesNear = Math.max(0, b.consecutiveFramesNear - 1);
+        }
+
+        // Collision: require overlap OR very close + converging + sustained for 3+ frames
+        const sustainedProximity = Math.min(a.consecutiveFramesNear, b.consecutiveFramesNear) >= 3;
+        const actualOverlap = iou > 0.05 || overlapArea > 200;
+
+        if (actualOverlap || (sustainedProximity && dist < minDist && converging)) {
+          const speedFactor = Math.min((a.speedKmh + b.speedKmh) / 80, 1);
+          const confidence = Math.min(0.95,
+            0.25 * Math.min(iou * 10, 1) +
+            0.25 * (1 - Math.min(dist / minDist, 1)) +
+            0.2 * speedFactor +
+            0.15 * (converging ? 1 : 0) +
+            0.15 * Math.min(sceneScore / 0.15, 1)
+          );
+
+          if (confidence > 0.5) {
             return {
               type: "vehicle_collision",
               severity: confidence > 0.7 ? "critical" : "major",
@@ -419,31 +506,24 @@ export default function VideoAnalysisPage() {
             };
           }
         }
-
-        // Near-miss (close but no overlap yet — still alarming)
-        if (dist < minDist * 2.5 && converging) {
-          const confidence = 0.4 + (1 - dist / (minDist * 2.5)) * 0.3;
-          if (confidence > 0.5) {
-            return {
-              type: "vehicle_collision",
-              severity: "major",
-              confidence,
-              timestamp: new Date().toISOString(),
-              latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
-              longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
-            };
-          }
-        }
       }
     }
 
-    // Car-pedestrian collision
-    for (const car of cars) {
+    // Vehicle-pedestrian collision: require actual overlap, not just proximity
+    for (const vehicle of vehicles) {
       for (const ped of persons) {
-        const dist = Math.sqrt((car.cx - ped.cx) ** 2 + (car.cy - ped.cy) ** 2);
-        const minDist = (car.w + ped.w) / 2;
+        const dist = Math.sqrt((vehicle.cx - ped.cx) ** 2 + (vehicle.cy - ped.cy) ** 2);
+        const overlapX = Math.max(0, Math.min(vehicle.cx + vehicle.w / 2, ped.cx + ped.w / 2) - Math.max(vehicle.cx - vehicle.w / 2, ped.cx - ped.w / 2));
+        const overlapY = Math.max(0, Math.min(vehicle.cy + vehicle.h / 2, ped.cy + ped.h / 2) - Math.max(vehicle.cy - vehicle.h / 2, ped.cy - ped.h / 2));
+        const overlapArea = overlapX * overlapY;
+        const minDist = (vehicle.w + ped.w) / 2 * 0.6;
 
-        if (dist < minDist * 1.2) {
+        // Only trigger on actual overlap or very close + converging
+        const toPedX = ped.cx - vehicle.cx;
+        const toPedY = ped.cy - vehicle.cy;
+        const converging = (vehicle.vx * toPedX + vehicle.vy * toPedY) > 0;
+
+        if (overlapArea > 100 || (dist < minDist && converging)) {
           return {
             type: "pedestrian_collision",
             severity: "critical",
@@ -778,7 +858,7 @@ export default function VideoAnalysisPage() {
                     detections.map((det, i) => (
                       <div key={i} className="flex items-center justify-between p-2 bg-background rounded">
                         <div className="flex items-center gap-2">
-                          <div className={`w-2 h-2 rounded-full ${det.class === "person" ? "bg-blue-500" : "bg-green-500"}`} />
+                          <div className={`w-2 h-2 rounded-full ${det.class === "person" ? "bg-blue-500" : det.class === "bike" ? "bg-orange-500" : "bg-green-500"}`} />
                           <span className="text-sm capitalize">{det.class}</span>
                         </div>
                         <div className="text-right">
