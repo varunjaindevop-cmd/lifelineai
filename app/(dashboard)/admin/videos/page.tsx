@@ -60,7 +60,6 @@ export default function VideoAnalysisPage() {
   const frameRef = useRef(0);
   const stateFrameRef = useRef(0);
   const cooldownRef = useRef(0);
-  const prevGridRef = useRef<Float32Array | null>(null);
   const accumRef = useRef<Float32Array>(new Float32Array(GRID_COLS * GRID_ROWS));
   const consecutiveAnomalyRef = useRef(0);
   const supabase = createClient();
@@ -98,8 +97,8 @@ export default function VideoAnalysisPage() {
     currGray: Float32Array, prevGray: Float32Array, w: number, h: number
   ): { vx: number; vy: number; mag: number }[][] => {
     const result: { vx: number; vy: number; mag: number }[][] = [];
-    const searchR = 8; // search window radius in pixels
-    const blockSize = 4; // compare blocks of 4x4
+    const searchR = 6; // search window radius in pixels
+    const blockSize = 3; // compare blocks of 6x6
 
     for (let r = 0; r < GRID_ROWS; r++) {
       result[r] = [];
@@ -107,14 +106,13 @@ export default function VideoAnalysisPage() {
         const cx = Math.floor((c + 0.5) * CELL_W);
         const cy = Math.floor((r + 0.5) * CELL_H);
 
-        // Sample block around cell center from current frame
         let bestDx = 0, bestDy = 0, bestErr = Infinity;
 
         for (let dy = -searchR; dy <= searchR; dy += 2) {
           for (let dx = -searchR; dx <= searchR; dx += 2) {
             let err = 0, count = 0;
-            for (let by = -blockSize; by <= blockSize; by += 2) {
-              for (let bx = -blockSize; bx <= blockSize; bx += 2) {
+            for (let by = -blockSize; by <= blockSize; by++) {
+              for (let bx = -blockSize; bx <= blockSize; bx++) {
                 const sx = cx + bx, sy = cy + by;
                 const tx = sx + dx, ty = sy + dy;
                 if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
@@ -144,7 +142,17 @@ export default function VideoAnalysisPage() {
     return result;
   };
 
-  // Convert frame to grayscale grid (for flow computation and change detection)
+  // Full-resolution grayscale (for optical flow) — returns W*H Float32Array
+  const toFullGray = (data: Uint8ClampedArray, w: number, h: number): Float32Array => {
+    const g = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      const j = i * 4;
+      g[i] = data[j] * 0.299 + data[j + 1] * 0.587 + data[j + 2] * 0.114;
+    }
+    return g;
+  };
+
+  // Grid-level grayscale (for accumulated change detection) — returns GRID_COLS*GRID_ROWS
   const toGrayGrid = (data: Uint8ClampedArray, w: number, h: number): Float32Array => {
     const g = new Float32Array(GRID_COLS * GRID_ROWS);
     const cw = Math.floor(w / GRID_COLS), ch = Math.floor(h / GRID_ROWS);
@@ -363,35 +371,6 @@ export default function VideoAnalysisPage() {
     return anomalies;
   };
 
-  // ========== NORMAL MODE: ACCUMULATED CHANGE ==========
-  // Simple grid-based change detection for isolated roads
-  const computeAccumChange = (grid: Float32Array): { score: number; anomalies: FlowAnomaly[] } => {
-    const prev = prevGridRef.current;
-    let totalChange = 0;
-    for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
-      const diff = prev ? Math.abs(grid[i] - prev[i]) / 255 : 0;
-      accumRef.current[i] = accumRef.current[i] * 0.95 + diff * 3;
-      totalChange += accumRef.current[i];
-    }
-    prevGridRef.current = grid;
-    const score = totalChange / (GRID_COLS * GRID_ROWS);
-
-    const anomalies: FlowAnomaly[] = [];
-    if (score > 0.04) {
-      // Find the cell with highest accumulated change
-      let maxCell = 0, maxVal = 0;
-      for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
-        if (accumRef.current[i] > maxVal) { maxVal = accumRef.current[i]; maxCell = i; }
-      }
-      anomalies.push({
-        type: "collision", confidence: Math.min(0.8, score * 8),
-        cx: maxCell % GRID_COLS, cy: Math.floor(maxCell / GRID_COLS),
-        evidence: `Accumulated change: ${(score * 100).toFixed(1)}%`,
-      });
-    }
-    return { score, anomalies };
-  };
-
   // Draw flow visualization on canvas
   const drawFlowViz = (
     flow: { vx: number; vy: number; mag: number }[][] | null,
@@ -501,7 +480,6 @@ export default function VideoAnalysisPage() {
     }
 
     // Reset all state
-    prevGridRef.current = null;
     accumRef.current.fill(0);
     frameRef.current = 0;
     stateFrameRef.current = 0;
@@ -516,7 +494,9 @@ export default function VideoAnalysisPage() {
     setState("monitoring");
     setObjectCount(0);
 
-    let prevFrameData: Uint8ClampedArray | null = null;
+    // Store previous frames: full-res for flow, grid for change detection
+    let prevFullGray: Float32Array | null = null;
+    let prevGridGray: Float32Array | null = null;
 
     const loop = () => {
       try {
@@ -532,46 +512,47 @@ export default function VideoAnalysisPage() {
         frameRef.current++;
         if (cooldownRef.current > 0) cooldownRef.current--;
 
-        // Convert to grayscale for flow computation
-        const currGray = toGrayGrid(data, W, H);
+        // Full-res grayscale for optical flow
+        const currFullGray = toFullGray(data, W, H);
+        // Grid-level grayscale for change detection
+        const currGridGray = toGrayGrid(data, W, H);
 
-        // Compute dense optical flow
+        // Compute anomalies
         let flow: { vx: number; vy: number; mag: number }[][] | null = null;
         let anomalies: FlowAnomaly[] = [];
 
-        if (prevFrameData) {
-          const prevGray = toGrayGrid(new Uint8ClampedArray(
-            // Convert prev frame data to grayscale grid
-            (() => {
-              const prev = prevFrameData!;
-              const g = new Float32Array(GRID_COLS * GRID_ROWS);
-              const cw = Math.floor(W / GRID_COLS), ch = Math.floor(H / GRID_ROWS);
-              for (let r = 0; r < GRID_ROWS; r++) for (let c = 0; c < GRID_COLS; c++) {
-                let s = 0, n = 0;
-                for (let dy = 0; dy < ch; dy += 2) for (let dx = 0; dx < cw; dx += 2) {
-                  const i = ((r * ch + dy) * W + (c * cw + dx)) * 4;
-                  s += prev[i] * 0.299 + prev[i + 1] * 0.587 + prev[i + 2] * 0.114; n++;
-                }
-                g[r * GRID_COLS + c] = n > 0 ? s / n : 128;
-              }
-              return g;
-            })()
-          ), W, H);
-
-          flow = computeFlowGrid(currGray, prevGray, W, H);
+        if (prevFullGray) {
+          flow = computeFlowGrid(currFullGray, prevFullGray, W, H);
 
           if (analysisMode === "traffic") {
-            // Traffic mode: use optical flow anomaly detection
             anomalies = analyzeFlowAnomalies(flow, []);
           } else {
-            // Normal mode: use accumulated change
-            const { anomalies: accAnomalies } = computeAccumChange(currGray);
-            anomalies = accAnomalies;
+            // Normal mode: accumulated change on grid
+            let totalChange = 0;
+            for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
+              const diff = prevGridGray ? Math.abs(currGridGray[i] - prevGridGray[i]) / 255 : 0;
+              accumRef.current[i] = accumRef.current[i] * 0.95 + diff * 3;
+              totalChange += accumRef.current[i];
+            }
+            const score = totalChange / (GRID_COLS * GRID_ROWS);
+            if (score > 0.04) {
+              let maxCell = 0, maxVal = 0;
+              for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
+                if (accumRef.current[i] > maxVal) { maxVal = accumRef.current[i]; maxCell = i; }
+              }
+              anomalies.push({
+                type: "collision", confidence: Math.min(0.8, score * 8),
+                cx: maxCell % GRID_COLS, cy: Math.floor(maxCell / GRID_COLS),
+                evidence: `Accumulated change: ${(score * 100).toFixed(1)}%`,
+              });
+            }
           }
         }
-        prevFrameData = new Uint8ClampedArray(data);
 
-        // Count moving objects (cells with motion)
+        prevFullGray = currFullGray;
+        prevGridGray = currGridGray;
+
+        // Count moving regions
         let movingCount = 0;
         if (flow) {
           for (let r = 0; r < GRID_ROWS; r++)
@@ -597,8 +578,6 @@ export default function VideoAnalysisPage() {
         stateFrameRef.current++;
         let st = stateRef.current;
 
-        // Unified state machine — works for both modes
-        // The difference is in thresholds, not logic
         if (hasAnomaly && consecutiveAnomalyRef.current >= 3) {
           if (st === "monitoring") st = "watching";
           else if (st === "watching" && consecutiveAnomalyRef.current >= (isHighConf ? 3 : 6)) st = "confirming";
@@ -675,7 +654,6 @@ export default function VideoAnalysisPage() {
   const resetClip = () => {
     stopAnalysis();
     setIncidents([]);
-    prevGridRef.current = null;
     accumRef.current.fill(0);
     frameRef.current = 0;
     stateFrameRef.current = 0;
