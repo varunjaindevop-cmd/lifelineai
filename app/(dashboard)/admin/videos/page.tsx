@@ -104,8 +104,9 @@ export default function VideoAnalysisPage() {
   const trackedBlobsRef = useRef<TrackedBlob[]>([]);
   const alertedRef = useRef(false);
   const stateFrameRef = useRef(0);
-  const alertCooldownRef = useRef(0); // frames to wait before next alert
-  const frameBufferRef = useRef<ImageData[]>([]); // last 60 frames (~15s) for clip recording
+  const alertCooldownRef = useRef(0);
+  const frameBufferRef = useRef<ImageData[]>([]);
+  const avgSceneMotionRef = useRef(0.05); // running average of scene motion
   const supabase = createClient();
 
   useEffect(() => {
@@ -184,20 +185,24 @@ export default function VideoAnalysisPage() {
     });
   };
 
-  // Motion-based detection — conservative thresholds to eliminate false alarms
-  const detectMotion = useCallback((currFrame: ImageData, prevFrame: ImageData): Detection[] => {
+  // Motion-based detection — adaptive thresholds based on scene motion level
+  const detectMotion = useCallback((currFrame: ImageData, prevFrame: ImageData, avgSceneMotion: number): Detection[] => {
     const w = currFrame.width;
     const h = currFrame.height;
     const curr = currFrame.data;
     const prev = prevFrame.data;
 
-    // Step 1: Difference map with HIGH threshold (only significant motion)
+    // Adaptive thresholds: low-motion scenes use lower thresholds to catch subtle events
+    const motionThreshold = avgSceneMotion < 0.05 ? 25 : avgSceneMotion < 0.1 ? 30 : 35;
+    const minBlobArea = avgSceneMotion < 0.05 ? 400 : avgSceneMotion < 0.1 ? 500 : 600;
+
+    // Step 1: Difference map with adaptive threshold
     const diff = new Uint8Array(w * h);
     for (let i = 0; i < diff.length; i++) {
       const idx = i * 4;
       const grayCurr = curr[idx] * 0.299 + curr[idx + 1] * 0.587 + curr[idx + 2] * 0.114;
       const grayPrev = prev[idx] * 0.299 + prev[idx + 1] * 0.587 + prev[idx + 2] * 0.114;
-      diff[i] = Math.abs(grayCurr - grayPrev) > 35 ? 255 : 0; // HIGH threshold
+      diff[i] = Math.abs(grayCurr - grayPrev) > motionThreshold ? 255 : 0;
     }
 
     // Step 2: Aggressive dilation (merge nearby motion into big blobs)
@@ -247,8 +252,8 @@ export default function VideoAnalysisPage() {
         const blobH = maxY - minY;
         const area = blobW * blobH;
 
-        // STRICT: only keep LARGE blobs (minimum 600px area = ~25x24 pixels)
-        if (area < 600 || count < 40) continue;
+        // Adaptive minimum blob size
+        if (area < minBlobArea || count < 30) continue;
 
         // Motion density: what % of the bounding box is actually moving
         const motionDensity = count / Math.max(area / 16, 1);
@@ -414,9 +419,9 @@ export default function VideoAnalysisPage() {
       .sort((a, b) => b.framesTracked - a.framesTracked)
       .slice(0, 5);
 
-    // Only return objects tracked for 6+ frames (filter out noise)
+    // Return objects tracked for 5+ frames
     return trackedBlobsRef.current
-      .filter((b) => b.framesTracked >= 6)
+      .filter((b) => b.framesTracked >= 5)
       .map((b) => ({
         class: b.class,
         confidence: Math.min(0.95, 0.7 + b.framesTracked * 0.02),
@@ -440,9 +445,9 @@ export default function VideoAnalysisPage() {
   };
 
   const checkForAccident = (tracked: TrackedBlob[], sceneScore: number): IncidentAlert | null => {
-    // Only check objects tracked for 8+ frames (confirmed objects, not noise)
-    const vehicles = tracked.filter((b) => (b.class === "car" || b.class === "bike") && b.framesTracked >= 8);
-    const persons = tracked.filter((b) => b.class === "person" && b.framesTracked >= 8);
+    // Check objects tracked for 6+ frames (confirmed objects)
+    const vehicles = tracked.filter((b) => (b.class === "car" || b.class === "bike") && b.framesTracked >= 6);
+    const persons = tracked.filter((b) => b.class === "person" && b.framesTracked >= 6);
 
     // Vehicle-vehicle collision
     for (let i = 0; i < vehicles.length; i++) {
@@ -469,23 +474,23 @@ export default function VideoAnalysisPage() {
         const angleDiff = Math.abs(aAngle - bAngle);
         const parallel = angleDiff < Math.PI * 0.3 || angleDiff > Math.PI * 1.7;
 
-        // Track sustained proximity — need 8+ consecutive frames
-        const closeThreshold = Math.max(a.w, b.w) * 0.7;
+        // Track sustained proximity — need 6+ consecutive frames
+        const closeThreshold = Math.max(a.w, b.w) * 0.8;
         if (Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2) < closeThreshold) {
           a.consecutiveFramesNear++;
           b.consecutiveFramesNear++;
         } else {
-          a.consecutiveFramesNear = Math.max(0, a.consecutiveFramesNear - 3);
-          b.consecutiveFramesNear = Math.max(0, b.consecutiveFramesNear - 3);
+          a.consecutiveFramesNear = Math.max(0, a.consecutiveFramesNear - 2);
+          b.consecutiveFramesNear = Math.max(0, b.consecutiveFramesNear - 2);
         }
 
         const sustainedNear = Math.min(a.consecutiveFramesNear, b.consecutiveFramesNear);
 
-        // REQUIREMENT 1: ACTUAL overlap — 15% of smaller object
-        const hasOverlap = overlapArea > minArea * 0.15;
+        // REQUIREMENT 1: ACTUAL overlap — 10% of smaller object
+        const hasOverlap = overlapArea > minArea * 0.10;
 
-        // REQUIREMENT 2: Sustained 8+ frames AND not parallel
-        const sustained = sustainedNear >= 8 && !parallel;
+        // REQUIREMENT 2: Sustained 6+ frames AND not parallel
+        const sustained = sustainedNear >= 6 && !parallel;
 
         if (hasOverlap || sustained) {
           const confidence = Math.min(0.95,
@@ -521,8 +526,8 @@ export default function VideoAnalysisPage() {
         const overlapArea = overlapX * overlapY;
         const minArea = Math.min(vehicle.w * vehicle.h, ped.w * ped.h);
 
-        // ONLY trigger on ACTUAL overlap — 15% of smaller object
-        if (overlapArea > minArea * 0.15) {
+        // ONLY trigger on ACTUAL overlap — 10% of smaller object
+        if (overlapArea > minArea * 0.10) {
           return {
             type: "pedestrian_collision",
             severity: "critical",
@@ -721,10 +726,13 @@ export default function VideoAnalysisPage() {
       }
       setSceneChange(sceneScore);
 
-      // Real motion detection + tracking
+      // Update running average scene motion
+      avgSceneMotionRef.current = avgSceneMotionRef.current * 0.9 + sceneScore * 0.1;
+
+      // Real motion detection + tracking with adaptive thresholds
       let dets: Detection[];
       if (prevFrameRef.current) {
-        const motionDets = detectMotion(frame, prevFrameRef.current);
+        const motionDets = detectMotion(frame, prevFrameRef.current, avgSceneMotionRef.current);
         dets = trackBlobs(motionDets, fn);
       } else {
         dets = [];
