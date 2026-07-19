@@ -188,37 +188,52 @@ export default function VideoAnalysisPage() {
   }, []);
 
   // ========== ACCIDENT DETECTION ==========
-  // Simple rule: if total motion energy suddenly spikes above baseline, it's an accident.
-  // No hotspot requirement — motion can be spread or concentrated.
+  // Key insight: accidents cause SUSTAINED energy spikes (3+ frames).
+  // A car passing is a brief 1-2 frame blip. People walking = gradual rise.
+  // We require the spike to PERSIST before triggering.
+
+  const spikeFrameRef = useRef(0); // how many consecutive frames have been spiking
 
   const detectAccident = useCallback((metrics: MotionMetrics, frameNum: number): { detected: boolean; confidence: number; type: string } => {
     const history = motionHistoryRef.current;
 
-    // Need at least 8 frames of baseline
     if (history.length < 8) return { detected: false, confidence: 0, type: "" };
 
-    // Baseline = average of frames 3 ago through 8 ago (skip the most recent 2)
-    const baselineStart = Math.max(0, history.length - 8);
-    const baselineEnd = Math.max(0, history.length - 2);
-    const baselineSlice = history.slice(baselineStart, baselineEnd);
+    // Baseline = average of frames 4-8 ago (well before current activity)
+    const baselineSlice = history.slice(Math.max(0, history.length - 8), Math.max(0, history.length - 3));
     const baselineAvg = baselineSlice.length > 0 ? baselineSlice.reduce((a, b) => a + b, 0) / baselineSlice.length : 0.01;
 
     const currentEnergy = metrics.totalEnergy;
 
-    // Energy spike ratio (how much higher than baseline)
+    // Spike ratio
     const spikeRatio = baselineAvg > 0.001 ? currentEnergy / baselineAvg : currentEnergy > 0.02 ? 5 : 0;
 
-    // Absolute energy check (even in quiet scenes, must have some motion)
-    const hasSignificantMotion = currentEnergy > 0.015;
+    // Frame-to-frame jump: how FAST did energy increase?
+    // Accident = sudden jump (1 frame). Car passing = gradual (3-4 frames).
+    const prevEnergy = history.length >= 2 ? history[history.length - 2] : baselineAvg;
+    const frameJump = prevEnergy > 0.001 ? currentEnergy / prevEnergy : 1;
+    const suddenJump = frameJump > 1.5; // >50% increase in single frame = sudden
 
-    // Gradient: motion increasing rapidly
-    const risingGradient = metrics.motionGradient > 0.3;
+    // Sustained check: must be spiking for 2+ consecutive frames
+    const isSpikeNow = spikeRatio > 1.6 && currentEnergy > 0.012;
+    if (isSpikeNow) {
+      spikeFrameRef.current++;
+    } else {
+      spikeFrameRef.current = Math.max(0, spikeFrameRef.current - 1);
+    }
 
-    // Confidence based on spike magnitude
-    const confidence = Math.min(0.95, Math.min(spikeRatio / 4, 1) * 0.7 + (hasSignificantMotion ? 0.2 : 0) + (risingGradient ? 0.1 : 0));
+    const sustainedSpike = spikeFrameRef.current >= 2; // sustained for 2+ frames
 
-    // Detection: spike > 1.8x baseline OR spike > 1.4x with rising gradient
-    const detected = (spikeRatio > 1.8 && hasSignificantMotion) || (spikeRatio > 1.4 && risingGradient && hasSignificantMotion);
+    // Confidence
+    const confidence = Math.min(0.95,
+      Math.min(spikeRatio / 3, 1) * 0.4 +
+      (suddenJump ? 0.25 : 0) +
+      (sustainedSpike ? 0.25 : 0) +
+      (currentEnergy > 0.03 ? 0.1 : 0)
+    );
+
+    // Detection: sustained spike OR sudden large spike
+    const detected = (sustainedSpike && spikeRatio > 1.6) || (suddenJump && spikeRatio > 2.0 && currentEnergy > 0.02);
 
     return { detected, confidence, type: "vehicle_collision" };
   }, []);
@@ -338,6 +353,7 @@ export default function VideoAnalysisPage() {
     prevFrameRef.current = null;
     motionHistoryRef.current = [];
     bgModelRef.current = null;
+    spikeFrameRef.current = 0;
     setMotionHistory([]);
 
     await new Promise((r) => setTimeout(r, 300));
@@ -385,9 +401,9 @@ export default function VideoAnalysisPage() {
           if (sf >= 35 && state === "confirming") state = "alert";
         }
 
-        // Trigger alert
+        // Trigger alert — 10s cooldown so real accident after false alarm still triggers
         if (state === "alert" && stateRef.current !== "alert" && alertCooldownRef.current <= 0) {
-          alertCooldownRef.current = 80;
+          alertCooldownRef.current = 40; // 10 seconds
 
           createIncidentFromDetection({
             type: result.type || "vehicle_collision",
@@ -432,6 +448,7 @@ export default function VideoAnalysisPage() {
     alertCooldownRef.current = 0;
     motionHistoryRef.current = [];
     bgModelRef.current = null;
+    spikeFrameRef.current = 0;
   };
 
   const stateColors: Record<string, string> = {
