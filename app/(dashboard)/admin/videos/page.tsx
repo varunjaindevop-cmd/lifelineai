@@ -454,61 +454,71 @@ export default function VideoAnalysisPage() {
   };
 
   const checkForAccident = (tracked: TrackedBlob[], sceneScore: number): IncidentAlert | null => {
-    const vehicles = tracked.filter((b) => (b.class === "car" || b.class === "bike") && b.framesTracked >= 3);
-    const persons = tracked.filter((b) => b.class === "person" && b.framesTracked >= 3);
-    const cars = tracked.filter((b) => b.class === "car" && b.framesTracked >= 3);
+    const vehicles = tracked.filter((b) => (b.class === "car" || b.class === "bike") && b.framesTracked >= 4);
+    const persons = tracked.filter((b) => b.class === "person" && b.framesTracked >= 4);
 
-    // Vehicle-vehicle collision: require ACTUAL bounding box overlap + sustained proximity
+    // Vehicle-vehicle collision
     for (let i = 0; i < vehicles.length; i++) {
       for (let j = i + 1; j < vehicles.length; j++) {
         const a = vehicles[i];
         const b = vehicles[j];
 
-        // Bounding box overlap (actual intersection, not just proximity)
-        const overlapX = Math.max(0, Math.min(a.cx + a.w / 2, b.cx + b.w / 2) - Math.max(a.cx - a.w / 2, b.cx - b.w / 2));
-        const overlapY = Math.max(0, Math.min(a.cy + a.h / 2, b.cy + b.h / 2) - Math.max(a.cy - a.h / 2, b.cy - b.h / 2));
+        // Bounding box overlap
+        const aLeft = a.cx - a.w / 2, aRight = a.cx + a.w / 2;
+        const aTop = a.cy - a.h / 2, aBot = a.cy + a.h / 2;
+        const bLeft = b.cx - b.w / 2, bRight = b.cx + b.w / 2;
+        const bTop = b.cy - b.h / 2, bBot = b.cy + b.h / 2;
+        const overlapX = Math.max(0, Math.min(aRight, bRight) - Math.max(aLeft, bLeft));
+        const overlapY = Math.max(0, Math.min(aBot, bBot) - Math.max(aTop, bTop));
         const overlapArea = overlapX * overlapY;
         const aArea = a.w * a.h;
         const bArea = b.w * b.h;
-        const iou = aArea + bArea > 0 ? overlapArea / (aArea + bArea - overlapArea) : 0;
+        const iou = (aArea + bArea - overlapArea) > 0 ? overlapArea / (aArea + bArea - overlapArea) : 0;
 
-        // Center distance
         const dist = Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2);
-        const minDist = (a.w + b.w) / 2 * 0.7; // 70% of combined half-widths
 
-        // Converging check: are they moving toward each other?
-        const toBx = b.cx - a.cx;
-        const toBy = b.cy - a.cy;
-        const dotProduct = a.vx * toBx + a.vy * toBy;
-        const converging = dotProduct > 0; // positive = moving toward each other
+        // Direction analysis: check if velocities are OPPOSING (head-on) vs PARALLEL (passing)
+        const aAngle = Math.atan2(a.vy, a.vx);
+        const bAngle = Math.atan2(b.vy, b.vx);
+        const angleDiff = Math.abs(aAngle - bAngle);
+        const opposing = angleDiff > Math.PI * 0.5 && angleDiff < Math.PI * 1.5; // roughly head-on
+        const parallel = angleDiff < Math.PI * 0.3 || angleDiff > Math.PI * 1.7; // roughly same direction
 
-        // Track sustained proximity (required for real collision)
-        if (dist < minDist * 2) {
+        // Track sustained proximity
+        const closeThreshold = Math.max(a.w, b.w) * 0.8;
+        if (dist < closeThreshold) {
           a.consecutiveFramesNear++;
           b.consecutiveFramesNear++;
         } else {
-          a.consecutiveFramesNear = Math.max(0, a.consecutiveFramesNear - 1);
-          b.consecutiveFramesNear = Math.max(0, b.consecutiveFramesNear - 1);
+          a.consecutiveFramesNear = Math.max(0, a.consecutiveFramesNear - 2);
+          b.consecutiveFramesNear = Math.max(0, b.consecutiveFramesNear - 2);
         }
 
-        // Collision: require overlap OR very close + converging + sustained for 3+ frames
-        const sustainedProximity = Math.min(a.consecutiveFramesNear, b.consecutiveFramesNear) >= 3;
-        const actualOverlap = iou > 0.05 || overlapArea > 200;
+        const sustainedNear = Math.min(a.consecutiveFramesNear, b.consecutiveFramesNear);
 
-        if (actualOverlap || (sustainedProximity && dist < minDist && converging)) {
-          const speedFactor = Math.min((a.speedKmh + b.speedKmh) / 80, 1);
+        // REQUIREMENT 1: Actual bounding box overlap (not just proximity)
+        const hasOverlap = overlapArea > (Math.min(aArea, bArea) * 0.08); // 8% of smaller object
+
+        // REQUIREMENT 2: Sustained proximity (5+ frames) AND not just passing
+        const sustainedCollision = sustainedNear >= 5 && !parallel;
+
+        // REQUIREMENT 3: High-speed convergence
+        const speed = Math.max(a.speedKmh, b.speedKmh);
+        const highSpeed = speed > 30;
+
+        if (hasOverlap || sustainedCollision) {
           const confidence = Math.min(0.95,
-            0.25 * Math.min(iou * 10, 1) +
-            0.25 * (1 - Math.min(dist / minDist, 1)) +
-            0.2 * speedFactor +
-            0.15 * (converging ? 1 : 0) +
-            0.15 * Math.min(sceneScore / 0.15, 1)
+            0.3 * Math.min(iou * 8, 1) +
+            0.25 * (hasOverlap ? 1 : 0) +
+            0.2 * (opposing ? 1 : 0.3) +
+            0.15 * Math.min(speed / 60, 1) +
+            0.1 * Math.min(sceneScore / 0.2, 1)
           );
 
-          if (confidence > 0.5) {
+          if (confidence > 0.55) {
             return {
               type: "vehicle_collision",
-              severity: confidence > 0.7 ? "critical" : "major",
+              severity: confidence > 0.75 ? "critical" : "major",
               confidence,
               timestamp: new Date().toISOString(),
               latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
@@ -519,25 +529,26 @@ export default function VideoAnalysisPage() {
       }
     }
 
-    // Vehicle-pedestrian collision: require actual overlap, not just proximity
+    // Vehicle-pedestrian: REQUIRE actual bounding box overlap — passing nearby does NOT count
     for (const vehicle of vehicles) {
       for (const ped of persons) {
-        const dist = Math.sqrt((vehicle.cx - ped.cx) ** 2 + (vehicle.cy - ped.cy) ** 2);
-        const overlapX = Math.max(0, Math.min(vehicle.cx + vehicle.w / 2, ped.cx + ped.w / 2) - Math.max(vehicle.cx - vehicle.w / 2, ped.cx - ped.w / 2));
-        const overlapY = Math.max(0, Math.min(vehicle.cy + vehicle.h / 2, ped.cy + ped.h / 2) - Math.max(vehicle.cy - vehicle.h / 2, ped.cy - ped.h / 2));
+        const vLeft = vehicle.cx - vehicle.w / 2, vRight = vehicle.cx + vehicle.w / 2;
+        const vTop = vehicle.cy - vehicle.h / 2, vBot = vehicle.cy + vehicle.h / 2;
+        const pLeft = ped.cx - ped.w / 2, pRight = ped.cx + ped.w / 2;
+        const pTop = ped.cy - ped.h / 2, pBot = ped.cy + ped.h / 2;
+        const overlapX = Math.max(0, Math.min(vRight, pRight) - Math.max(vLeft, pLeft));
+        const overlapY = Math.max(0, Math.min(vBot, pBot) - Math.max(vTop, pTop));
         const overlapArea = overlapX * overlapY;
-        const minDist = (vehicle.w + ped.w) / 2 * 0.6;
 
-        // Only trigger on actual overlap or very close + converging
-        const toPedX = ped.cx - vehicle.cx;
-        const toPedY = ped.cy - vehicle.cy;
-        const converging = (vehicle.vx * toPedX + vehicle.vy * toPedY) > 0;
+        const vArea = vehicle.w * vehicle.h;
+        const pArea = ped.w * ped.h;
 
-        if (overlapArea > 100 || (dist < minDist && converging)) {
+        // Only trigger on ACTUAL overlap — minimum 10% of the smaller object
+        if (overlapArea > Math.min(vArea, pArea) * 0.1) {
           return {
             type: "pedestrian_collision",
             severity: "critical",
-            confidence: 0.85,
+            confidence: 0.88,
             timestamp: new Date().toISOString(),
             latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
             longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
@@ -550,7 +561,82 @@ export default function VideoAnalysisPage() {
   };
 
   const recordClipAndAlert = async (alert: IncidentAlert) => {
-    // Step 1: Create incident immediately (no clip yet)
+    // Record the clip as an encoded image composite (reliable, no MediaRecorder)
+    const frames = frameBufferRef.current;
+    let clipUrl: string | undefined;
+
+    // Try to encode frames as a single composite image (strip of frames)
+    if (frames.length >= 4) {
+      try {
+        const COLS = 4;
+        const ROWS = Math.min(3, Math.ceil(frames.length / COLS));
+        const FRAME_W = 240;
+        const FRAME_H = 180;
+        const canvas = document.createElement("canvas");
+        canvas.width = COLS * FRAME_W;
+        canvas.height = ROWS * FRAME_H;
+        const ctx = canvas.getContext("2d")!;
+
+        // Draw sampled frames in a grid
+        const step = Math.max(1, Math.floor(frames.length / (COLS * ROWS)));
+        let idx = 0;
+        for (let row = 0; row < ROWS && idx < frames.length; row++) {
+          for (let col = 0; col < COLS && idx < frames.length; col++) {
+            const frame = frames[Math.min(idx * step, frames.length - 1)];
+            const tmpCanvas = document.createElement("canvas");
+            tmpCanvas.width = 320;
+            tmpCanvas.height = 240;
+            const tmpCtx = tmpCanvas.getContext("2d")!;
+            tmpCtx.putImageData(frame, 0, 0);
+            ctx.drawImage(tmpCanvas, col * FRAME_W, row * FRAME_H, FRAME_W, FRAME_H);
+            idx++;
+          }
+        }
+
+        // Draw detection boxes on the last frame
+        const lastFrame = frames[frames.length - 1];
+        const tmpCanvas = document.createElement("canvas");
+        tmpCanvas.width = 320;
+        tmpCanvas.height = 240;
+        const tmpCtx = tmpCanvas.getContext("2d")!;
+        tmpCtx.putImageData(lastFrame, 0, 0);
+
+        const blob = await new Promise<Blob | null>((resolve) =>
+          canvas.toBlob(resolve, "image/jpeg", 0.85)
+        );
+
+        if (blob && blob.size > 1000) {
+          const filename = `clips/${Date.now()}-frames.jpg`;
+          const { data } = await supabase.storage
+            .from("incident-clips")
+            .upload(filename, blob, { contentType: "image/jpeg" });
+
+          if (data) {
+            const { data: urlData } = supabase.storage
+              .from("incident-clips")
+              .getPublicUrl(filename);
+            clipUrl = urlData?.publicUrl;
+          }
+        }
+      } catch (err) {
+        console.error("Frame encoding failed:", err);
+      }
+    }
+
+    // Determine the best clip URL: prefer source video, fallback to encoded frames
+    const videoSrc = selectedClip?.src || null;
+    const videoTime = videoRef.current ? Math.floor(videoRef.current.currentTime) : 0;
+
+    // Store source video info in detection_data so ambulance can play the actual clip
+    const detectionData = {
+      source: "video_analysis",
+      clip: selectedClip?.name,
+      video_src: videoSrc,
+      video_timestamp: videoTime,
+      frames_captured: frames.length,
+    };
+
+    // Create incident
     const { data: incident, error } = await supabase
       .from("incidents")
       .insert({
@@ -560,7 +646,8 @@ export default function VideoAnalysisPage() {
         longitude: alert.longitude,
         location_name: `Video Analysis: ${selectedClip?.name}`,
         detection_confidence: alert.confidence,
-        detection_data: { source: "video_analysis", clip: selectedClip?.name },
+        detection_data: detectionData,
+        video_clip_url: clipUrl || videoSrc || null,
         status: "detected",
       })
       .select()
@@ -568,16 +655,15 @@ export default function VideoAnalysisPage() {
 
     if (error) {
       console.error("Incident insert error:", error);
-      setIncidents((prev) => [...prev, alert]);
+      setIncidents((prev) => [...prev, { ...alert, video_clip_url: clipUrl || videoSrc || undefined }]);
       toast.error(`ACCIDENT DETECTED: ${alert.type.replace(/_/g, " ")} (${alert.severity})`);
       return;
     }
 
-    // Show incident immediately in UI
-    setIncidents((prev) => [...prev, alert]);
+    setIncidents((prev) => [...prev, { ...alert, video_clip_url: clipUrl || videoSrc || undefined }]);
     toast.error(`ACCIDENT DETECTED: ${alert.type.replace(/_/g, " ")} (${alert.severity}) — dispatching ambulance!`);
 
-    // Broadcast immediately (without clip — ambulance gets the alert)
+    // Broadcast to ambulance with full data
     supabase.channel("alerts:ambulance").send({
       type: "broadcast",
       event: "new_incident",
@@ -587,113 +673,21 @@ export default function VideoAnalysisPage() {
         incident_type: alert.type,
         latitude: alert.latitude,
         longitude: alert.longitude,
+        video_clip_url: clipUrl || videoSrc,
+        video_src: videoSrc,
+        video_timestamp: videoTime,
         message: `ACCIDENT from video analysis: ${alert.type.replace(/_/g, " ")}`,
       },
     });
 
-    // Step 2: Record clip async (non-blocking) and attach it
-    const frames = frameBufferRef.current;
-    if (frames.length > 5) {
-      // Fire and forget — don't block the alert
-      (async () => {
-        try {
-          const canvas = document.createElement("canvas");
-          canvas.width = 320;
-          canvas.height = 240;
-          const ctx = canvas.getContext("2d")!;
-
-          // Check if MediaRecorder is available
-          if (typeof MediaRecorder === "undefined") {
-            console.warn("MediaRecorder not available — skipping clip");
-            return;
-          }
-
-          const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8")
-            ? "video/webm;codecs=vp8"
-            : "video/webm";
-
-          const stream = canvas.captureStream(4);
-          const recorder = new MediaRecorder(stream, { mimeType });
-          const chunks: Blob[] = [];
-
-          recorder.ondataavailable = (e) => {
-            if (e.data.size > 0) chunks.push(e.data);
-          };
-
-          const clipBlob = await new Promise<Blob | null>((resolve) => {
-            const timeout = setTimeout(() => {
-              if (recorder.state === "recording") recorder.stop();
-            }, 20000);
-
-            recorder.onstop = () => {
-              clearTimeout(timeout);
-              resolve(new Blob(chunks, { type: "video/webm" }));
-            };
-            recorder.start();
-
-            let i = 0;
-            const drawNext = () => {
-              if (i >= frames.length || recorder.state !== "recording") {
-                recorder.stop();
-                return;
-              }
-              ctx.putImageData(frames[i], 0, 0);
-              i++;
-              setTimeout(drawNext, 250);
-            };
-            drawNext();
-          });
-
-          if (!clipBlob || clipBlob.size < 500) {
-            console.warn("Clip too small, skipping upload");
-            return;
-          }
-
-          // Upload to Supabase Storage
-          const filename = `clips/${incident.id}/${Date.now()}.webm`;
-          const { data: uploadData, error: uploadErr } = await supabase.storage
-            .from("incident-clips")
-            .upload(filename, clipBlob, { contentType: "video/webm" });
-
-          if (uploadErr) {
-            console.error("Upload error:", uploadErr);
-            // Try creating the bucket if it doesn't exist
-            await supabase.storage.createBucket("incident-clips", { public: true });
-            const { data: retry } = await supabase.storage
-              .from("incident-clips")
-              .upload(filename, clipBlob, { contentType: "video/webm" });
-            if (retry) {
-              const { data: urlData } = supabase.storage.from("incident-clips").getPublicUrl(filename);
-              if (urlData?.publicUrl) {
-                await supabase.from("incidents").update({ video_clip_url: urlData.publicUrl }).eq("id", incident.id);
-                // Broadcast clip URL to ambulance
-                supabase.channel("alerts:ambulance").send({
-                  type: "broadcast",
-                  event: "clip_ready",
-                  payload: { incident_id: incident.id, video_clip_url: urlData.publicUrl },
-                });
-              }
-            }
-            return;
-          }
-
-          if (uploadData) {
-            const { data: urlData } = supabase.storage.from("incident-clips").getPublicUrl(filename);
-            if (urlData?.publicUrl) {
-              // Update incident with clip URL
-              await supabase.from("incidents").update({ video_clip_url: urlData.publicUrl }).eq("id", incident.id);
-              // Broadcast clip URL to ambulance in real-time
-              supabase.channel("alerts:ambulance").send({
-                type: "broadcast",
-                event: "clip_ready",
-                payload: { incident_id: incident.id, video_clip_url: urlData.publicUrl },
-              });
-            }
-          }
-        } catch (err) {
-          console.error("Clip recording failed:", err);
-        }
-      })();
+    // If we later get a better clip URL, update it
+    if (clipUrl && clipUrl !== videoSrc) {
+      await supabase.from("incidents").update({ video_clip_url: clipUrl }).eq("id", incident.id);
+      supabase.channel("alerts:ambulance").send({
+        type: "broadcast",
+        event: "clip_ready",
+        payload: { incident_id: incident.id, video_clip_url: clipUrl },
+      });
     }
   };
 

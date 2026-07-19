@@ -180,25 +180,43 @@ export default function AmbulanceDashboard() {
           </span>
         </div>
 
-        {/* Video Clip */}
+        {/* Video Clip — works for both source video URLs and uploaded clips */}
         {incident.video_clip_url ? (
           <div className="bg-background rounded-lg overflow-hidden">
-            <video
-              src={incident.video_clip_url}
-              controls
-              preload="none"
-              className="w-full max-h-48"
-            />
-            <div className="px-3 py-2 text-xs text-muted-foreground flex items-center gap-1">
-              <Video size={12} />
-              Incident footage — review before dispatch
-            </div>
+            {incident.video_clip_url.endsWith(".jpg") || incident.video_clip_url.endsWith(".jpeg") ? (
+              // Frame capture composite image
+              <div>
+                <img
+                  src={incident.video_clip_url}
+                  alt="Accident frames"
+                  className="w-full max-h-64 object-contain"
+                />
+                <div className="px-3 py-2 text-xs text-muted-foreground flex items-center gap-1">
+                  <Video size={12} />
+                  Captured frames — review before dispatch
+                </div>
+              </div>
+            ) : (
+              // Video file (source or uploaded clip)
+              <div>
+                <video
+                  src={incident.video_clip_url}
+                  controls
+                  preload="none"
+                  className="w-full max-h-48"
+                />
+                <div className="px-3 py-2 text-xs text-muted-foreground flex items-center gap-1">
+                  <Video size={12} />
+                  Incident footage — review before dispatch
+                </div>
+              </div>
+            )}
           </div>
         ) : (
           <div className="bg-background rounded-lg p-4 text-center text-sm text-muted-foreground flex items-center justify-center gap-2">
             <Video size={16} className="opacity-50" />
             {incident.location_name?.startsWith("Video Analysis:")
-              ? "Clip processing — will appear shortly"
+              ? "Clip processing..."
               : "No video clip available"}
           </div>
         )}
