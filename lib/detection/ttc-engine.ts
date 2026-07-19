@@ -13,6 +13,8 @@
 
 import { TrackedEntity } from "./kalman-tracker";
 
+const H = 240; // frame height for position checks
+
 export interface TTCPair {
   a: TrackedEntity;
   b: TrackedEntity;
@@ -187,18 +189,38 @@ export function findAllTTCPairs(entities: TrackedEntity[]): TTCPair[] {
 }
 
 export function detectPostImpact(entities: TrackedEntity[], ttcPairs: TTCPair[]): AccidentEvidence | null {
-  for (const pair of ttcPairs) {
-    if (pair.distance > 40) continue;
-    if (!isStopped(pair.a) || !isStopped(pair.b)) continue;
-    if (!wasFast(pair.a) || !wasFast(pair.b)) continue;
-    if (!isStationary(pair.a) || !isStationary(pair.b)) continue;
+  // Scan ALL entity pairs, not just TTC pairs — objects may scatter after crash
+  const candidates = entities.filter(e => e.age >= 3);
 
-    return {
-      type: "post_impact",
-      confidence: 0.9,
-      objects: [pair.a.id, pair.b.id],
-      details: `Both stopped + stationary (dist: ${pair.distance.toFixed(0)}px)`,
-    };
+  for (let i = 0; i < candidates.length; i++) {
+    for (let j = i + 1; j < candidates.length; j++) {
+      const a = candidates[i], b = candidates[j];
+      if (a.class === "person" && b.class === "person") continue;
+
+      const d = dist(a, b);
+
+      // Must be within reasonable distance (objects scatter after crash)
+      if (d > 200) continue;
+
+      // Both must be stopped
+      if (!isStopped(a) || !isStopped(b)) continue;
+
+      // Both must have been moving fast recently
+      if (!wasFast(a) || !wasFast(b)) continue;
+
+      // Both should be stationary (not just stopped — actually still)
+      if (!isStationary(a) || !isStationary(b)) continue;
+
+      // At least one must have been tracked for a while (not a flash detection)
+      if (a.age < 5 || b.age < 5) continue;
+
+      return {
+        type: "post_impact",
+        confidence: 0.9,
+        objects: [a.id, b.id],
+        details: `Both stopped after fast movement (dist: ${d.toFixed(0)}px)`,
+      };
+    }
   }
   return null;
 }
@@ -227,6 +249,7 @@ export function detectAccidents(
   if (postImpact) evidence.push(postImpact);
 
   for (const entity of entities) {
+    // Bike fall near a vehicle
     if (isBikeFall(entity)) {
       const nearbyVehicle = entities.find(e =>
         e.id !== entity.id &&
@@ -240,6 +263,23 @@ export function detectAccidents(
           objects: [entity.id, nearbyVehicle.id],
           details: `Bike fell near #${nearbyVehicle.id}`,
         });
+      }
+    }
+
+    // Person fell: was moving fast, now stopped and low on screen (on ground)
+    if (entity.class === "person" && wasFast(entity) && isStopped(entity) && isStationary(entity)) {
+      if (entity.positions.length >= 3) {
+        const lastY = entity.positions[entity.positions.length - 1].y;
+        const prevY = entity.positions[entity.positions.length - 3].y;
+        // Person dropped (fell to ground) or is in lower half of frame
+        if (lastY > prevY + 3 || lastY > H * 0.6) {
+          evidence.push({
+            type: "bike_fall", // reuse type for person fall
+            confidence: 0.7,
+            objects: [entity.id],
+            details: `Person fell (was fast, now stopped on ground)`,
+          });
+        }
       }
     }
   }
