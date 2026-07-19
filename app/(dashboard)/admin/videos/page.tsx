@@ -12,10 +12,8 @@ import { MultiObjectTracker, TrackedEntity } from "@/lib/detection/kalman-tracke
 import { findAllTTCPairs, detectAccidents, TTCPair, AccidentEvidence } from "@/lib/detection/ttc-engine";
 import { autoCalibrate, calculateRealSpeed, perspectiveCorrectedSpeed } from "@/lib/detection/speed-estimator";
 
-// ========== TYPES ==========
 interface VideoClip { name: string; src: string; description: string }
 interface IncidentAlert { type: string; severity: string; confidence: number; timestamp: string; latitude: number; longitude: number }
-
 type EnvMode = "isolated" | "traffic" | "marketplace";
 
 const VIDEO_CLIPS: VideoClip[] = [
@@ -34,42 +32,37 @@ const COCO_MAP: Record<string, string> = {
 const LAT = 22.7196, LNG = 75.8577;
 const GRID_COLS = 10, GRID_ROWS = 8;
 
-let nextObjId = 1;
-
 export default function VideoAnalysisPage() {
   const [selectedClip, setSelectedClip] = useState<VideoClip | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [videoReady, setVideoReady] = useState(false);
   const [incidents, setIncidents] = useState<IncidentAlert[]>([]);
   const [state, setState] = useState("monitoring");
-  const [demoMode, setDemoMode] = useState(false);
   const [objectCount, setObjectCount] = useState(0);
   const [envMode, setEnvMode] = useState<EnvMode>("isolated");
-  const [modelLoading, setModelLoading] = useState(false);
   const [modelReady, setModelReady] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const tmpCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number>(0);
-  const analyzingRef = useRef(false); // use ref, not state, for loop control
-  const trackerRef = useRef<MultiObjectTracker>(new MultiObjectTracker());
+  const analyzingRef = useRef(false);
+  const trackerRef = useRef(new MultiObjectTracker());
   const modelRef = useRef<any>(null);
   const stateRef = useRef("monitoring");
   const frameRef = useRef(0);
-  const stateFrameRef = useRef(0);
   const cooldownRef = useRef(0);
   const accumRef = useRef<Float32Array>(new Float32Array(GRID_COLS * GRID_ROWS));
   const prevChangeGridRef = useRef<Float32Array | null>(null);
   const consecutiveAnomalyRef = useRef(0);
-  const ttcPairsRef = useRef<TTCPair[]>([]);
-  const evidenceRef = useRef<AccidentEvidence[]>([]);
-  const pixelsPerMeterRef = useRef(50);
+  const pixelsPerMeterRef = useRef(20);
+  const alertTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const canvasSizedRef = useRef(false);
   const supabase = createClient();
 
-  // Load COCO-SSD model
+  // Load COCO-SSD once on mount
   useEffect(() => {
     const loadModel = async () => {
-      setModelLoading(true);
       try {
         const [tf, cocoSsd] = await Promise.all([
           import("@tensorflow/tfjs"),
@@ -79,40 +72,48 @@ export default function VideoAnalysisPage() {
         modelRef.current = await cocoSsd.load({ base: "lite_mobilenet_v2" });
         setModelReady(true);
       } catch (e) {
-        console.error("Failed to load COCO-SSD:", e);
+        console.error("COCO-SSD load failed:", e);
         toast.error("AI model failed to load.");
       }
-      setModelLoading(false);
     };
     loadModel();
-    return () => { cancelAnimationFrame(rafRef.current); };
+    return () => { cancelAnimationFrame(rafRef.current); if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current); };
   }, []);
 
-  useEffect(() => { setVideoReady(false); const t = setTimeout(() => setVideoReady(true), 8000); return () => clearTimeout(t); }, [selectedClip]);
+  // Recalibrate PPM when env mode changes
+  useEffect(() => {
+    if (videoRef.current) {
+      pixelsPerMeterRef.current = autoCalibrate(videoRef.current.videoWidth || 640, videoRef.current.videoHeight || 480, envMode);
+    }
+  }, [envMode]);
 
   const getTmp = useCallback(() => {
     if (!tmpCanvasRef.current) tmpCanvasRef.current = document.createElement("canvas");
     return tmpCanvasRef.current;
   }, []);
 
-  // COCO-SSD detection
-  const detectObjects = async (video: HTMLVideoElement) => {
-    if (!modelRef.current || video.paused || video.ended) return [];
-    try {
-      const predictions = await modelRef.current.detect(video);
-      return predictions
-        .filter((p: any) => p.class in COCO_MAP && p.score > 0.4)
-        .map((p: any) => {
-          const [x, y, w, h] = p.bbox;
-          return { class: COCO_MAP[p.class], cx: x + w / 2, cy: y + h / 2, w, h, confidence: p.score };
-        });
-    } catch (e) {
-      console.error("COCO-SSD error:", e);
-      return [];
+  // Create AudioContext on first user interaction
+  const getAudioCtx = useCallback(() => {
+    if (!audioCtxRef.current) {
+      try { audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)(); } catch {}
     }
-  };
+    return audioCtxRef.current;
+  }, []);
 
-  // Compute accumulated change grid
+  const playAlertSound = useCallback(() => {
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    try {
+      if (ctx.state === "suspended") ctx.resume();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.frequency.value = 880; osc.type = "sine"; gain.gain.value = 0.3;
+      osc.start(); gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+      osc.stop(ctx.currentTime + 0.4);
+    } catch {}
+  }, [getAudioCtx]);
+
   const computeChangeGrid = (data: Uint8ClampedArray, w: number, h: number): Float32Array => {
     const grid = new Float32Array(GRID_COLS * GRID_ROWS);
     const cw = Math.floor(w / GRID_COLS), ch = Math.floor(h / GRID_ROWS);
@@ -127,106 +128,83 @@ export default function VideoAnalysisPage() {
     return grid;
   };
 
-  // Draw everything
-  const drawFrame = (
-    entities: TrackedEntity[], ttcPairs: TTCPair[], evidence: AccidentEvidence[],
-    changeGrid: Float32Array, videoW: number, videoH: number
-  ) => {
+  const drawFrame = (entities: TrackedEntity[], ttcPairs: TTCPair[], evidence: AccidentEvidence[], videoW: number, videoH: number) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    canvas.width = videoW;
-    canvas.height = videoH;
+    // Size canvas once
+    if (!canvasSizedRef.current || canvas.width !== videoW || canvas.height !== videoH) {
+      canvas.width = videoW;
+      canvas.height = videoH;
+      canvasSizedRef.current = true;
+    }
     ctx.clearRect(0, 0, videoW, videoH);
 
-    const ppm = pixelsPerMeterRef.current;
-
-    // Draw tracked objects with ESP boxes
+    // Draw objects
     for (const entity of entities) {
       if (entity.age < 2) continue;
       const isInvolved = evidence.some(e => e.objects.includes(entity.id));
       const baseColor = entity.class === "car" ? "#22c55e" : entity.class === "motorcycle" ? "#f59e0b" : "#3b82f6";
       const color = isInvolved ? "#ef4444" : baseColor;
+      const cx = entity.kalman.getState().x, cy = entity.kalman.getState().y;
+      const bx = cx - entity.w / 2, by = cy - entity.h / 2;
 
-      // Bounding box
-      const bx = entity.kalman.getState().x - entity.w / 2;
-      const by = entity.kalman.getState().y - entity.h / 2;
       ctx.strokeStyle = color;
       ctx.lineWidth = isInvolved ? 3 : 2;
       ctx.strokeRect(bx, by, entity.w, entity.h);
 
       // Heading arrow
-      const cx = entity.kalman.getState().x;
-      const cy = entity.kalman.getState().y;
       const arrowLen = Math.min(entity.w, entity.h) * 0.5;
       ctx.beginPath();
       ctx.moveTo(cx, cy);
       ctx.lineTo(cx + Math.cos(entity.heading) * arrowLen, cy + Math.sin(entity.heading) * arrowLen);
-      ctx.strokeStyle = isInvolved ? "#ef4444" : "#ffffff";
+      ctx.strokeStyle = isInvolved ? "#ef4444" : "#fff";
       ctx.lineWidth = 2;
       ctx.stroke();
 
-      // Speed label with REAL km/h
-      const { current: speedKmh } = calculateRealSpeed(entity, ppm);
-      const correctedSpeed = perspectiveCorrectedSpeed(speedKmh, entity.kalman.getState().y, videoH);
-      const accelLabel = entity.acceleration < -0.3 ? "BRAKE" : entity.acceleration > 0.3 ? "ACC" : "";
-      const label = `${entity.class} ${(entity.confidence * 100).toFixed(0)}% | ${correctedSpeed}km/h${accelLabel ? " | " + accelLabel : ""}`;
+      // Label
+      const { current: speedKmh } = calculateRealSpeed(entity, pixelsPerMeterRef.current);
+      const corrected = perspectiveCorrectedSpeed(speedKmh, cy, videoH);
+      const accelLabel = entity.acceleration < -0.3 ? " BRAKE" : "";
+      const label = `${entity.class} ${corrected}km/h${accelLabel}`;
       ctx.font = "bold 11px Arial";
       const tw = ctx.measureText(label).width;
-      const labelY = by - 20;
       ctx.fillStyle = isInvolved ? "#ef4444" : "rgba(0,0,0,0.75)";
-      ctx.fillRect(bx, labelY, tw + 8, 18);
-      ctx.fillStyle = "white";
-      ctx.fillText(label, bx + 4, labelY + 13);
+      ctx.fillRect(bx, by - 18, tw + 8, 16);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(label, bx + 4, by - 5);
     }
 
-    // Draw TTC warning lines for critical pairs
+    // TTC lines
     for (const pair of ttcPairs) {
       if (pair.severity === "none") continue;
-      const ax = pair.a.kalman.getState().x;
-      const ay = pair.a.kalman.getState().y;
-      const bx = pair.b.kalman.getState().x;
-      const by = pair.b.kalman.getState().y;
-
-      const lineColor = pair.severity === "impact" ? "#ef4444"
-        : pair.severity === "critical" ? "#f97316"
-        : "#f59e0b";
-
-      ctx.setLineDash([5, 5]);
+      const lineColor = pair.severity === "impact" ? "#ef4444" : pair.severity === "critical" ? "#f97316" : "#f59e0b";
+      ctx.setLineDash([4, 4]);
       ctx.strokeStyle = lineColor;
-      ctx.lineWidth = pair.severity === "impact" ? 3 : 2;
+      ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.moveTo(ax, ay);
-      ctx.lineTo(bx, by);
+      ctx.moveTo(pair.a.kalman.getState().x, pair.a.kalman.getState().y);
+      ctx.lineTo(pair.b.kalman.getState().x, pair.b.kalman.getState().y);
       ctx.stroke();
       ctx.setLineDash([]);
-
-      // TTC label at midpoint
-      if (!isNaN(pair.ttc)) {
-        const mx = (ax + bx) / 2, my = (ay + by) / 2;
-        ctx.font = "bold 10px Arial";
-        ctx.fillStyle = lineColor;
-        ctx.fillText(`TTC: ${pair.ttc.toFixed(1)}s`, mx + 5, my - 5);
-      }
     }
 
     // Bottom bar
-    const barY = videoH - 22;
+    const barY = videoH - 20;
     ctx.fillStyle = "rgba(0,0,0,0.7)";
-    ctx.fillRect(0, barY, videoW, 22);
-    const modeLabel = envMode === "traffic" ? "TRAFFIC" : envMode === "marketplace" ? "MARKETPLACE" : "ISOLATED";
-    const topEvidence = evidence[0];
-    const evLabel = topEvidence ? ` | ${topEvidence.type}: ${topEvidence.details}` : "";
-    ctx.fillStyle = "white";
+    ctx.fillRect(0, barY, videoW, 20);
+    ctx.fillStyle = "#fff";
     ctx.font = "11px Arial";
-    ctx.fillText(`${modeLabel} | Objects: ${entities.filter(e => e.age >= 2).length} | PPM: ${ppm.toFixed(1)}${evLabel}`, 8, barY + 15);
+    const modeLabel = envMode === "traffic" ? "TRAFFIC" : envMode === "marketplace" ? "MARKETPLACE" : "ISOLATED";
+    ctx.fillText(`${modeLabel} | Objects: ${entities.filter(e => e.age >= 2).length} | PPM: ${pixelsPerMeterRef.current.toFixed(1)}`, 8, barY + 14);
   };
 
   const createIncident = async (alert: IncidentAlert) => {
     setIncidents(prev => [...prev, alert]);
     toast.error(`ACCIDENT: ${alert.type.replace(/_/g, " ")} (${alert.severity})`);
+    playAlertSound();
 
     try {
       const { data: inc, error } = await supabase.from("incidents").insert({
@@ -238,38 +216,26 @@ export default function VideoAnalysisPage() {
         video_clip_url: selectedClip?.src || null,
         status: "detected",
       }).select().single();
-
-      if (error) {
-        console.error("Failed to create incident:", error);
-        return;
-      }
-
-      if (inc) {
+      if (!error && inc) {
         try {
           supabase.channel("alerts:ambulance").send({
             type: "broadcast", event: "new_incident",
-            payload: {
-              incident_id: inc.id, severity: alert.severity, incident_type: alert.type,
+            payload: { incident_id: inc.id, severity: alert.severity, incident_type: alert.type,
               latitude: alert.latitude, longitude: alert.longitude, video_clip_url: selectedClip?.src,
-              message: `ACCIDENT: ${alert.type.replace(/_/g, " ")}`,
-            },
+              message: `ACCIDENT: ${alert.type.replace(/_/g, " ")}` },
           });
-        } catch (e) {
-          console.error("Broadcast failed:", e);
-        }
+        } catch {}
       }
-    } catch (e) {
-      console.error("Incident creation failed:", e);
-    }
+    } catch (e) { console.error("Incident failed:", e); }
   };
 
   // ========== MAIN LOOP ==========
   const startAnalysis = async () => {
-    if (!videoRef.current || !selectedClip) return;
+    if (!videoRef.current || !selectedClip || analyzingRef.current) return;
     if (!modelRef.current) { toast.error("AI model still loading..."); return; }
     const video = videoRef.current;
     try { await video.play(); } catch {
-      video.muted = false;
+      video.muted = true;
       try { await video.play(); } catch { toast.error("Cannot play video"); return; }
     }
 
@@ -277,18 +243,14 @@ export default function VideoAnalysisPage() {
     accumRef.current.fill(0);
     prevChangeGridRef.current = null;
     frameRef.current = 0;
-    stateFrameRef.current = 0;
     cooldownRef.current = 0;
     consecutiveAnomalyRef.current = 0;
     stateRef.current = "monitoring";
-    nextObjId = 1;
-
-    // Auto-calibrate
+    canvasSizedRef.current = false;
     pixelsPerMeterRef.current = autoCalibrate(video.videoWidth || 640, video.videoHeight || 480, envMode);
 
-    setVideoReady(true);
-    setIsAnalyzing(true);
     analyzingRef.current = true;
+    setIsAnalyzing(true);
     setIncidents([]);
     setState("monitoring");
     setObjectCount(0);
@@ -297,27 +259,21 @@ export default function VideoAnalysisPage() {
     let latestDetections: { class: string; cx: number; cy: number; w: number; h: number; confidence: number }[] = [];
     let isDetecting = false;
 
-    // Non-blocking detection — runs in background, doesn't block render
-    const scheduleDetection = (video: HTMLVideoElement) => {
-      if (isDetecting || !modelRef.current || video.paused || video.ended) return;
+    const scheduleDetection = (vid: HTMLVideoElement) => {
+      if (isDetecting || !modelRef.current || vid.paused || vid.ended) return;
       const now = Date.now();
-      if (now - lastDetectTime < 500) return; // 2 FPS detection
+      if (now - lastDetectTime < 500) return;
       isDetecting = true;
       lastDetectTime = now;
-      modelRef.current.detect(video).then((predictions: any[]) => {
-        const filtered = predictions
+      modelRef.current.detect(vid).then((preds: any[]) => {
+        latestDetections = preds
           .filter((p: any) => p.class in COCO_MAP && p.score > 0.3)
           .map((p: any) => {
             const [x, y, w, h] = p.bbox;
             return { class: COCO_MAP[p.class], cx: x + w / 2, cy: y + h / 2, w, h, confidence: p.score };
           });
-        latestDetections = filtered;
-        if (frameRef.current % 30 === 0) {
-          console.log(`[SAGE] COCO-SSD: ${predictions.length} raw, ${filtered.length} filtered`, predictions.map((p: any) => `${p.class}(${(p.score*100).toFixed(0)}%)`));
-        }
-      }).catch((e: any) => {
-        console.error("[SAGE] COCO-SSD detect failed:", e);
-      }).finally(() => { isDetecting = false; });
+        if (frameRef.current % 60 === 0) console.log(`[SAGE] ${preds.length} raw → ${latestDetections.length} filtered`);
+      }).catch(() => {}).finally(() => { isDetecting = false; });
     };
 
     const loop = () => {
@@ -327,130 +283,76 @@ export default function VideoAnalysisPage() {
         frameRef.current++;
         if (cooldownRef.current > 0) cooldownRef.current--;
 
-        // Schedule non-blocking detection
         scheduleDetection(videoRef.current);
 
-        // Track with Kalman filter (uses last known detections)
         const entities = trackerRef.current.update(latestDetections, frameRef.current);
         const validEntities = entities.filter(e => e.age >= 2);
-        setObjectCount(validEntities.length);
 
-        // Compute change grid
-        const tmp = getTmp();
-        tmp.width = video.videoWidth || 640;
-        tmp.height = video.videoHeight || 480;
-        const ctx = tmp.getContext("2d")!;
-        ctx.drawImage(video, 0, 0, tmp.width, tmp.height);
-        const imgData = ctx.getImageData(0, 0, tmp.width, tmp.height);
-        const changeGrid = computeChangeGrid(imgData.data, tmp.width, tmp.height);
+        // Update object count every 10 frames (not every frame)
+        if (frameRef.current % 10 === 0) setObjectCount(validEntities.length);
 
-        // Update accum grid
-        const prev = prevChangeGridRef.current;
-        for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
-          const diff = prev ? Math.abs(changeGrid[i] - prev[i]) / 255 : 0;
-          accumRef.current[i] = accumRef.current[i] * 0.95 + diff * 3;
+        // Change detection — only every 500ms (expensive getImageData)
+        if (frameRef.current % 30 === 0) {
+          const tmp = getTmp();
+          tmp.width = video.videoWidth || 640;
+          tmp.height = video.videoHeight || 480;
+          const tCtx = tmp.getContext("2d")!;
+          tCtx.drawImage(video, 0, 0, tmp.width, tmp.height);
+          const imgData = tCtx.getImageData(0, 0, tmp.width, tmp.height);
+          const changeGrid = computeChangeGrid(imgData.data, tmp.width, tmp.height);
+          const prev = prevChangeGridRef.current;
+          for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
+            const diff = prev ? Math.abs(changeGrid[i] - prev[i]) / 255 : 0;
+            accumRef.current[i] = accumRef.current[i] * 0.95 + diff * 3;
+          }
+          prevChangeGridRef.current = changeGrid;
         }
-        prevChangeGridRef.current = changeGrid;
 
-        // TTC computation
         const ttcPairs = findAllTTCPairs(validEntities);
-        ttcPairsRef.current = ttcPairs;
-
-        // Accident detection
         const evidence = detectAccidents(validEntities, ttcPairs);
-        evidenceRef.current = evidence;
 
-        // Draw
-        drawFrame(validEntities, ttcPairs, evidence, changeGrid, video.videoWidth || 640, video.videoHeight || 480);
+        drawFrame(validEntities, ttcPairs, evidence, video.videoWidth || 640, video.videoHeight || 480);
 
-        // ========== STATE MACHINE (Very Conservative) ==========
-        // ONLY advance with strong collision evidence (speed change + proximity)
-        const hasCollision = evidence.some(e =>
-          e.type === "collision" && e.confidence > 0.7
-        );
+        // State machine
+        const hasCollision = evidence.some(e => e.type === "collision" && e.confidence > 0.7);
         const hasPostImpact = evidence.some(e => e.type === "post_impact");
-        // Post-impact is the strongest signal — both objects stopped after moving
         const hasStrongEvidence = hasCollision || hasPostImpact;
 
         if (hasStrongEvidence) consecutiveAnomalyRef.current++;
         else consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 1);
 
-        stateFrameRef.current++;
+        frameRef.current++;
         let st = stateRef.current;
 
-        // Very strict: need sustained strong evidence
         if (hasPostImpact) {
-          // Post-impact = immediate alert (both stopped, was moving)
           st = "alert";
         } else if (hasStrongEvidence && consecutiveAnomalyRef.current >= 8) {
           if (st === "monitoring") st = "watching";
           else if (st === "watching" && consecutiveAnomalyRef.current >= 12) st = "confirming";
           else if (st === "confirming" && consecutiveAnomalyRef.current >= 16) st = "alert";
-        } else if (!demoMode && frameRef.current % 5 === 0) {
+        } else if (frameRef.current % 5 === 0) {
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
 
-        if (demoMode) {
-          const sf = stateFrameRef.current;
-          if (sf === 15 && st === "monitoring") st = "watching";
-          if (sf === 25 && st === "watching") st = "confirming";
-          if (sf >= 35 && st === "confirming") st = "alert";
-        }
-
-        // Fire alert
+        // Alert
         if (st === "alert" && stateRef.current !== "alert" && cooldownRef.current <= 0) {
-          cooldownRef.current = envMode === "traffic" ? 120 : 40;
+          cooldownRef.current = 120;
           consecutiveAnomalyRef.current = 0;
 
           const topEv = evidence[0];
           let incidentType = "vehicle_collision";
           let severity = "major";
 
-          if (topEv) {
-            if (topEv.type === "collision" || topEv.type === "perpendicular_impact") {
-              const hasPerson = topEv.objects.some(id => {
-                const ent = validEntities.find(v => v.id === id);
-                return ent?.class === "person";
-              });
-              incidentType = hasPerson ? "pedestrian_collision" : "vehicle_collision";
-              severity = topEv.confidence > 0.8 ? "critical" : "major";
-            } else if (topEv.type === "post_impact") {
-              incidentType = "vehicle_collision";
-              severity = "critical";
-            } else {
-              incidentType = "";
-            }
+          if (topEv?.type === "post_impact") {
+            severity = "critical";
+          } else if (topEv?.type === "collision") {
+            const hasPerson = topEv.objects.some(id => validEntities.find(v => v.id === id)?.class === "person");
+            incidentType = hasPerson ? "pedestrian_collision" : "vehicle_collision";
+          } else {
+            incidentType = "";
           }
 
           if (incidentType) {
-            // Play alert sound
-            try {
-              const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-              const osc = audioCtx.createOscillator();
-              const gain = audioCtx.createGain();
-              osc.connect(gain);
-              gain.connect(audioCtx.destination);
-              osc.frequency.value = 880;
-              osc.type = "sine";
-              gain.gain.value = 0.3;
-              osc.start();
-              gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
-              osc.stop(audioCtx.currentTime + 0.5);
-              // Second beep
-              setTimeout(() => {
-                const osc2 = audioCtx.createOscillator();
-                const gain2 = audioCtx.createGain();
-                osc2.connect(gain2);
-                gain2.connect(audioCtx.destination);
-                osc2.frequency.value = 1100;
-                osc2.type = "sine";
-                gain2.gain.value = 0.3;
-                osc2.start();
-                gain2.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
-                osc2.stop(audioCtx.currentTime + 0.5);
-              }, 200);
-            } catch {}
-
             createIncident({
               type: incidentType, severity,
               confidence: topEv?.confidence || 0.6,
@@ -458,9 +360,8 @@ export default function VideoAnalysisPage() {
               latitude: LAT + (Math.random() - 0.5) * 0.01,
               longitude: LNG + (Math.random() - 0.5) * 0.01,
             });
-            setTimeout(() => { stateRef.current = "monitoring"; stateFrameRef.current = 0; setState("monitoring"); }, 8000);
-          } else {
-            stateRef.current = "monitoring"; stateFrameRef.current = 0; setState("monitoring");
+            if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current);
+            alertTimeoutRef.current = setTimeout(() => { stateRef.current = "monitoring"; setState("monitoring"); }, 8000);
           }
         }
 
@@ -468,8 +369,7 @@ export default function VideoAnalysisPage() {
         setState(st);
       } catch (e) { console.error(e); }
 
-      // Stop loop if video ended or analysis stopped
-      if (videoRef.current && !videoRef.current.paused && !videoRef.current.ended && analyzingRef.current) {
+      if (analyzingRef.current && videoRef.current && !videoRef.current.paused) {
         rafRef.current = requestAnimationFrame(loop);
       }
     };
@@ -479,6 +379,7 @@ export default function VideoAnalysisPage() {
   const stopAnalysis = () => {
     analyzingRef.current = false;
     cancelAnimationFrame(rafRef.current);
+    if (alertTimeoutRef.current) { clearTimeout(alertTimeoutRef.current); alertTimeoutRef.current = null; }
     if (videoRef.current) { videoRef.current.pause(); videoRef.current.currentTime = 0; }
     setIsAnalyzing(false);
     setState("monitoring");
@@ -492,9 +393,9 @@ export default function VideoAnalysisPage() {
     accumRef.current.fill(0);
     prevChangeGridRef.current = null;
     frameRef.current = 0;
-    stateFrameRef.current = 0;
     cooldownRef.current = 0;
     consecutiveAnomalyRef.current = 0;
+    canvasSizedRef.current = false;
     setObjectCount(0);
   };
 
@@ -518,13 +419,13 @@ export default function VideoAnalysisPage() {
       </Link>
       <div>
         <h1 className="text-2xl font-bold">Video Analysis</h1>
-        <p className="text-muted-foreground">Kalman tracking + TTC prediction + COCO-SSD detection</p>
+        <p className="text-muted-foreground">COCO-SSD AI + Kalman tracking + TTC prediction</p>
       </div>
 
       {!selectedClip ? (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {VIDEO_CLIPS.map(clip => (
-            <button key={clip.name} onClick={() => { if (isAnalyzing) stopAnalysis(); resetClip(); setSelectedClip(clip); }}
+            <button key={clip.name} onClick={() => setSelectedClip(clip)}
               className="bg-card p-5 rounded-xl border border-border hover:border-primary/50 transition-colors text-left">
               <div className="flex items-start gap-4">
                 <div className="w-16 h-16 bg-background rounded-lg flex items-center justify-center shrink-0">
@@ -563,33 +464,18 @@ export default function VideoAnalysisPage() {
                     <button onClick={startAnalysis} disabled={!videoReady || !modelReady}
                       className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2 disabled:opacity-50">
                       {!modelReady ? <><Loader2 size={16} className="animate-spin" /> Loading AI...</> :
-                        videoReady ? <><Play size={16} /> Start Analysis</> :
-                          <><Loader2 size={16} className="animate-spin" /> Loading...</>}
+                        <><Play size={16} /> Start Analysis</>}
                     </button>
                   ) : (
-                    <>
-                      <button onClick={stopAnalysis} className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors flex items-center gap-2"><Pause size={16} /> Stop</button>
-                      <button onClick={resetClip} className="px-4 py-2 bg-card border border-border rounded-lg hover:bg-background transition-colors flex items-center gap-2"><RotateCcw size={16} /> Reset</button>
-                    </>
+                    <button onClick={stopAnalysis} className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors flex items-center gap-2"><Pause size={16} /> Stop</button>
                   )}
-
-                  <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
-                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${demoMode ? "bg-yellow-500/20 text-yellow-500" : "bg-green-500/20 text-green-500"}`}>{demoMode ? "DEMO" : "REAL"}</span>
-                    <div onClick={() => setDemoMode(!demoMode)} className={`w-10 h-5 rounded-full transition-colors relative cursor-pointer ${demoMode ? "bg-yellow-500" : "bg-green-600"}`}>
-                      <div className={`w-4 h-4 bg-white rounded-full absolute top-0.5 transition-transform ${demoMode ? "translate-x-5" : "translate-x-0.5"}`} />
-                    </div>
-                  </label>
-
                   <span className="text-muted-foreground text-xs">{selectedClip.name}</span>
-
                   <div className="flex gap-1 ml-auto">
                     {envModes.map(m => (
                       <button key={m.key} onClick={() => setEnvMode(m.key)}
                         className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
                           envMode === m.key
-                            ? m.color === "blue" ? "bg-blue-600 text-white"
-                              : m.color === "orange" ? "bg-orange-600 text-white"
-                              : "bg-purple-600 text-white"
+                            ? m.color === "blue" ? "bg-blue-600 text-white" : m.color === "orange" ? "bg-orange-600 text-white" : "bg-purple-600 text-white"
                             : "bg-card border border-border text-muted-foreground hover:bg-background"
                         }`}>
                         {m.icon}{m.label}
@@ -601,7 +487,6 @@ export default function VideoAnalysisPage() {
             </div>
 
             <div className="space-y-4">
-              {/* State */}
               <div className="bg-card p-4 rounded-xl border border-border">
                 <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> State</h3>
                 <div className="space-y-2">
@@ -612,12 +497,9 @@ export default function VideoAnalysisPage() {
                     </div>
                   ))}
                 </div>
-                <div className="mt-2 text-xs text-muted-foreground">
-                  Mode: {envMode} | PPM: {pixelsPerMeterRef.current.toFixed(1)} | Cooldown: {cooldownRef.current}f
-                </div>
+                <div className="mt-2 text-xs text-muted-foreground">Mode: {envMode} | PPM: {pixelsPerMeterRef.current.toFixed(1)}</div>
               </div>
 
-              {/* Change Detection */}
               <div className="bg-card p-4 rounded-xl border border-border">
                 <h3 className="font-semibold mb-3 flex items-center gap-2"><Zap size={16} /> Change Detection</h3>
                 <div className="grid gap-px" style={{ gridTemplateColumns: `repeat(${GRID_COLS}, 1fr)` }}>
@@ -631,67 +513,28 @@ export default function VideoAnalysisPage() {
                 </div>
               </div>
 
-              {/* TTC Status */}
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> Time-to-Collision</h3>
-                {(() => {
-                  const pairs = ttcPairsRef.current;
-                  if (pairs.length === 0) return <p className="text-sm text-green-400">No converging objects</p>;
-                  return pairs.slice(0, 3).map((p, i) => (
-                    <div key={i} className={`p-2 rounded mb-1 text-xs ${p.severity === "impact" ? "bg-red-500/10 border border-red-500/30" : p.severity === "critical" ? "bg-orange-500/10" : "bg-yellow-500/10"}`}>
-                      <div className="flex justify-between">
-                        <span>#{p.a.id}({p.a.class}) + #{p.b.id}({p.b.class})</span>
-                        <span className={`font-bold ${p.severity === "impact" ? "text-red-400" : p.severity === "critical" ? "text-orange-400" : "text-yellow-400"}`}>
-                          {isNaN(p.ttc) ? "N/A" : `${p.ttc.toFixed(1)}s`}
-                        </span>
-                      </div>
-                      <div className="text-muted-foreground">dist: {p.distance.toFixed(0)}px | closing: {p.closingSpeed.toFixed(1)}px/f</div>
-                    </div>
-                  ));
-                })()}
-              </div>
-
-              {/* Evidence */}
-              <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> Accident Evidence</h3>
-                {(() => {
-                  const ev = evidenceRef.current;
-                  if (ev.length === 0) return <p className="text-sm text-green-400">No evidence detected</p>;
-                  return ev.slice(0, 3).map((e, i) => (
-                    <div key={i} className="p-2 bg-red-500/5 border border-red-500/20 rounded mb-1 text-xs">
-                      <div className="font-medium text-red-400">{e.type} ({(e.confidence * 100).toFixed(0)}%)</div>
-                      <div className="text-muted-foreground">{e.details}</div>
-                    </div>
-                  ));
-                })()}
-              </div>
-
-              {/* Vehicle ESP */}
-              <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2"><Zap size={16} /> Vehicle ESP</h3>
+                <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> Vehicle ESP</h3>
                 <div className="space-y-2 max-h-60 overflow-y-auto">
                   {(() => {
-                    const valid = trackerRef.current ? [] : [];
                     const entities = Array.from((trackerRef.current as any).entities?.values?.() || []) as TrackedEntity[];
                     const filtered = entities.filter((b: any) => b.age >= 2);
                     if (filtered.length === 0) return <p className="text-sm text-muted-foreground">{isAnalyzing ? "Scanning..." : "Start"}</p>;
                     return filtered.map((b: any) => {
                       const { current: speedKmh } = calculateRealSpeed(b, pixelsPerMeterRef.current);
-                      const correctedSpeed = perspectiveCorrectedSpeed(speedKmh, b.kalman.getState().y, videoRef.current?.videoHeight || 480);
+                      const corrected = perspectiveCorrectedSpeed(speedKmh, b.kalman.getState().y, videoRef.current?.videoHeight || 480);
                       const accelLabel = b.acceleration < -0.3 ? "BRAKE" : b.acceleration > 0.3 ? "ACC" : "CRUISE";
                       const accelColor = b.acceleration < -0.3 ? "text-red-400" : b.acceleration > 0.3 ? "text-green-400" : "text-gray-400";
                       return (
-                        <div key={b.id} className="p-2 bg-background rounded text-xs space-y-1">
+                        <div key={b.id} className="p-2 bg-background rounded text-xs">
                           <div className="flex items-center justify-between">
                             <span className={`font-medium ${b.class === "car" ? "text-green-400" : b.class === "motorcycle" ? "text-yellow-400" : "text-blue-400"}`}>{b.class} #{b.id}</span>
                             <span className={accelColor}>{accelLabel}</span>
                           </div>
                           <div className="flex gap-2 text-muted-foreground flex-wrap">
-                            <span>{correctedSpeed}km/h</span>
+                            <span>{corrected}km/h</span>
                             <span>a:{b.acceleration.toFixed(2)}</span>
                             <span>θ:{Math.round(b.heading * 180 / Math.PI)}°</span>
-                            <span>age:{b.age}f</span>
-                            <span>conf:{(b.confidence * 100).toFixed(0)}%</span>
                           </div>
                         </div>
                       );
@@ -700,7 +543,6 @@ export default function VideoAnalysisPage() {
                 </div>
               </div>
 
-              {/* Incidents */}
               <div className="bg-card p-4 rounded-xl border border-border">
                 <h3 className="font-semibold mb-3">Incidents</h3>
                 {incidents.length === 0 ? (
