@@ -56,6 +56,7 @@ export default function VideoAnalysisPage() {
   const consecutiveAnomalyRef = useRef(0);
   const pixelsPerMeterRef = useRef(20);
   const alertTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const videoReadyTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const canvasSizedRef = useRef(false);
   const supabase = createClient();
@@ -77,8 +78,25 @@ export default function VideoAnalysisPage() {
       }
     };
     loadModel();
-    return () => { cancelAnimationFrame(rafRef.current); if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current); };
+    return () => {
+      cancelAnimationFrame(rafRef.current);
+      if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current);
+      if (videoReadyTimeoutRef.current) clearTimeout(videoReadyTimeoutRef.current);
+    };
   }, []);
+
+  // Fallback: force videoReady after 5s if events don't fire (Vercel issue)
+  useEffect(() => {
+    if (selectedClip) {
+      setVideoReady(false);
+      if (videoReadyTimeoutRef.current) clearTimeout(videoReadyTimeoutRef.current);
+      videoReadyTimeoutRef.current = setTimeout(() => {
+        setVideoReady(true);
+        console.log("[SAGE] Video ready forced by timeout (events may not have fired)");
+      }, 5000);
+    }
+    return () => { if (videoReadyTimeoutRef.current) clearTimeout(videoReadyTimeoutRef.current); };
+  }, [selectedClip]);
 
   // Recalibrate PPM when env mode changes
   useEffect(() => {
@@ -449,7 +467,10 @@ export default function VideoAnalysisPage() {
               <div className="bg-card rounded-xl border border-border overflow-hidden">
                 <div className="aspect-video bg-black relative">
                   <video ref={videoRef} src={selectedClip.src} className="w-full h-full object-contain"
-                    playsInline muted loop onLoadedData={() => setVideoReady(true)} onCanPlay={() => setVideoReady(true)} />
+                    playsInline muted loop preload="auto"
+                    onLoadedData={() => { setVideoReady(true); if (videoReadyTimeoutRef.current) clearTimeout(videoReadyTimeoutRef.current); }}
+                    onCanPlay={() => { setVideoReady(true); if (videoReadyTimeoutRef.current) clearTimeout(videoReadyTimeoutRef.current); }}
+                    onError={(e) => console.error("[SAGE] Video error:", e)} />
                   <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ pointerEvents: "none" }} />
                   {!videoReady && <div className="absolute inset-0 flex items-center justify-center bg-black/50">
                     <div className="flex items-center gap-2 text-white"><Loader2 className="w-5 h-5 animate-spin" /> Loading...</div>
