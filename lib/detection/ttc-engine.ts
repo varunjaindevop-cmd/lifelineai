@@ -47,9 +47,12 @@ function wasFast(entity: TrackedEntity): boolean {
 }
 
 function hasDecelerated(entity: TrackedEntity): boolean {
-  if (entity.speedHistory.length < 4) return false;
-  const prevAvg = (entity.speedHistory[0] + entity.speedHistory[1]) / 2;
-  return prevAvg > 2 && entity.speed < 1;
+  if (entity.speedHistory.length < 3) return false;
+  // Check if speed dropped significantly from any recent frame
+  const maxRecent = Math.max(...entity.speedHistory.slice(0, 3));
+  const curr = entity.speed;
+  // Dropped from >1.5 to <0.8 — significant deceleration
+  return maxRecent > 1.5 && curr < 0.8;
 }
 
 // ========== ISOLATED MODE ==========
@@ -92,29 +95,40 @@ function scoreIsolated(a: TrackedEntity, b: TrackedEntity): { score: number; rea
 
 // ========== TRAFFIC MODE ==========
 // NO overlap check. Only sudden stops near other objects.
+// Track when each entity last triggered a traffic alert
+const trafficAlertCooldown = new Map<number, number>();
+
 function detectTrafficAlerts(entities: TrackedEntity[]): AccidentEvidence[] {
   const evidence: AccidentEvidence[] = [];
+  const now = Date.now();
 
   for (const entity of entities) {
-    if (entity.age < 5 || entity.speedHistory.length < 5) continue;
+    if (entity.age < 8 || entity.speedHistory.length < 5) continue;
+
+    // Per-object cooldown: don't alert same object twice in 5 seconds
+    const lastAlert = trafficAlertCooldown.get(entity.id) || 0;
+    if (now - lastAlert < 5000) continue;
 
     const recentSpeed = entity.speed;
-    const prevAvg = (entity.speedHistory[0] + entity.speedHistory[1] + entity.speedHistory[2]) / 3;
+    // Use max of last 3 frames as "was moving" reference
+    const maxRecent = Math.max(entity.speedHistory[0], entity.speedHistory[1], entity.speedHistory[2]);
 
-    // Was moving fast (>3 px/frame), now stopped (<0.5)
-    if (prevAvg <= 3 || recentSpeed >= 0.5) continue;
+    // Must have been moving FAST (>4 px/frame) and now STOPPED (<0.3)
+    // This is a DRAMATIC stop, not just normal braking
+    if (maxRecent <= 4 || recentSpeed >= 0.3) continue;
 
     // Find nearby object
     const nearby = entities.find(e =>
-      e.id !== entity.id && e.age >= 3 && dist(e, entity) < combinedR(e, entity) * 3
+      e.id !== entity.id && e.age >= 5 && dist(e, entity) < combinedR(e, entity) * 2.5
     );
     if (!nearby) continue;
 
+    trafficAlertCooldown.set(entity.id, now);
     evidence.push({
       type: "collision",
-      confidence: 0.75,
+      confidence: 0.8,
       objects: [entity.id, nearby.id],
-      details: `Sudden stop: ${prevAvg.toFixed(1)}→${recentSpeed.toFixed(1)} near #${nearby.id}`,
+      details: `Dramatic stop: ${maxRecent.toFixed(1)}→${recentSpeed.toFixed(1)} near #${nearby.id}`,
     });
   }
 
