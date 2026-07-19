@@ -13,20 +13,25 @@ import { toast } from "sonner";
 interface VideoClip { name: string; src: string; description: string }
 interface IncidentAlert { type: string; severity: string; confidence: number; timestamp: string; latitude: number; longitude: number }
 
-// Per-cell flow data
-interface FlowCell {
-  vx: number; vy: number; speed: number;
-  magHistory: number[];     // last N magnitudes for deceleration detection
-  angleHistory: number[];   // last N angles for direction change
-  stagnation: number;       // frames this cell has been near-zero
+interface TrackedBlob {
+  id: number; cx: number; cy: number; w: number; h: number;
+  vx: number; vy: number; frames: number; lastSeen: number;
+  class: string; positions: { x: number; y: number }[];
+  area: number;
+  // Physics
+  speed: number;           // pixels/frame
+  acceleration: number;    // change in speed per frame
+  heading: number;         // angle in radians
+  headingChange: number;   // angular velocity
+  aspectRatio: number;     // w/h
+  aspectHistory: number[]; // track shape changes (bike falling = ratio change)
+  speedHistory: number[];
+  decelFrames: number;     // consecutive frames of deceleration
+  _near?: number;          // sustained closeness counter
 }
 
-// Detection result from flow analysis
 interface FlowAnomaly {
-  type: "collision" | "pile_up" | "sudden_stop" | "direction_chaos";
-  confidence: number;
-  cx: number; cy: number;   // center of anomaly in grid coords
-  evidence: string;
+  type: string; confidence: number; cx: number; cy: number; evidence: string;
 }
 
 const VIDEO_CLIPS: VideoClip[] = [
@@ -38,10 +43,10 @@ const VIDEO_CLIPS: VideoClip[] = [
 
 const LAT = 22.7196, LNG = 75.8577;
 const W = 320, H = 240;
-// Flow grid dimensions — 10x8 = 80 cells for dense motion analysis
 const GRID_COLS = 10, GRID_ROWS = 8;
 const CELL_W = W / GRID_COLS, CELL_H = H / GRID_ROWS;
-const HISTORY_LEN = 8; // frames of velocity history per cell
+
+let nextId = 1;
 
 export default function VideoAnalysisPage() {
   const [selectedClip, setSelectedClip] = useState<VideoClip | null>(null);
@@ -56,37 +61,16 @@ export default function VideoAnalysisPage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const tmpCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number>(0);
+  const blobsRef = useRef<TrackedBlob[]>([]);
   const stateRef = useRef("monitoring");
   const frameRef = useRef(0);
   const stateFrameRef = useRef(0);
   const cooldownRef = useRef(0);
   const accumRef = useRef<Float32Array>(new Float32Array(GRID_COLS * GRID_ROWS));
+  const prevGridRef = useRef<Float32Array | null>(null);
   const consecutiveAnomalyRef = useRef(0);
-  const supabase = createClient();
-
-  // ========== ANOMALY PERSISTENCE HEATMAP ==========
-  // Tracks how many consecutive frames each cell has been anomalous.
-  // A real accident stays in one spot; normal traffic anomalies move around.
   const anomalyHeatmapRef = useRef<Float32Array>(new Float32Array(GRID_COLS * GRID_ROWS));
-  const ANOMALY_PERSIST_THRESHOLD = 5; // cell must be anomalous for 5+ consecutive frames
-
-  // ========== OPTICAL FLOW GRID ==========
-  // Persistent flow state across frames
-  const flowGridRef = useRef<FlowCell[][]>([]);
-
-  const initFlowGrid = () => {
-    const grid: FlowCell[][] = [];
-    for (let r = 0; r < GRID_ROWS; r++) {
-      grid[r] = [];
-      for (let c = 0; c < GRID_COLS; c++) {
-        grid[r][c] = {
-          vx: 0, vy: 0, speed: 0,
-          magHistory: [], angleHistory: [], stagnation: 0,
-        };
-      }
-    }
-    flowGridRef.current = grid;
-  };
+  const supabase = createClient();
 
   useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
   useEffect(() => { setVideoReady(false); const t = setTimeout(() => setVideoReady(true), 8000); return () => clearTimeout(t); }, [selectedClip]);
@@ -96,271 +80,333 @@ export default function VideoAnalysisPage() {
     return tmpCanvasRef.current;
   }, []);
 
-  // ========== DENSE OPTICAL FLOW (Block Matching) ==========
-  // For each grid cell, find the best matching region in the previous frame
-  // within a search window. Returns velocity vector (vx, vy).
-  const computeFlowGrid = (
-    currGray: Float32Array, prevGray: Float32Array, w: number, h: number
-  ): { vx: number; vy: number; mag: number }[][] => {
-    const result: { vx: number; vy: number; mag: number }[][] = [];
-    const searchR = 6; // search window radius in pixels
-    const blockSize = 3; // compare blocks of 6x6
+  // ========== BLOB DETECTION (Frame Differencing) ==========
+  const findBlobs = (curr: Uint8ClampedArray, prev: Uint8ClampedArray, w: number, h: number) => {
+    const diff = new Uint8Array(w * h);
+    for (let i = 0; i < diff.length; i++) {
+      const j = i * 4;
+      const g1 = curr[j] * 0.299 + curr[j + 1] * 0.587 + curr[j + 2] * 0.114;
+      const g2 = prev[j] * 0.299 + prev[j + 1] * 0.587 + prev[j + 2] * 0.114;
+      diff[i] = Math.abs(g1 - g2) > 20 ? 1 : 0;
+    }
+    const dil = new Uint8Array(w * h);
+    const K = 4;
+    for (let y = K; y < h - K; y++) for (let x = K; x < w - K; x++) {
+      let mx = 0;
+      for (let dy = -K; dy <= K; dy += 2) for (let dx = -K; dx <= K; dx += 2)
+        if (diff[(y + dy) * w + (x + dx)] > mx) mx = diff[(y + dy) * w + (x + dx)];
+      dil[y * w + x] = mx;
+    }
+    const vis = new Uint8Array(w * h);
+    const blobs: { cx: number; cy: number; w: number; h: number; mass: number }[] = [];
+    for (let y = K; y < h - K; y += 3) for (let x = K; x < w - K; x += 3) {
+      if (vis[y * w + x] || !dil[y * w + x]) continue;
+      let x0 = x, x1 = x, y0 = y, y1 = y, sx = 0, sy = 0, n = 0;
+      const q = [x, y]; vis[y * w + x] = 1;
+      while (q.length) {
+        const qx = q.shift()!, qy = q.shift()!;
+        sx += qx; sy += qy; n++;
+        if (qx < x0) x0 = qx; if (qx > x1) x1 = qx; if (qy < y0) y0 = qy; if (qy > y1) y1 = qy;
+        for (const [ddx, ddy] of [[-3, 0], [3, 0], [0, -3], [0, 3]]) {
+          const nx = qx + ddx, ny = qy + ddy;
+          if (nx >= 0 && nx < w && ny >= 0 && ny < h && !vis[ny * w + nx] && dil[ny * w + nx]) { vis[ny * w + nx] = 1; q.push(nx, ny); }
+        }
+      }
+      const bw = x1 - x0, bh = y1 - y0, area = bw * bh;
+      if (n < 25 || area < 300) continue;
+      blobs.push({ cx: sx / n, cy: sy / n, w: bw, h: bh, mass: area });
+    }
+    // Merge overlapping
+    const merged: typeof blobs = [];
+    const used = new Set<number>();
+    for (let i = 0; i < blobs.length; i++) {
+      if (used.has(i)) continue;
+      let b = blobs[i];
+      for (let j = i + 1; j < blobs.length; j++) {
+        if (used.has(j)) continue;
+        const d = Math.sqrt((b.cx - blobs[j].cx) ** 2 + (b.cy - blobs[j].cy) ** 2);
+        if (d < Math.max(b.w, blobs[j].w) * 1.5) {
+          const tm = b.mass + blobs[j].mass;
+          b = { cx: (b.cx * b.mass + blobs[j].cx * blobs[j].mass) / tm, cy: (b.cy * b.mass + blobs[j].cy * blobs[j].mass) / tm, w: Math.max(b.w, blobs[j].w), h: Math.max(b.h, blobs[j].h), mass: tm };
+          used.add(j);
+        }
+      }
+      merged.push(b);
+      used.add(i);
+    }
+    return merged;
+  };
 
-    for (let r = 0; r < GRID_ROWS; r++) {
-      result[r] = [];
-      for (let c = 0; c < GRID_COLS; c++) {
-        const cx = Math.floor((c + 0.5) * CELL_W);
-        const cy = Math.floor((r + 0.5) * CELL_H);
+  // ========== OBJECT CLASSIFICATION ==========
+  const classifyBlob = (w: number, h: number, cy: number): string => {
+    const area = w * h;
+    const aspect = w / Math.max(h, 1);
+    if (area < 400) return "person";
+    if (area > 2500) return "car";
+    if (area > 1200 && aspect > 0.8) return "car";
+    if (area > 600 && aspect < 0.7) return cy > H * 0.4 ? "bike" : "person";
+    if (area > 800 && aspect > 0.6 && aspect < 1.4) return "car";
+    return "person";
+  };
 
-        let bestDx = 0, bestDy = 0, bestErr = Infinity;
+  // ========== TRACKING WITH PHYSICS ==========
+  const trackBlobs = (detections: { cx: number; cy: number; w: number; h: number; mass: number }[], frame: number): TrackedBlob[] => {
+    const tracked = blobsRef.current;
+    const matched = new Set<number>();
+    for (const blob of tracked) {
+      let best = -1, bestD = 50;
+      for (let i = 0; i < detections.length; i++) {
+        if (matched.has(i)) continue;
+        const d = Math.sqrt((blob.cx - detections[i].cx) ** 2 + (blob.cy - detections[i].cy) ** 2);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      if (best >= 0) {
+        const det = detections[best];
+        const newVx = det.cx - blob.cx;
+        const newVy = det.cy - blob.cy;
+        const newSpeed = Math.sqrt(newVx * newVx + newVy * newVy);
+        const newHeading = Math.atan2(newVy, newVx);
 
-        for (let dy = -searchR; dy <= searchR; dy += 2) {
-          for (let dx = -searchR; dx <= searchR; dx += 2) {
-            let err = 0, count = 0;
-            for (let by = -blockSize; by <= blockSize; by++) {
-              for (let bx = -blockSize; bx <= blockSize; bx++) {
-                const sx = cx + bx, sy = cy + by;
-                const tx = sx + dx, ty = sy + dy;
-                if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
-                if (tx < 0 || tx >= w || ty < 0 || ty >= h) continue;
-                const si = sy * w + sx;
-                const ti = ty * w + tx;
-                const diff = currGray[si] - prevGray[ti];
-                err += diff * diff;
-                count++;
-              }
-            }
-            if (count > 0) {
-              err /= count;
-              if (err < bestErr) {
-                bestErr = err;
-                bestDx = dx;
-                bestDy = dy;
-              }
-            }
+        // Physics: acceleration and heading change
+        const prevSpeed = blob.speed;
+        blob.acceleration = newSpeed - prevSpeed;
+        blob.decelFrames = blob.acceleration < -0.5 ? blob.decelFrames + 1 : 0;
+
+        let hdgDiff = Math.abs(newHeading - blob.heading);
+        if (hdgDiff > Math.PI) hdgDiff = 2 * Math.PI - hdgDiff;
+        blob.headingChange = hdgDiff;
+
+        blob.vx = newVx; blob.vy = newVy;
+        blob.cx = det.cx; blob.cy = det.cy;
+        blob.w = det.w; blob.h = det.h;
+        blob.area = det.w * det.h;
+        blob.speed = newSpeed;
+        blob.heading = newHeading;
+        blob.aspectRatio = det.w / Math.max(det.h, 1);
+        blob.aspectHistory.push(blob.aspectRatio);
+        if (blob.aspectHistory.length > 8) blob.aspectHistory.shift();
+        blob.speedHistory.push(newSpeed);
+        if (blob.speedHistory.length > 8) blob.speedHistory.shift();
+        blob.frames++;
+        blob.lastSeen = frame;
+        blob.positions.push({ x: det.cx, y: det.cy });
+        if (blob.positions.length > 10) blob.positions.shift();
+        if (blob.frames >= 3) blob.class = classifyBlob(det.w, det.h, det.cy);
+        matched.add(best);
+      }
+    }
+    for (let i = 0; i < detections.length; i++) {
+      if (matched.has(i)) continue;
+      const d = detections[i];
+      tracked.push({
+        id: nextId++, cx: d.cx, cy: d.cy, w: d.w, h: d.h,
+        vx: 0, vy: 0, frames: 1, lastSeen: frame,
+        class: classifyBlob(d.w, d.h, d.cy),
+        positions: [{ x: d.cx, y: d.cy }],
+        area: d.w * d.h,
+        speed: 0, acceleration: 0, heading: 0, headingChange: 0,
+        aspectRatio: d.w / Math.max(d.h, 1),
+        aspectHistory: [d.w / Math.max(d.h, 1)],
+        speedHistory: [0], decelFrames: 0,
+      });
+    }
+    blobsRef.current = tracked.filter(b => frame - b.lastSeen < 5);
+    return blobsRef.current;
+  };
+
+  // ========== PHYSICS-BASED COLLISION DETECTION ==========
+  // Analyzes individual object physics: proximity + convergence + deceleration + shape change
+  const detectPhysicsCollision = (blobs: TrackedBlob[]): { confidence: number; a: TrackedBlob; b: TrackedBlob; evidence: string } | null => {
+    const minFrames = 3;
+    const candidates = blobs.filter(b => b.frames >= minFrames);
+    if (candidates.length < 2) return null;
+
+    let best: { confidence: number; a: TrackedBlob; b: TrackedBlob; evidence: string } | null = null;
+
+    for (let i = 0; i < candidates.length; i++) {
+      for (let j = i + 1; j < candidates.length; j++) {
+        const a = candidates[i], b = candidates[j];
+        if (a.class === "person" && b.class === "person") continue;
+
+        const dist = Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2);
+        const combinedR = Math.sqrt(a.area) + Math.sqrt(b.area);
+        if (dist > combinedR * 2) continue;
+
+        // Proximity score
+        const proximity = 1 - Math.min(dist / (combinedR * 2), 1);
+
+        // Convergence: heading toward each other
+        const dx = b.cx - a.cx, dy = b.cy - a.cy;
+        const dotA = a.vx * dx + a.vy * dy;
+        const dotB = b.vx * (-dx) + b.vy * (-dy);
+        const converging = dotA > 0 || dotB > 0;
+
+        // Parallel check (same direction = not collision)
+        const angleDiff = Math.abs(a.heading - b.heading);
+        const wrapped = angleDiff > Math.PI ? 2 * Math.PI - angleDiff : angleDiff;
+        const parallel = wrapped < Math.PI * 0.3;
+
+        // Deceleration: either object braking hard
+        const decelA = a.decelFrames >= 2 ? 1 : a.decelFrames >= 1 ? 0.5 : 0;
+        const decelB = b.decelFrames >= 2 ? 1 : b.decelFrames >= 1 ? 0.5 : 0;
+        const decel = Math.max(decelA, decelB);
+
+        // Sudden speed drop (impact signature)
+        let suddenDrop = 0;
+        for (const obj of [a, b]) {
+          if (obj.speedHistory.length >= 4) {
+            const prevAvg = (obj.speedHistory[0] + obj.speedHistory[1]) / 2;
+            const curr = obj.speedHistory[obj.speedHistory.length - 1];
+            if (prevAvg > 1.5 && curr < prevAvg * 0.3) suddenDrop = Math.max(suddenDrop, 1);
+            else if (prevAvg > 1.5 && curr < prevAvg * 0.5) suddenDrop = Math.max(suddenDrop, 0.5);
           }
         }
 
-        const mag = Math.sqrt(bestDx * bestDx + bestDy * bestDy);
-        result[r][c] = { vx: bestDx, vy: bestDy, mag };
+        // Aspect ratio change (bike falling, vehicle rollover)
+        let shapeChange = 0;
+        for (const obj of [a, b]) {
+          if (obj.aspectHistory.length >= 4) {
+            const prevAR = (obj.aspectHistory[0] + obj.aspectHistory[1]) / 2;
+            const currAR = obj.aspectHistory[obj.aspectHistory.length - 1];
+            const arChange = Math.abs(currAR - prevAR) / Math.max(prevAR, 0.1);
+            if (arChange > 0.4) shapeChange = Math.max(shapeChange, 1);
+            else if (arChange > 0.2) shapeChange = Math.max(shapeChange, 0.5);
+          }
+        }
+
+        // Sustained closeness
+        const closeThresh = combinedR * 1.5;
+        if (dist < closeThresh) {
+          a._near = (a._near || 0) + 1;
+          b._near = (b._near || 0) + 1;
+        } else {
+          a._near = Math.max(0, (a._near || 0) - 1);
+          b._near = Math.max(0, (b._near || 0) - 1);
+        }
+        const near = Math.min(a._near || 0, b._near || 0);
+
+        // Very close OR close+converging OR deceleration+proximity OR shape change
+        const veryClose = dist < combinedR * 0.5;
+        const closeConverging = dist < closeThresh && converging && near >= 2;
+        const decelProximity = decel > 0 && proximity > 0.3;
+        const validSignal = veryClose || closeConverging || decelProximity || shapeChange > 0;
+
+        if (!validSignal) continue;
+        if (parallel && !veryClose && !decelProximity && shapeChange === 0) continue;
+
+        const conf = Math.min(0.95,
+          0.25 * proximity +
+          0.20 * (converging ? 1 : 0.1) +
+          0.20 * Math.min(near / 3, 1) +
+          0.15 * decel +
+          0.10 * suddenDrop +
+          0.10 * shapeChange
+        );
+
+        if (conf > 0.35 && (!best || conf > best.confidence)) {
+          const evidence = [
+            proximity > 0.5 ? "close" : "",
+            converging ? "converging" : "",
+            decel > 0 ? "decelerating" : "",
+            suddenDrop > 0 ? "sudden_stop" : "",
+            shapeChange > 0 ? "shape_change" : "",
+          ].filter(Boolean).join("+");
+          best = { confidence: conf, a, b, evidence };
+        }
       }
     }
-    return result;
+    return best;
   };
 
-  // Full-resolution grayscale (for optical flow) — returns W*H Float32Array
-  const toFullGray = (data: Uint8ClampedArray, w: number, h: number): Float32Array => {
-    const g = new Float32Array(w * h);
-    for (let i = 0; i < w * h; i++) {
-      const j = i * 4;
-      g[i] = data[j] * 0.299 + data[j + 1] * 0.587 + data[j + 2] * 0.114;
-    }
-    return g;
-  };
-
-  // Grid-level grayscale (for accumulated change detection) — returns GRID_COLS*GRID_ROWS
+  // ========== FLOW HEATMAP (Scene-level backup) ==========
   const toGrayGrid = (data: Uint8ClampedArray, w: number, h: number): Float32Array => {
     const g = new Float32Array(GRID_COLS * GRID_ROWS);
     const cw = Math.floor(w / GRID_COLS), ch = Math.floor(h / GRID_ROWS);
-    for (let r = 0; r < GRID_ROWS; r++) {
-      for (let c = 0; c < GRID_COLS; c++) {
-        let s = 0, n = 0;
-        for (let dy = 0; dy < ch; dy += 2) {
-          for (let dx = 0; dx < cw; dx += 2) {
-            const i = ((r * ch + dy) * w + (c * cw + dx)) * 4;
-            s += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
-            n++;
-          }
-        }
-        g[r * GRID_COLS + c] = n > 0 ? s / n : 128;
+    for (let r = 0; r < GRID_ROWS; r++) for (let c = 0; c < GRID_COLS; c++) {
+      let s = 0, n = 0;
+      for (let dy = 0; dy < ch; dy += 2) for (let dx = 0; dx < cw; dx += 2) {
+        const i = ((r * ch + dy) * w + (c * cw + dx)) * 4;
+        s += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114; n++;
       }
+      g[r * GRID_COLS + c] = n > 0 ? s / n : 128;
     }
     return g;
   };
 
-  // ========== FLOW-BASED ANOMALY DETECTION ==========
-  // Uses a persistence heatmap: a cell must be anomalous for N consecutive frames
-  // before it counts. This eliminates false positives from normal traffic variation.
-  const analyzeFlowAnomalies = (
-    flow: { vx: number; vy: number; mag: number }[][],
-  ): FlowAnomaly[] => {
-    const rawAnomalies: FlowAnomaly[] = [];
-    const grid = flowGridRef.current;
+  const updateFlowHeatmap = (blobs: TrackedBlob[]): boolean => {
     const heatmap = anomalyHeatmapRef.current;
     const totalCells = GRID_COLS * GRID_ROWS;
 
-    // Update per-cell history
-    let totalMag = 0, movingCells = 0, stoppedCells = 0;
-    for (let r = 0; r < GRID_ROWS; r++) {
-      for (let c = 0; c < GRID_COLS; c++) {
-        const cell = grid[r][c];
-        const f = flow[r][c];
-        cell.vx = f.vx;
-        cell.vy = f.vy;
-        cell.speed = f.mag;
-        cell.magHistory.push(f.mag);
-        if (cell.magHistory.length > HISTORY_LEN) cell.magHistory.shift();
-        cell.angleHistory.push(Math.atan2(f.vy, f.vx));
-        if (cell.angleHistory.length > HISTORY_LEN) cell.angleHistory.shift();
-        if (f.mag < 0.8) cell.stagnation = Math.min(cell.stagnation + 1, 30);
-        else cell.stagnation = Math.max(0, cell.stagnation - 1);
-        totalMag += f.mag;
-        if (f.mag > 1.5) movingCells++;
-        if (f.mag < 0.5) stoppedCells++;
+    // Mark cells with anomalous blob behavior
+    const anomalousCells = new Set<number>();
+    for (const blob of blobs) {
+      if (blob.frames < 3) continue;
+      const gc = Math.min(Math.floor(blob.cx / CELL_W), GRID_COLS - 1);
+      const gr = Math.min(Math.floor(blob.cy / CELL_H), GRID_ROWS - 1);
+      const idx = gr * GRID_COLS + gc;
+
+      let cellAnomaly = false;
+      // Hard deceleration
+      if (blob.decelFrames >= 3) cellAnomaly = true;
+      // Sudden speed drop
+      if (blob.speedHistory.length >= 4) {
+        const prev = (blob.speedHistory[0] + blob.speedHistory[1]) / 2;
+        const curr = blob.speedHistory[blob.speedHistory.length - 1];
+        if (prev > 2 && curr < prev * 0.3) cellAnomaly = true;
       }
-    }
-
-    const avgMag = totalMag / totalCells;
-    if (avgMag < 0.5 || movingCells < 4) {
-      // Too little motion — decay heatmap
-      for (let i = 0; i < totalCells; i++) heatmap[i] *= 0.7;
-      return [];
-    }
-
-    // ===== PER-CELL ANOMALY SCORING =====
-    // Instead of separate detectors, score each cell on multiple dimensions
-    // and combine into a single anomaly score per cell.
-    const cellScores = new Float32Array(totalCells);
-
-    for (let r = 1; r < GRID_ROWS - 1; r++) {
-      for (let c = 1; c < GRID_COLS - 1; c++) {
-        const idx = r * GRID_COLS + c;
-        const cell = grid[r][c];
-        let score = 0;
-
-        // Factor 1: CONVERGENCE — neighbors pointing toward this cell
-        let convergeScore = 0;
-        let fastNeighbors = 0;
-        for (const [dr, dc] of [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]]) {
-          const nr = r + dr, nc = c + dc;
-          const neighbor = grid[nr][nc];
-          if (neighbor.speed < 1.0) continue;
-          fastNeighbors++;
-          const toCenterX = (c - nc) * CELL_W;
-          const toCenterY = (r - nr) * CELL_H;
-          const toCenterMag = Math.sqrt(toCenterX * toCenterX + toCenterY * toCenterY);
-          if (toCenterMag < 1) continue;
-          const dot = neighbor.vx * toCenterX + neighbor.vy * toCenterY;
-          const cosAngle = dot / (neighbor.speed * toCenterMag);
-          if (cosAngle > 0.4) convergeScore += cosAngle;
-        }
-        // Require slow center + fast converging neighbors
-        if (cell.speed < avgMag * 0.4 && fastNeighbors >= 3) {
-          score += Math.min(convergeScore * 0.3, 1.0);
-        }
-
-        // Factor 2: SUDDEN DECELERATION — was fast, now slow
-        if (cell.magHistory.length >= 4) {
-          const prevAvg = (cell.magHistory[0] + cell.magHistory[1]) / 2;
-          const recentAvg = (cell.magHistory[cell.magHistory.length - 1] + cell.magHistory[cell.magHistory.length - 2]) / 2;
-          if (prevAvg > 2.5 && recentAvg < 1.0) {
-            score += Math.min((prevAvg - recentAvg) / prevAvg, 1.0) * 0.5;
-          }
-        }
-
-        // Factor 3: FLOW DISCONTINUITY — sharp speed difference with neighbors
-        let maxNeighborDiff = 0;
-        for (const [dr, dc] of [[-1,0],[1,0],[0,-1],[0,1]]) {
-          const nr = r + dr, nc = c + dc;
-          const neighbor = grid[nr][nc];
-          const diff = Math.abs(cell.speed - neighbor.speed);
-          if (diff > maxNeighborDiff) maxNeighborDiff = diff;
-        }
-        if (maxNeighborDiff > 3) {
-          score += Math.min(maxNeighborDiff * 0.1, 0.8);
-        }
-
-        // Factor 4: DIRECTION CHANGE — this cell suddenly changed direction
-        if (cell.angleHistory.length >= 4) {
-          const recentAngle = cell.angleHistory[cell.angleHistory.length - 1];
-          const prevAngle = cell.angleHistory[cell.angleHistory.length - 4];
-          let angleDiff = Math.abs(recentAngle - prevAngle);
-          if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
-          if (angleDiff > Math.PI * 0.5 && cell.speed > 1.5) {
-            score += Math.min(angleDiff / Math.PI, 1.0) * 0.4;
-          }
-        }
-
-        cellScores[idx] = Math.min(score, 1.0);
+      // Shape change (bike falling)
+      if (blob.aspectHistory.length >= 4) {
+        const prevAR = (blob.aspectHistory[0] + blob.aspectHistory[1]) / 2;
+        const currAR = blob.aspectHistory[blob.aspectHistory.length - 1];
+        if (Math.abs(currAR - prevAR) / Math.max(prevAR, 0.1) > 0.4) cellAnomaly = true;
       }
+
+      if (cellAnomaly) anomalousCells.add(idx);
     }
 
-    // ===== UPDATE HEATMAP =====
-    // Cells with high anomaly score increment, others decay
+    // Update heatmap
     for (let i = 0; i < totalCells; i++) {
-      if (cellScores[i] > 0.4) {
-        heatmap[i] = Math.min(heatmap[i] + cellScores[i], 20);
+      if (anomalousCells.has(i)) {
+        heatmap[i] = Math.min(heatmap[i] + 1, 30);
       } else {
-        heatmap[i] = Math.max(0, heatmap[i] - 0.5);
+        heatmap[i] = Math.max(0, heatmap[i] - 0.3);
       }
     }
 
-    // ===== FIND PERSISTENT ANOMALY CLUSTERS =====
-    // Look for cells where heatmap exceeds threshold — sustained anomaly
+    // Check for persistent clusters
+    let maxClusterHeat = 0;
+    let clusterCount = 0;
     const visited = new Uint8Array(totalCells);
-    for (let r = 1; r < GRID_ROWS - 1; r++) {
-      for (let c = 1; c < GRID_COLS - 1; c++) {
-        const idx = r * GRID_COLS + c;
-        if (visited[idx] || heatmap[idx] < ANOMALY_PERSIST_THRESHOLD) continue;
-
-        // BFS to find cluster of persistent anomaly cells
-        let clusterCells = 0;
-        let totalHeat = 0;
-        let maxR = r, maxC = c, maxHeat = 0;
-        const queue = [r, c];
-        visited[idx] = 1;
-
-        while (queue.length) {
-          const cr = queue.shift()!;
-          const cc = queue.shift()!;
-          const ci = cr * GRID_COLS + cc;
-          clusterCells++;
-          totalHeat += heatmap[ci];
-          if (heatmap[ci] > maxHeat) { maxHeat = heatmap[ci]; maxR = cr; maxC = cc; }
-
-          for (const [dr, dc] of [[-1,0],[1,0],[0,-1],[0,1]]) {
-            const nr = cr + dr, nc = cc + dc;
-            if (nr < 0 || nr >= GRID_ROWS || nc < 0 || nc >= GRID_COLS) continue;
-            const ni = nr * GRID_COLS + nc;
-            if (!visited[ni] && heatmap[ni] >= ANOMALY_PERSIST_THRESHOLD * 0.7) {
-              visited[ni] = 1;
-              queue.push(nr, nc);
-            }
-          }
+    for (let i = 0; i < totalCells; i++) {
+      if (visited[i] || heatmap[i] < 4) continue;
+      // BFS cluster
+      let cells = 0, totalHeat = 0;
+      const queue = [i];
+      visited[i] = 1;
+      while (queue.length) {
+        const ci = queue.shift()!;
+        cells++;
+        totalHeat += heatmap[ci];
+        const cr = Math.floor(ci / GRID_COLS), cc = ci % GRID_COLS;
+        for (const [dr, dc] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+          const nr = cr + dr, nc = cc + dc;
+          if (nr < 0 || nr >= GRID_ROWS || nc < 0 || nc >= GRID_COLS) continue;
+          const ni = nr * GRID_COLS + nc;
+          if (!visited[ni] && heatmap[ni] >= 3) { visited[ni] = 1; queue.push(ni); }
         }
-
-        if (clusterCells >= 2) {
-          const avgHeat = totalHeat / clusterCells;
-          const conf = Math.min(0.95, 0.3 + avgHeat * 0.03 + clusterCells * 0.05);
-
-          // Determine type based on cell characteristics
-          const centerCell = grid[maxR][maxC];
-          let type: FlowAnomaly["type"] = "collision";
-          if (centerCell.speed < 0.5 && stoppedCells > movingCells * 0.3) type = "pile_up";
-          else if (centerCell.magHistory.length >= 4) {
-            const prevAvg = (centerCell.magHistory[0] + centerCell.magHistory[1]) / 2;
-            const recentAvg = (centerCell.magHistory[centerCell.magHistory.length - 1]);
-            if (prevAvg > 2.5 && recentAvg < 1.0) type = "sudden_stop";
-          }
-
-          rawAnomalies.push({
-            type, confidence: conf,
-            cx: maxC, cy: maxR,
-            evidence: `Persistent cluster: ${clusterCells} cells, heat: ${avgHeat.toFixed(1)}`,
-          });
-        }
+      }
+      if (cells >= 2) {
+        clusterCount++;
+        const avgHeat = totalHeat / cells;
+        if (avgHeat > maxClusterHeat) maxClusterHeat = avgHeat;
       }
     }
 
-    rawAnomalies.sort((a, b) => b.confidence - a.confidence);
-    return rawAnomalies;
+    return maxClusterHeat >= 8 && clusterCount >= 1;
   };
 
-  // Draw flow visualization on canvas
-  const drawFlowViz = (
-    flow: { vx: number; vy: number; mag: number }[][] | null,
-    anomalies: FlowAnomaly[]
-  ) => {
+  // ========== DRAW ==========
+  const drawBoxes = (tracked: TrackedBlob[], collision: ReturnType<typeof detectPhysicsCollision>) => {
     const canvas = canvasRef.current;
     const video = videoRef.current;
     if (!canvas || !video) return;
@@ -370,67 +416,62 @@ export default function VideoAnalysisPage() {
     canvas.width = video.videoWidth || 640;
     canvas.height = video.videoHeight || 480;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
     const sx = canvas.width / W, sy = canvas.height / H;
 
-    if (flow && analysisMode === "traffic") {
-      // Draw flow arrows
-      for (let r = 0; r < GRID_ROWS; r++) {
-        for (let c = 0; c < GRID_COLS; c++) {
-          const f = flow[r][c];
-          if (f.mag < 0.5) continue;
-          const cx = (c + 0.5) * CELL_W * sx;
-          const cy = (r + 0.5) * CELL_H * sy;
-          const scale = 3;
-          const ex = cx + f.vx * scale;
-          const ey = cy + f.vy * scale;
-
-          // Color by speed: green=fast, yellow=medium, red=slow/stopped
-          const speedRatio = Math.min(f.mag / 5, 1);
-          const hue = speedRatio * 120; // 0=red, 120=green
-          ctx.strokeStyle = `hsla(${hue}, 80%, 50%, 0.6)`;
-          ctx.lineWidth = 1.5;
-          ctx.beginPath();
-          ctx.moveTo(cx, cy);
-          ctx.lineTo(ex, ey);
-          ctx.stroke();
-        }
-      }
-    }
-
-    // Show heatmap as subtle overlay on ALL cells
+    // Draw heatmap overlay
     const heatmap = anomalyHeatmapRef.current;
-    for (let r = 0; r < GRID_ROWS; r++) {
-      for (let c = 0; c < GRID_COLS; c++) {
-        const heat = heatmap[r * GRID_COLS + c];
-        if (heat > 1) {
-          const x = c * CELL_W * sx, y = r * CELL_H * sy;
-          const w = CELL_W * sx, h = CELL_H * sy;
-          const intensity = Math.min(heat / 15, 1);
-          ctx.fillStyle = `rgba(255, 0, 0, ${intensity * 0.3})`;
-          ctx.fillRect(x, y, w, h);
-        }
+    for (let r = 0; r < GRID_ROWS; r++) for (let c = 0; c < GRID_COLS; c++) {
+      const heat = heatmap[r * GRID_COLS + c];
+      if (heat > 2) {
+        const intensity = Math.min(heat / 20, 1);
+        ctx.fillStyle = `rgba(255, 0, 0, ${intensity * 0.25})`;
+        ctx.fillRect(c * CELL_W * sx, r * CELL_H * sy, CELL_W * sx, CELL_H * sy);
       }
     }
 
-    // Highlight confirmed anomaly clusters
-    for (const a of anomalies) {
-      const x = a.cx * CELL_W * sx;
-      const y = a.cy * CELL_H * sy;
-      const w = CELL_W * sx;
-      const h = CELL_H * sy;
-      const color = a.type === "collision" ? "#ef4444"
-        : a.type === "sudden_stop" ? "#f59e0b"
-        : a.type === "pile_up" ? "#f97316"
-        : "#8b5cf6";
+    // Draw ESP boxes for each tracked object
+    for (const blob of tracked) {
+      if (blob.frames < 3) continue;
+      const x = (blob.cx - blob.w / 2) * sx;
+      const y = (blob.cy - blob.h / 2) * sy;
+      const w = blob.w * sx;
+      const h = blob.h * sy;
+
+      const isCollision = collision && (collision.a.id === blob.id || collision.b.id === blob.id);
+      const color = isCollision ? "#ef4444"
+        : blob.class === "car" ? "#22c55e"
+        : blob.class === "bike" ? "#f59e0b"
+        : "#3b82f6";
+
+      // Bounding box
       ctx.strokeStyle = color;
-      ctx.lineWidth = 3;
+      ctx.lineWidth = isCollision ? 3 : 2;
       ctx.strokeRect(x, y, w, h);
-      ctx.fillStyle = `${color}44`;
-      ctx.fillRect(x, y, w, h);
+
+      // Heading arrow (physics axis)
+      const arrowLen = 15;
+      const ax = blob.cx * sx;
+      const ay = blob.cy * sy;
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(ax + Math.cos(blob.heading) * arrowLen, ay + Math.sin(blob.heading) * arrowLen);
+      ctx.strokeStyle = isCollision ? "#ef4444" : "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // ESP info box
+      const speedKmh = Math.round(blob.speed * 5); // approximate km/h
+      const accelLabel = blob.acceleration < -0.5 ? "BRAKING" : blob.acceleration > 0.5 ? "ACCEL" : "";
+      const label = `${blob.class} | ${speedKmh}km/h${accelLabel ? " | " + accelLabel : ""}`;
+      ctx.font = "bold 10px Arial";
+      const tw = ctx.measureText(label).width;
+      ctx.fillStyle = isCollision ? "#ef4444" : "rgba(0,0,0,0.7)";
+      ctx.fillRect(x, y - 16, tw + 8, 16);
+      ctx.fillStyle = "white";
+      ctx.fillText(label, x + 4, y - 4);
     }
 
-    // Score bar
+    // Bottom bar
     const score = accumRef.current.reduce((a, b) => a + b, 0) / (GRID_COLS * GRID_ROWS);
     const barY = canvas.height - 22;
     ctx.fillStyle = "rgba(0,0,0,0.7)";
@@ -440,8 +481,8 @@ export default function VideoAnalysisPage() {
     ctx.fillStyle = "white";
     ctx.font = "11px Arial";
     const modeLabel = analysisMode === "traffic" ? "TRAFFIC" : "NORMAL";
-    const anomalyLabel = anomalies.length > 0 ? ` | ${anomalies[0].type.toUpperCase()}` : "";
-    ctx.fillText(`${modeLabel} | Objects: ${objectCount} | Change: ${(score * 100).toFixed(1)}%${anomalyLabel}`, 8, barY + 15);
+    const collisionLabel = collision ? ` | COLLISION: ${collision.evidence}` : "";
+    ctx.fillText(`${modeLabel} | Objects: ${tracked.filter(b => b.frames >= 3).length}${collisionLabel}`, 8, barY + 15);
   };
 
   const createIncident = async (alert: IncidentAlert) => {
@@ -450,7 +491,7 @@ export default function VideoAnalysisPage() {
       latitude: alert.latitude, longitude: alert.longitude,
       location_name: `Video Analysis: ${selectedClip?.name}`,
       detection_confidence: alert.confidence,
-      detection_data: { source: "optical_flow", clip: selectedClip?.name },
+      detection_data: { source: "physics_tracking", clip: selectedClip?.name },
       video_clip_url: selectedClip?.src || null,
       status: "detected",
     }).select().single();
@@ -470,7 +511,7 @@ export default function VideoAnalysisPage() {
     }
   };
 
-  // ========== MAIN ANALYSIS LOOP ==========
+  // ========== MAIN LOOP ==========
   const startAnalysis = async () => {
     if (!videoRef.current || !selectedClip) return;
     const video = videoRef.current;
@@ -479,15 +520,16 @@ export default function VideoAnalysisPage() {
       try { await video.play(); } catch { toast.error("Cannot play video"); return; }
     }
 
-    // Reset all state
+    blobsRef.current = [];
+    prevGridRef.current = null;
     accumRef.current.fill(0);
+    anomalyHeatmapRef.current.fill(0);
     frameRef.current = 0;
     stateFrameRef.current = 0;
     cooldownRef.current = 0;
     consecutiveAnomalyRef.current = 0;
     stateRef.current = "monitoring";
-    initFlowGrid();
-    anomalyHeatmapRef.current.fill(0);
+    nextId = 1;
 
     setVideoReady(true);
     setIsAnalyzing(true);
@@ -495,9 +537,7 @@ export default function VideoAnalysisPage() {
     setState("monitoring");
     setObjectCount(0);
 
-    // Store previous frames: full-res for flow, grid for change detection
-    let prevFullGray: Float32Array | null = null;
-    let prevGridGray: Float32Array | null = null;
+    let prevFrameData: Uint8ClampedArray | null = null;
 
     const loop = () => {
       try {
@@ -513,69 +553,72 @@ export default function VideoAnalysisPage() {
         frameRef.current++;
         if (cooldownRef.current > 0) cooldownRef.current--;
 
-        // Full-res grayscale for optical flow
-        const currFullGray = toFullGray(data, W, H);
-        // Grid-level grayscale for change detection
-        const currGridGray = toGrayGrid(data, W, H);
+        // Detect blobs + track with physics
+        let tracked: TrackedBlob[] = [];
+        if (prevFrameData) {
+          const detections = findBlobs(data, prevFrameData, W, H);
+          tracked = trackBlobs(detections, frameRef.current);
+        }
+        prevFrameData = new Uint8ClampedArray(data);
 
-        // Compute anomalies
-        let flow: { vx: number; vy: number; mag: number }[][] | null = null;
-        let anomalies: FlowAnomaly[] = [];
+        // Accumulated change
+        const grid = toGrayGrid(data, W, H);
+        const prev = prevGridRef.current;
+        let totalChange = 0;
+        for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
+          const diff = prev ? Math.abs(grid[i] - prev[i]) / 255 : 0;
+          accumRef.current[i] = accumRef.current[i] * 0.95 + diff * 3;
+          totalChange += accumRef.current[i];
+        }
+        prevGridRef.current = grid;
 
-        if (prevFullGray) {
-          flow = computeFlowGrid(currFullGray, prevFullGray, W, H);
+        // Physics-based collision detection (runs in BOTH modes)
+        const collision = detectPhysicsCollision(tracked);
 
-          if (analysisMode === "traffic") {
-            anomalies = analyzeFlowAnomalies(flow);
-          } else {
-            // Normal mode: accumulated change on grid
-            let totalChange = 0;
-            for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
-              const diff = prevGridGray ? Math.abs(currGridGray[i] - prevGridGray[i]) / 255 : 0;
-              accumRef.current[i] = accumRef.current[i] * 0.95 + diff * 3;
-              totalChange += accumRef.current[i];
-            }
-            const score = totalChange / (GRID_COLS * GRID_ROWS);
-            if (score > 0.04) {
-              let maxCell = 0, maxVal = 0;
-              for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
-                if (accumRef.current[i] > maxVal) { maxVal = accumRef.current[i]; maxCell = i; }
-              }
-              anomalies.push({
-                type: "collision", confidence: Math.min(0.8, score * 8),
-                cx: maxCell % GRID_COLS, cy: Math.floor(maxCell / GRID_COLS),
-                evidence: `Accumulated change: ${(score * 100).toFixed(1)}%`,
-              });
-            }
+        // Flow heatmap (traffic mode backup)
+        const flowDisruption = analysisMode === "traffic" ? updateFlowHeatmap(tracked) : false;
+
+        const validTracked = tracked.filter(b => b.frames >= 3);
+        setObjectCount(validTracked.length);
+
+        // ========== ANOMALY EVIDENCE ==========
+        let hasAnomaly = false;
+        let anomalyConfidence = 0;
+        let anomalyType = "";
+
+        if (collision) {
+          // Direct collision: highest priority
+          hasAnomaly = true;
+          anomalyConfidence = collision.confidence;
+          anomalyType = "collision";
+        } else if (flowDisruption && analysisMode === "traffic") {
+          // Persistent flow disruption: secondary
+          hasAnomaly = true;
+          anomalyConfidence = 0.6;
+          anomalyType = "flow_disruption";
+        } else if (analysisMode === "normal") {
+          // Normal mode: accumulated change
+          const avgChange = totalChange / (GRID_COLS * GRID_ROWS);
+          if (avgChange > 0.04) {
+            hasAnomaly = true;
+            anomalyConfidence = Math.min(0.8, avgChange * 8);
+            anomalyType = "change";
           }
         }
 
-        prevFullGray = currFullGray;
-        prevGridGray = currGridGray;
+        const isHighConf = anomalyConfidence > 0.5;
 
-        // Count moving regions
-        let movingCount = 0;
-        if (flow) {
-          for (let r = 0; r < GRID_ROWS; r++)
-            for (let c = 0; c < GRID_COLS; c++)
-              if (flow[r][c].mag > 1.5) movingCount++;
-        }
-        setObjectCount(movingCount);
+        // Draw
+        drawBoxes(tracked, collision);
 
-        // Draw visualization
-        drawFlowViz(flow, anomalies);
-
-        // ========== STATE MACHINE ==========
-        const hasAnomaly = anomalies.length > 0 && anomalies[0].confidence > 0.3;
-        const topConfidence = anomalies.length > 0 ? anomalies[0].confidence : 0;
-        const isHighConf = topConfidence > 0.5;
-
+        // Consecutive anomaly tracking
         if (hasAnomaly) {
           consecutiveAnomalyRef.current++;
         } else {
           consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 1);
         }
 
+        // ========== STATE MACHINE ==========
         stateFrameRef.current++;
         let st = stateRef.current;
 
@@ -596,51 +639,45 @@ export default function VideoAnalysisPage() {
 
         // Fire alert
         if (st === "alert" && stateRef.current !== "alert" && cooldownRef.current <= 0) {
-          cooldownRef.current = analysisMode === "traffic" ? 80 : 40;
+          cooldownRef.current = analysisMode === "traffic" ? 120 : 40;
           consecutiveAnomalyRef.current = 0;
+          anomalyHeatmapRef.current.fill(0);
 
-          const topAnomaly = anomalies[0];
           let incidentType = "vehicle_collision";
           let severity = "major";
 
-          if (topAnomaly) {
-            switch (topAnomaly.type) {
-              case "collision":
-                incidentType = "vehicle_collision";
-                severity = topAnomaly.confidence > 0.7 ? "critical" : "major";
-                break;
-              case "sudden_stop":
-                incidentType = "vehicle_collision";
-                severity = "major";
-                break;
-              case "pile_up":
-                incidentType = "vehicle_collision";
-                severity = topAnomaly.confidence > 0.6 ? "critical" : "major";
-                break;
-              case "direction_chaos":
-                incidentType = "traffic_disruption";
-                severity = "major";
-                break;
-            }
+          if (collision) {
+            const isPed = collision.a.class === "person" || collision.b.class === "person";
+            incidentType = isPed ? "pedestrian_collision" : "vehicle_collision";
+            severity = collision.confidence > 0.7 ? "critical" : collision.confidence > 0.5 ? "major" : "minor";
+          } else if (flowDisruption) {
+            incidentType = "traffic_disruption";
+            severity = "major";
+          } else {
+            incidentType = "";
           }
 
-          createIncident({
-            type: incidentType, severity,
-            confidence: topConfidence || 0.6,
-            timestamp: new Date().toISOString(),
-            latitude: LAT + (Math.random() - 0.5) * 0.01,
-            longitude: LNG + (Math.random() - 0.5) * 0.01,
-          });
-          setTimeout(() => { stateRef.current = "monitoring"; stateFrameRef.current = 0; setState("monitoring"); }, 8000);
+          if (incidentType) {
+            createIncident({
+              type: incidentType, severity,
+              confidence: anomalyConfidence || 0.6,
+              timestamp: new Date().toISOString(),
+              latitude: LAT + (Math.random() - 0.5) * 0.01,
+              longitude: LNG + (Math.random() - 0.5) * 0.01,
+            });
+            setTimeout(() => { stateRef.current = "monitoring"; stateFrameRef.current = 0; setState("monitoring"); }, 8000);
+          } else {
+            stateRef.current = "monitoring";
+            stateFrameRef.current = 0;
+            setState("monitoring");
+          }
         }
 
         stateRef.current = st;
         setState(st);
       } catch (e) { console.error(e); }
-
       rafRef.current = requestAnimationFrame(loop);
     };
-
     rafRef.current = requestAnimationFrame(loop);
   };
 
@@ -655,6 +692,8 @@ export default function VideoAnalysisPage() {
   const resetClip = () => {
     stopAnalysis();
     setIncidents([]);
+    blobsRef.current = [];
+    prevGridRef.current = null;
     accumRef.current.fill(0);
     anomalyHeatmapRef.current.fill(0);
     frameRef.current = 0;
@@ -678,7 +717,7 @@ export default function VideoAnalysisPage() {
       </Link>
       <div>
         <h1 className="text-2xl font-bold">Video Analysis</h1>
-        <p className="text-muted-foreground">Optical flow analysis + motion field anomaly detection</p>
+        <p className="text-muted-foreground">Physics-based object tracking + ESP vehicle telemetry</p>
       </div>
 
       {!selectedClip ? (
@@ -715,7 +754,7 @@ export default function VideoAnalysisPage() {
                   </div>}
                   {isAnalyzing && <div className="absolute top-4 left-4 flex items-center gap-2">
                     <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
-                    <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">Tracking {objectCount} regions</span>
+                    <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">Tracking {objectCount} objects</span>
                   </div>}
                 </div>
                 <div className="p-4 border-t border-border flex items-center gap-3 flex-wrap">
@@ -762,31 +801,33 @@ export default function VideoAnalysisPage() {
                 </div>
               </div>
 
+              {/* ESP Vehicle Telemetry */}
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2">
-                  <Zap size={16} />
-                  {analysisMode === "traffic" ? "Flow Analysis" : "Change Detection"}
-                </h3>
-                {analysisMode === "traffic" ? (
-                  <div className="text-sm text-muted-foreground space-y-1">
-                    <p>Dense optical flow with block matching</p>
-                    <p className="text-xs">Detects: convergence zones, sudden stops, flow discontinuities, direction chaos</p>
-                    <p className="text-xs mt-1">Green arrows = fast, Red = slow/stopped, Highlighted cells = anomaly</p>
-                  </div>
-                ) : (
-                  <div className="text-sm text-muted-foreground space-y-1">
-                    <p>Grid-based accumulated change detection</p>
-                    <p className="text-xs">Best for isolated roads with less motion</p>
-                  </div>
-                )}
-                <div className="grid gap-px mt-2" style={{ gridTemplateColumns: `repeat(${GRID_COLS}, 1fr)` }}>
-                  {Array.from(accumRef.current).map((v, i) => (
-                    <div key={i} className="aspect-square rounded-sm" style={{
-                      backgroundColor: v > 0.08 ? `rgb(${Math.min(255, Math.floor(v * 2000))},0,0)` :
-                        v > 0.03 ? `rgb(${Math.min(255, Math.floor(v * 1500))},${Math.floor(v * 500)},0)` :
-                          `rgb(0,${Math.min(255, Math.floor(v * 3000))},0)`
-                    }} />
-                  ))}
+                <h3 className="font-semibold mb-3 flex items-center gap-2"><Zap size={16} /> Vehicle ESP</h3>
+                <div className="space-y-2 max-h-60 overflow-y-auto">
+                  {(() => {
+                    const valid = blobsRef.current.filter(b => b.frames >= 3);
+                    if (valid.length === 0) return <p className="text-sm text-muted-foreground">{isAnalyzing ? "Scanning..." : "Start analysis"}</p>;
+                    return valid.map(b => {
+                      const speedKmh = Math.round(b.speed * 5);
+                      const accelLabel = b.acceleration < -0.5 ? "BRAKE" : b.acceleration > 0.5 ? "ACC" : "CRUISE";
+                      const accelColor = b.acceleration < -0.5 ? "text-red-400" : b.acceleration > 0.5 ? "text-green-400" : "text-gray-400";
+                      return (
+                        <div key={b.id} className="p-2 bg-background rounded text-xs space-y-1">
+                          <div className="flex items-center justify-between">
+                            <span className={`font-medium ${b.class === "car" ? "text-green-400" : b.class === "bike" ? "text-yellow-400" : "text-blue-400"}`}>{b.class} #{b.id}</span>
+                            <span className={accelColor}>{accelLabel}</span>
+                          </div>
+                          <div className="flex gap-3 text-muted-foreground">
+                            <span>{speedKmh} km/h</span>
+                            <span>a:{b.acceleration.toFixed(1)}</span>
+                            <span>θ:{Math.round(b.heading * 180 / Math.PI)}°</span>
+                            <span>AR:{b.aspectRatio.toFixed(1)}</span>
+                          </div>
+                        </div>
+                      );
+                    });
+                  })()}
                 </div>
               </div>
 
