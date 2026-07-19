@@ -64,11 +64,20 @@ export function findAllTTCPairs(entities: TrackedEntity[]): TTCPair[] {
       nowActive.add(key);
 
       if (isOverlapping(a, b)) {
+        // FILTER: If both moving in same direction = passing, not collision
+        const angleDiff = Math.abs(a.heading - b.heading);
+        const wrapped = angleDiff > Math.PI ? 2 * Math.PI - angleDiff : angleDiff;
+        const bothMoving = a.speed > 1 && b.speed > 1;
+        const sameDirection = wrapped < Math.PI * 0.4; // within ~72 degrees
+        if (bothMoving && sameDirection) {
+          overlapHistory.set(key, 0); // reset — this is passing
+          continue;
+        }
+
         const prev = overlapHistory.get(key) || 0;
         overlapHistory.set(key, prev + 1);
         const overlapFrames = overlapHistory.get(key)!;
 
-        // Overlap threshold: 2 frames at 3 FPS = ~0.7 seconds
         if (overlapFrames >= 2) {
           let severity: TTCPair["severity"] = "warning";
           if (overlapFrames >= 6) severity = "impact";
