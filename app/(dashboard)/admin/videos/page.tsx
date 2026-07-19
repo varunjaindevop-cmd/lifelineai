@@ -353,8 +353,8 @@ export default function VideoAnalysisPage() {
         matched.add(bestIdx);
 
         // Compute speed from centroid displacement
-        // ~2 pixels per meter for 320x240 CCTV at typical road distance
-        const PPM = 2;
+        // ~4 pixels per meter for 320x240 CCTV at typical road distance
+        const PPM = 4;
         const pixelDist = Math.sqrt(blob.vx ** 2 + blob.vy ** 2);
         const rawSpeedKmh = (pixelDist / PPM) * FPS * 3.6;
 
@@ -445,65 +445,70 @@ export default function VideoAnalysisPage() {
   };
 
   const checkForAccident = (tracked: TrackedBlob[], sceneScore: number): IncidentAlert | null => {
-    // Check objects tracked for 6+ frames (confirmed objects)
-    const vehicles = tracked.filter((b) => (b.class === "car" || b.class === "bike") && b.framesTracked >= 6);
-    const persons = tracked.filter((b) => b.class === "person" && b.framesTracked >= 6);
+    const vehicles = tracked.filter((b) => (b.class === "car" || b.class === "bike") && b.framesTracked >= 4);
+    const persons = tracked.filter((b) => b.class === "person" && b.framesTracked >= 4);
+    const allObjects = [...vehicles, ...persons];
 
-    // Vehicle-vehicle collision
-    for (let i = 0; i < vehicles.length; i++) {
-      for (let j = i + 1; j < vehicles.length; j++) {
-        const a = vehicles[i];
-        const b = vehicles[j];
+    // Strategy 1: Proximity + convergence (works for all collision angles)
+    for (let i = 0; i < allObjects.length; i++) {
+      for (let j = i + 1; j < allObjects.length; j++) {
+        const a = allObjects[i];
+        const b = allObjects[j];
 
-        // Bounding box overlap
-        const aLeft = a.cx - a.w / 2, aRight = a.cx + a.w / 2;
-        const aTop = a.cy - a.h / 2, aBot = a.cy + a.h / 2;
-        const bLeft = b.cx - b.w / 2, bRight = b.cx + b.w / 2;
-        const bTop = b.cy - b.h / 2, bBot = b.cy + b.h / 2;
-        const overlapX = Math.max(0, Math.min(aRight, bRight) - Math.max(aLeft, bLeft));
-        const overlapY = Math.max(0, Math.min(aBot, bBot) - Math.max(aTop, bTop));
-        const overlapArea = overlapX * overlapY;
-        const aArea = a.w * a.h;
-        const bArea = b.w * b.h;
-        const minArea = Math.min(aArea, bArea);
-        const iou = (aArea + bArea - overlapArea) > 0 ? overlapArea / (aArea + bArea - overlapArea) : 0;
+        // Skip same-type pairs that are just passing (person-person or bike-bike far apart)
+        if (a.class === b.class && a.class === "person") continue;
 
-        // Direction analysis
-        const aAngle = Math.atan2(a.vy, a.vx);
-        const bAngle = Math.atan2(b.vy, b.vx);
-        const angleDiff = Math.abs(aAngle - bAngle);
-        const parallel = angleDiff < Math.PI * 0.3 || angleDiff > Math.PI * 1.7;
+        const dist = Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2);
+        const combinedRadius = (a.w + b.w) / 2;
 
-        // Track sustained proximity — need 6+ consecutive frames
-        const closeThreshold = Math.max(a.w, b.w) * 0.8;
-        if (Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2) < closeThreshold) {
+        // Convergence: are they moving toward each other?
+        const toBx = b.cx - a.cx;
+        const toBy = b.cy - a.cy;
+        const distDot = a.vx * toBx + a.vy * toBy;
+        const converging = distDot > 0;
+
+        // Separation speed (how fast they're approaching)
+        const approachSpeed = converging ? Math.abs(distDot) / Math.max(dist, 1) : 0;
+
+        // Track sustained proximity
+        if (dist < combinedRadius * 1.5) {
           a.consecutiveFramesNear++;
           b.consecutiveFramesNear++;
         } else {
-          a.consecutiveFramesNear = Math.max(0, a.consecutiveFramesNear - 2);
-          b.consecutiveFramesNear = Math.max(0, b.consecutiveFramesNear - 2);
+          a.consecutiveFramesNear = Math.max(0, a.consecutiveFramesNear - 1);
+          b.consecutiveFramesNear = Math.max(0, b.consecutiveFramesNear - 1);
         }
 
         const sustainedNear = Math.min(a.consecutiveFramesNear, b.consecutiveFramesNear);
 
-        // REQUIREMENT 1: ACTUAL overlap — 10% of smaller object
-        const hasOverlap = overlapArea > minArea * 0.10;
+        // Detection: close + converging + sustained OR very close
+        const veryClose = dist < combinedRadius * 0.8;
+        const closeAndConverging = dist < combinedRadius * 1.2 && converging && approachSpeed > 0.5;
+        const sustained = sustainedNear >= 4 && converging;
 
-        // REQUIREMENT 2: Sustained 6+ frames AND not parallel
-        const sustained = sustainedNear >= 6 && !parallel;
+        if (veryClose || closeAndConverging || sustained) {
+          // Direction analysis: passing vs colliding
+          const aAngle = Math.atan2(a.vy, a.vx);
+          const bAngle = Math.atan2(b.vy, b.vx);
+          const angleDiff = Math.abs(aAngle - bAngle);
+          const parallel = angleDiff < Math.PI * 0.25 || angleDiff > Math.PI * 1.75;
 
-        if (hasOverlap || sustained) {
+          // Don't trigger if clearly parallel (just passing)
+          if (parallel && dist > combinedRadius * 0.6) continue;
+
           const confidence = Math.min(0.95,
-            0.35 * Math.min(iou * 6, 1) +
-            0.3 * (hasOverlap ? 1 : 0) +
-            0.2 * (!parallel ? 1 : 0) +
-            0.15 * Math.min(sceneScore / 0.25, 1)
+            0.3 * (1 - Math.min(dist / (combinedRadius * 1.5), 1)) +
+            0.25 * (converging ? approachSpeed : 0) +
+            0.2 * (veryClose ? 1 : sustained ? 0.8 : 0.5) +
+            0.15 * (!parallel ? 1 : 0.3) +
+            0.1 * Math.min(sceneScore / 0.2, 1)
           );
 
-          if (confidence > 0.65) {
+          if (confidence > 0.55) {
+            const isVehicleCollision = (a.class === "car" || a.class === "bike") && (b.class === "car" || b.class === "bike");
             return {
-              type: "vehicle_collision",
-              severity: confidence > 0.8 ? "critical" : "major",
+              type: isVehicleCollision ? "vehicle_collision" : "pedestrian_collision",
+              severity: confidence > 0.75 ? "critical" : "major",
               confidence,
               timestamp: new Date().toISOString(),
               latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
@@ -514,34 +519,49 @@ export default function VideoAnalysisPage() {
       }
     }
 
-    // Vehicle-pedestrian: ONLY actual overlap, nothing else
-    for (const vehicle of vehicles) {
-      for (const ped of persons) {
-        const vLeft = vehicle.cx - vehicle.w / 2, vRight = vehicle.cx + vehicle.w / 2;
-        const vTop = vehicle.cy - vehicle.h / 2, vBot = vehicle.cy + vehicle.h / 2;
-        const pLeft = ped.cx - ped.w / 2, pRight = ped.cx + ped.w / 2;
-        const pTop = ped.cy - ped.h / 2, pBot = ped.cy + ped.h / 2;
-        const overlapX = Math.max(0, Math.min(vRight, pRight) - Math.max(vLeft, pLeft));
-        const overlapY = Math.max(0, Math.min(vBot, pBot) - Math.max(vTop, pTop));
-        const overlapArea = overlapX * overlapY;
-        const minArea = Math.min(vehicle.w * vehicle.h, ped.w * ped.h);
+    // Strategy 2: Sudden stop detection (vehicle stopped abruptly = potential collision aftermath)
+    for (const obj of vehicles) {
+      if (obj.framesTracked < 6) continue;
+      if (obj.prevPositions.length < 4) continue;
 
-        // ONLY trigger on ACTUAL overlap — 10% of smaller object
-        if (overlapArea > minArea * 0.10) {
-          return {
-            type: "pedestrian_collision",
-            severity: "critical",
-            confidence: 0.9,
-            timestamp: new Date().toISOString(),
-            latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
-            longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
-          };
+      const recent = obj.prevPositions.slice(-4);
+      const recentSpeed = Math.sqrt(
+        (recent[3].x - recent[0].x) ** 2 + (recent[3].y - recent[0].y) ** 2
+      ) / 3;
+
+      const older = obj.prevPositions.slice(0, 4);
+      if (older.length >= 4) {
+        const olderSpeed = Math.sqrt(
+          (older[3].x - older[0].x) ** 2 + (older[3].y - older[0].y) ** 2
+        ) / 3;
+
+        // Speed dropped dramatically (>70% reduction) = possible collision
+        if (olderSpeed > 2 && recentSpeed < olderSpeed * 0.3) {
+          // Check if another object is nearby
+          const nearbyOther = allObjects.find(
+            (o) => o.id !== obj.id && Math.sqrt((o.cx - obj.cx) ** 2 + (o.cy - obj.cy) ** 2) < (obj.w + o.w)
+          );
+          if (nearbyOther) {
+            return {
+              type: "vehicle_collision",
+              severity: "major",
+              confidence: 0.72,
+              timestamp: new Date().toISOString(),
+              latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
+              longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
+            };
+          }
         }
       }
     }
 
     return null;
   };
+
+  // Helper: combined radius for two objects
+  function combinedRadius(a: { w: number }, b: { w: number }): number {
+    return (a.w + b.w) / 2;
+  }
 
   const recordClipAndAlert = async (alert: IncidentAlert) => {
     // Record the clip as an encoded image composite (reliable, no MediaRecorder)
