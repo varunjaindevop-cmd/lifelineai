@@ -294,10 +294,13 @@ export default function VideoAnalysisPage() {
       }).catch(() => {}).finally(() => { isDetecting = false; });
     };
 
+    let lastChangeTime = 0;
+
     const loop = () => {
       try {
         if (!videoRef.current || videoRef.current.paused || videoRef.current.ended || !analyzingRef.current) return;
 
+        const now = Date.now();
         frameRef.current++;
         if (cooldownRef.current > 0) cooldownRef.current--;
 
@@ -306,24 +309,33 @@ export default function VideoAnalysisPage() {
         const entities = trackerRef.current.update(latestDetections, frameRef.current);
         const validEntities = entities.filter(e => e.age >= 2);
 
-        // Update object count every 10 frames (not every frame)
-        if (frameRef.current % 10 === 0) setObjectCount(validEntities.length);
+        // Debug logging every 3 seconds
+        if (now - (loop as any).lastLogTime > 3000) {
+          (loop as any).lastLogTime = now;
+          console.log(`[SAGE] Frame ${frameRef.current} | Objects: ${validEntities.length} | Detections: ${latestDetections.length} | Mode: ${envMode}`);
+        }
 
-        // Change detection — only every 500ms (expensive getImageData)
-        if (frameRef.current % 30 === 0) {
-          const tmp = getTmp();
-          tmp.width = video.videoWidth || 640;
-          tmp.height = video.videoHeight || 480;
-          const tCtx = tmp.getContext("2d")!;
-          tCtx.drawImage(video, 0, 0, tmp.width, tmp.height);
-          const imgData = tCtx.getImageData(0, 0, tmp.width, tmp.height);
-          const changeGrid = computeChangeGrid(imgData.data, tmp.width, tmp.height);
-          const prev = prevChangeGridRef.current;
-          for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
-            const diff = prev ? Math.abs(changeGrid[i] - prev[i]) / 255 : 0;
-            accumRef.current[i] = accumRef.current[i] * 0.95 + diff * 3;
-          }
-          prevChangeGridRef.current = changeGrid;
+        // Update object count every 500ms
+        if (now % 500 < 20) setObjectCount(validEntities.length);
+
+        // Change detection — time-based, every 500ms
+        if (now - lastChangeTime > 500) {
+          lastChangeTime = now;
+          try {
+            const tmp = getTmp();
+            tmp.width = video.videoWidth || 640;
+            tmp.height = video.videoHeight || 480;
+            const tCtx = tmp.getContext("2d")!;
+            tCtx.drawImage(video, 0, 0, tmp.width, tmp.height);
+            const imgData = tCtx.getImageData(0, 0, tmp.width, tmp.height);
+            const changeGrid = computeChangeGrid(imgData.data, tmp.width, tmp.height);
+            const prev = prevChangeGridRef.current;
+            for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
+              const diff = prev ? Math.abs(changeGrid[i] - prev[i]) / 255 : 0;
+              accumRef.current[i] = accumRef.current[i] * 0.95 + diff * 3;
+            }
+            prevChangeGridRef.current = changeGrid;
+          } catch {}
         }
 
         const ttcPairs = findAllTTCPairs(validEntities);
@@ -339,7 +351,6 @@ export default function VideoAnalysisPage() {
         if (hasStrongEvidence) consecutiveAnomalyRef.current++;
         else consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 1);
 
-        frameRef.current++;
         let st = stateRef.current;
 
         if (hasPostImpact) {
@@ -348,7 +359,8 @@ export default function VideoAnalysisPage() {
           if (st === "monitoring") st = "watching";
           else if (st === "watching" && consecutiveAnomalyRef.current >= 12) st = "confirming";
           else if (st === "confirming" && consecutiveAnomalyRef.current >= 16) st = "alert";
-        } else if (frameRef.current % 5 === 0) {
+        } else if (now % 1000 < 20) {
+          // Decay every 1 second
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
 
