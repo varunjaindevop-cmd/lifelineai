@@ -365,7 +365,7 @@ export default function VideoAnalysisPage() {
         }
 
         const ttcPairs = findAllTTCPairs(validEntities);
-        const evidence = detectAccidents(validEntities, ttcPairs);
+        const evidence = detectAccidents(validEntities, ttcPairs, envMode);
 
         drawFrame(validEntities, ttcPairs, evidence, video.videoWidth || 640, video.videoHeight || 480);
 
@@ -387,7 +387,7 @@ export default function VideoAnalysisPage() {
 
         // Alert
         if (st === "alert" && stateRef.current !== "alert" && cooldownRef.current <= 0) {
-          cooldownRef.current = 120;
+          cooldownRef.current = 300; // 10 seconds at 60fps — long cooldown
           consecutiveAnomalyRef.current = 0;
 
           const topEv = evidence[0];

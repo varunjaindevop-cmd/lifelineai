@@ -32,21 +32,34 @@ export function autoCalibrate(
   return Math.max(10, Math.min(40, ppm));
 }
 
-// Convert Kalman speed (pixels/frame) to real km/h
+// Convert entity speed to real km/h
+// Uses actual position history for more accurate speed
 export function pixelSpeedToKmh(
   entity: TrackedEntity,
   pixelsPerMeter: number,
-  fps: number = 10
+  fps: number = 3
 ): number {
-  const pixelSpeed = entity.speed; // pixels/frame from Kalman filter
-  
+  // Use actual position displacement if available
+  if (entity.positions.length >= 2) {
+    const last = entity.positions[entity.positions.length - 1];
+    const prev = entity.positions[entity.positions.length - 2];
+    const dx = last.x - prev.x;
+    const dy = last.y - prev.y;
+    const pixelDist = Math.sqrt(dx * dx + dy * dy);
+
+    if (pixelDist < 0.1) return 0;
+
+    const metersPerFrame = pixelDist / pixelsPerMeter;
+    const metersPerSecond = metersPerFrame * fps;
+    return Math.round(metersPerSecond * 3.6);
+  }
+
+  // Fallback to Kalman velocity
+  const pixelSpeed = entity.speed;
   if (pixelSpeed < 0.1) return 0;
-  
   const metersPerFrame = pixelSpeed / pixelsPerMeter;
   const metersPerSecond = metersPerFrame * fps;
-  const kmh = metersPerSecond * 3.6;
-  
-  return Math.round(kmh);
+  return Math.round(metersPerSecond * 3.6);
 }
 
 // Calculate speed with smoothing and history

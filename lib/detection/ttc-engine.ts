@@ -1,9 +1,15 @@
-// Collision Detection Engine v7 — ULTRA SIMPLE
-// ONLY ONE SIGNAL: bounding box overlap sustained over multiple frames.
-// No speed, no convergence, no aftermath. Just overlap.
+// Collision Detection Engine v8 — Mode-specific logic
 //
-// Why: Every other signal I added caused false positives.
-// Overlap is the ONLY thing that actually means two objects are in contact.
+// ISOLATED ROAD: Track center-to-center distance between object pairs.
+//   Alert when distance drops below threshold + objects converge.
+//   No bounding box overlap check (unreliable with COCO-SSD).
+//
+// TRAFFIC MODE: NO collision detection at all.
+//   Dense traffic always has close objects. Only flag if an object
+//   suddenly stops mid-traffic (post-crash behavior).
+//
+// KEY INSIGHT: COCO-SSD bounding boxes overlap in normal traffic.
+// We must NEVER use overlap as a collision signal.
 
 import { TrackedEntity } from "./kalman-tracker";
 
@@ -33,27 +39,18 @@ function combinedR(a: TrackedEntity, b: TrackedEntity): number {
   return (Math.sqrt(a.w * a.h) + Math.sqrt(b.w * b.h)) / 2;
 }
 
-function isOverlapping(a: TrackedEntity, b: TrackedEntity): boolean {
-  const ax = a.kalman.getState().x - a.w / 2;
-  const ay = a.kalman.getState().y - a.h / 2;
-  const bx = b.kalman.getState().x - b.w / 2;
-  const by = b.kalman.getState().y - b.h / 2;
-  return !(ax + a.w < bx || bx + b.w < ax || ay + a.h < by || by + b.h < ay);
-}
-
-// Track overlap history per pair using a Map
-const overlapHistory = new Map<string, number>();
+// Track distance history per pair
+const distanceHistory = new Map<string, number[]>();
 
 function getPairKey(a: TrackedEntity, b: TrackedEntity): string {
-  const id1 = Math.min(a.id, b.id);
-  const id2 = Math.max(a.id, b.id);
-  return `${id1}-${id2}`;
+  return `${Math.min(a.id, b.id)}-${Math.max(a.id, b.id)}`;
 }
 
-export function findAllTTCPairs(entities: TrackedEntity[]): TTCPair[] {
-  const pairs: TTCPair[] = [];
-  const candidates = entities.filter(e => e.age >= 2);
-  const nowActive = new Set<string>();
+// ISOLATED MODE: Distance-based collision detection
+function detectIsolatedCollision(entities: TrackedEntity[]): AccidentEvidence[] {
+  const evidence: AccidentEvidence[] = [];
+  const candidates = entities.filter(e => e.age >= 3);
+  const activePairs = new Set<string>();
 
   for (let i = 0; i < candidates.length; i++) {
     for (let j = i + 1; j < candidates.length; j++) {
@@ -61,63 +58,118 @@ export function findAllTTCPairs(entities: TrackedEntity[]): TTCPair[] {
       if (a.class === "person" && b.class === "person") continue;
 
       const key = getPairKey(a, b);
-      nowActive.add(key);
+      activePairs.add(key);
 
-      if (isOverlapping(a, b)) {
-        // FILTER: If both moving in same direction = passing, not collision
-        const angleDiff = Math.abs(a.heading - b.heading);
-        const wrapped = angleDiff > Math.PI ? 2 * Math.PI - angleDiff : angleDiff;
-        const bothMoving = a.speed > 1 && b.speed > 1;
-        const sameDirection = wrapped < Math.PI * 0.4; // within ~72 degrees
-        if (bothMoving && sameDirection) {
-          overlapHistory.set(key, 0); // reset — this is passing
-          continue;
-        }
+      const d = dist(a, b);
+      const cr = combinedR(a, b);
 
-        const prev = overlapHistory.get(key) || 0;
-        overlapHistory.set(key, prev + 1);
-        const overlapFrames = overlapHistory.get(key)!;
+      // Track distance history
+      const hist = distanceHistory.get(key) || [];
+      hist.push(d);
+      if (hist.length > 10) hist.shift();
+      distanceHistory.set(key, hist);
 
-        if (overlapFrames >= 2) {
-          let severity: TTCPair["severity"] = "warning";
-          if (overlapFrames >= 6) severity = "impact";
-          else if (overlapFrames >= 4) severity = "critical";
+      // Need at least 3 frames of history
+      if (hist.length < 3) continue;
 
-          pairs.push({
-            a, b, ttc: NaN, distance: dist(a, b), closingSpeed: 0, severity,
+      // Check if distance is decreasing (objects converging)
+      const recentAvg = (hist[hist.length - 1] + hist[hist.length - 2]) / 2;
+      const prevAvg = (hist[0] + hist[1]) / 2;
+      const converging = recentAvg < prevAvg - 1;
+
+      // Check if very close (within 0.5x combined radius)
+      const veryClose = d < cr * 0.5;
+
+      // Check if one object stopped suddenly
+      const aStopped = a.speedHistory.length >= 3 &&
+        a.speedHistory[0] > 2 && a.speed < 0.5;
+      const bStopped = b.speedHistory.length >= 3 &&
+        b.speedHistory[0] > 2 && b.speed < 0.5;
+      const oneStopped = aStopped || bStopped;
+
+      // Collision signal: converging + very close + (one stopped OR both converging fast)
+      if (veryClose && converging && oneStopped) {
+        evidence.push({
+          type: "collision",
+          confidence: 0.85,
+          objects: [a.id, b.id],
+          details: `Converging + very close + stopped (dist: ${d.toFixed(0)}px)`,
+        });
+      } else if (veryClose && converging && hist.length >= 4) {
+        // Distance was larger, now very close = rapid approach
+        const rapidApproach = prevAvg - recentAvg > 3;
+        if (rapidApproach) {
+          evidence.push({
+            type: "collision",
+            confidence: 0.7,
+            objects: [a.id, b.id],
+            details: `Rapid approach: ${prevAvg.toFixed(0)}→${recentAvg.toFixed(0)}px`,
           });
         }
-      } else {
-        // No overlap — reset counter
-        overlapHistory.set(key, 0);
       }
     }
   }
 
-  // Clean up pairs that are no longer active
-  for (const key of Array.from(overlapHistory.keys())) {
-    if (!nowActive.has(key)) overlapHistory.delete(key);
+  // Cleanup stale pairs
+  for (const key of Array.from(distanceHistory.keys())) {
+    if (!activePairs.has(key)) distanceHistory.delete(key);
   }
 
-  pairs.sort((a, b) => a.distance - b.distance);
-  return pairs;
+  return evidence;
+}
+
+// TRAFFIC MODE: Only detect sudden stops mid-traffic
+function detectTrafficCollision(entities: TrackedEntity[]): AccidentEvidence[] {
+  const evidence: AccidentEvidence[] = [];
+
+  for (const entity of entities) {
+    if (entity.age < 5) continue;
+    if (entity.speedHistory.length < 5) continue;
+
+    // Was moving fast, now suddenly stopped
+    const recentSpeed = entity.speed;
+    const prevSpeed = (entity.speedHistory[0] + entity.speedHistory[1] + entity.speedHistory[2]) / 3;
+
+    // Sudden stop: was >3 px/frame, now <0.5, dropped in 2-3 frames
+    if (prevSpeed > 3 && recentSpeed < 0.5) {
+      // Check if there are other objects nearby (could be the collision partner)
+      const nearbyObj = entities.find(e =>
+        e.id !== entity.id &&
+        e.age >= 3 &&
+        dist(e, entity) < combinedR(e, entity) * 3
+      );
+
+      if (nearbyObj) {
+        evidence.push({
+          type: "collision",
+          confidence: 0.75,
+          objects: [entity.id, nearbyObj.id],
+          details: `Sudden stop near #${nearbyObj.id} (${prevSpeed.toFixed(1)}→${recentSpeed.toFixed(1)} px/f)`,
+        });
+      }
+    }
+  }
+
+  return evidence;
+}
+
+export function findAllTTCPairs(entities: TrackedEntity[]): TTCPair[] {
+  // No TTC pairs in v8 — we use mode-specific detection instead
+  return [];
 }
 
 export function detectAccidents(
   entities: TrackedEntity[],
-  ttcPairs: TTCPair[]
+  ttcPairs: TTCPair[],
+  envMode: "isolated" | "traffic" | "marketplace"
 ): AccidentEvidence[] {
-  const evidence: AccidentEvidence[] = [];
+  let evidence: AccidentEvidence[];
 
-  for (const pair of ttcPairs) {
-    if (pair.severity === "impact" || pair.severity === "critical") {
-      evidence.push({
-        type: "collision",
-        confidence: pair.severity === "impact" ? 0.9 : 0.75,
-        objects: [pair.a.id, pair.b.id],
-        details: `Overlap sustained (${pair.severity}) dist:${pair.distance.toFixed(0)}px`,
-      });
-    }
+  if (envMode === "traffic") {
+    evidence = detectTrafficCollision(entities);
+  } else {
+    // isolated or marketplace
+    evidence = detectIsolatedCollision(entities);
   }
 
   evidence.sort((a, b) => b.confidence - a.confidence);
