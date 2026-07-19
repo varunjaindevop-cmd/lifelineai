@@ -100,11 +100,15 @@ function scoreCollision(a: TrackedEntity, b: TrackedEntity): {
   const d = dist(a, b);
   const cr = combinedR(a, b);
 
-  // HARD GATE 1: Must be within 1x combined radius (touching distance)
-  if (d > cr * 1.0) return null;
+  // HARD GATE 1: Must be close (within 1.5x combined radius)
+  if (d > cr * 1.5) return null;
 
-  // HARD GATE 2: Both moving fast = passing, not collision
-  if (a.speed > 1.5 && b.speed > 1.5) return null;
+  // HARD GATE 2: Both moving fast in same direction = passing
+  if (a.speed > 2 && b.speed > 2) {
+    const angleDiff = Math.abs(a.heading - b.heading);
+    const wrapped = angleDiff > Math.PI ? 2 * Math.PI - angleDiff : angleDiff;
+    if (wrapped < Math.PI * 0.3) return null; // same direction = passing
+  }
 
   let score = 0;
   const reasons: string[] = [];
@@ -115,51 +119,41 @@ function scoreCollision(a: TrackedEntity, b: TrackedEntity): {
     reasons.push("overlap");
   }
 
-  // Signal 2: Sudden deceleration near the other object
+  // Signal 2: Very close proximity
+  if (d < cr * 0.7) {
+    score += 0.15;
+    reasons.push("touching");
+  }
+
+  // Signal 3: Converging — heading toward each other
+  const dx = b.kalman.getState().x - a.kalman.getState().x;
+  const dy = b.kalman.getState().y - a.kalman.getState().y;
+  const dotA = a.kalman.getState().vx * dx + a.kalman.getState().vy * dy;
+  const dotB = b.kalman.getState().vx * (-dx) + b.kalman.getState().vy * (-dy);
+  if (dotA > 0 || dotB > 0) {
+    score += 0.2;
+    reasons.push("converging");
+  }
+
+  // Signal 4: Sudden deceleration
   const aDecel = hasSuddenDeceleration(a);
   const bDecel = hasSuddenDeceleration(b);
+  if (aDecel) { score += 0.3; reasons.push("A_decel"); }
+  if (bDecel) { score += 0.3; reasons.push("B_decel"); }
+  if (aDecel && bDecel) { score += 0.1; reasons.push("both_decel"); }
 
-  if (aDecel && !bDecel) {
-    // A decelerated suddenly — but only count if B was involved (close)
-    score += 0.35;
-    reasons.push("A_decel");
-  }
-  if (bDecel && !aDecel) {
-    score += 0.35;
-    reasons.push("B_decel");
-  }
-  if (aDecel && bDecel) {
-    // BOTH decelerated — very strong collision signal
-    score += 0.5;
-    reasons.push("both_decel");
-  }
-
-  // Signal 3: One was fast, now stopped, at this location
-  const aWasFast = wasFast(a) && isStopped(a);
-  const bWasFast = wasFast(b) && isStopped(b);
-
-  if (aWasFast && isStationary(a)) {
-    score += 0.15;
-    reasons.push("A_stopped_stationary");
-  }
-  if (bWasFast && isStationary(b)) {
-    score += 0.15;
-    reasons.push("B_stopped_stationary");
-  }
+  // Signal 5: One stopped near the other
+  const aStopped = wasFast(a) && isStopped(a);
+  const bStopped = wasFast(b) && isStopped(b);
+  if (aStopped && isStationary(a)) { score += 0.15; reasons.push("A_stopped"); }
+  if (bStopped && isStationary(b)) { score += 0.15; reasons.push("B_stopped"); }
 
   // ===== PENALTIES =====
-  // Parallel direction = likely passing
   const angleDiff = Math.abs(a.heading - b.heading);
   const wrapped = angleDiff > Math.PI ? 2 * Math.PI - angleDiff : angleDiff;
-  if (wrapped < Math.PI * 0.3) {
+  if (wrapped < Math.PI * 0.3 && a.speed > 1 && b.speed > 1) {
     score -= 0.3;
     reasons.push("parallel");
-  }
-
-  // Near threshold = less certain
-  if (d > cr * 0.8) {
-    score -= 0.15;
-    reasons.push("edge");
   }
 
   if (score < 0.5) return null;
