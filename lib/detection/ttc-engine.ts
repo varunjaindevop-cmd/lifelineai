@@ -1,21 +1,11 @@
-// Collision Detection Engine v4
-// PHILOSOPHY: Only detect what ACTUALLY happens in a real accident.
+// Collision Detection Engine v5
+// SIMPLIFIED for reliability: only detect REAL accidents.
 //
-// What happens in a REAL collision:
-//   1. Object was moving fast → suddenly stopped/slowed dramatically
-//   2. The stopped object stays in ONE spot for multiple frames
-//   3. Bike: falls sideways (aspect ratio change from tall to wide)
-//   4. Person: gets thrown (trajectory deviates from standing position)
-//   5. Both objects were VERY close at the moment of speed change
-//
-// What does NOT happen in normal traffic:
-//   - Objects passing each other at distance → both keep moving
-//   - Traffic overlap → objects continue at same speed
-//   - Car in front of person at distance → no speed change
-//
-// RULE: Speed change at close proximity = collision candidate.
-//       Speed change at far distance = NOT a collision.
-//       No speed change = NOT a collision (regardless of distance).
+// RULE 1: Objects passing at distance = NOT collision (no matter what)
+// RULE 2: Overlapping + one stopped = COLLISION
+// RULE 3: Both stopped after both were moving + close = POST-IMPACT
+// RULE 4: Bike heading change + stopped = BIKE FALL
+// RULE 5: No overlap + both moving = NEVER a collision
 
 import { TrackedEntity } from "./kalman-tracker";
 
@@ -29,95 +19,25 @@ export interface TTCPair {
 }
 
 export interface AccidentEvidence {
-  type: "collision" | "post_impact" | "bike_fall" | "person_thrown";
+  type: "collision" | "post_impact" | "bike_fall";
   confidence: number;
   objects: number[];
   details: string;
 }
 
-// ===== PHYSICS-BASED COLLISION SIGNATURES =====
+// ===== HELPERS =====
 
-// Signature 1: Object was fast, now stopped/stopped at specific spot
-function wasMovingNowStopped(entity: TrackedEntity): boolean {
-  if (entity.speedHistory.length < 3) return false;
-  const recentSpeed = entity.speed;
-  const prevSpeed = (entity.speedHistory[0] + entity.speedHistory[1]) / 2;
-  // Was moving (prevSpeed > 2 px/frame), now stopped (recentSpeed < 0.5)
-  return prevSpeed > 2 && recentSpeed < 0.5;
+function dist(a: TrackedEntity, b: TrackedEntity): number {
+  const dx = a.kalman.getState().x - b.kalman.getState().x;
+  const dy = a.kalman.getState().y - b.kalman.getState().y;
+  return Math.sqrt(dx * dx + dy * dy);
 }
 
-// Signature 2: Object is stationary at a specific spot (not just slow)
-function isStationary(entity: TrackedEntity): boolean {
-  if (entity.positions.length < 4) return false;
-  const last4 = entity.positions.slice(-4);
-  const maxDist = Math.max(
-    ...last4.map((p, i) =>
-      i === 0 ? 0 : Math.sqrt((p.x - last4[0].x) ** 2 + (p.y - last4[0].y) ** 2)
-    )
-  );
-  return maxDist < 5; // moved less than 5 pixels in 4 frames
+function combinedR(a: TrackedEntity, b: TrackedEntity): number {
+  return (Math.sqrt(a.w * a.h) + Math.sqrt(b.w * b.h)) / 2;
 }
 
-// Signature 3: Bike fell sideways (aspect ratio changed dramatically)
-function detectBikeFall(entity: TrackedEntity): boolean {
-  if (entity.class !== "motorcycle") return false;
-  if (entity.speedHistory.length < 3) return false;
-  if (entity.positions.length < 3) return false;
-
-  const currentAR = entity.w / Math.max(entity.h, 1);
-  const wasMoving = entity.speedHistory.some(s => s > 2);
-  const nowStopped = entity.speed < 0.5;
-
-  // Bike was moving, now stopped, and aspect ratio changed
-  // A bike falling sideways goes from tall (AR < 0.7) to wider (AR > 1.0)
-  if (wasMoving && nowStopped) {
-    // Check if heading changed dramatically (bike spun/fell)
-    if (entity.headingHistory.length >= 3) {
-      const headingDiff = Math.abs(
-        entity.headingHistory[entity.headingHistory.length - 1] -
-        entity.headingHistory[entity.headingHistory.length - 3]
-      );
-      if (headingDiff > Math.PI * 0.3) return true; // > 54 degrees
-    }
-    // Or if position is low on screen (fell to ground)
-    if (entity.positions.length >= 3) {
-      const lastY = entity.positions[entity.positions.length - 1].y;
-      const prevY = entity.positions[entity.positions.length - 3].y;
-      if (lastY > prevY + 5) return true; // dropped
-    }
-  }
-  return false;
-}
-
-// Signature 4: Person thrown (trajectory deviates from normal walking)
-function detectPersonThrown(entity: TrackedEntity): boolean {
-  if (entity.class !== "person") return false;
-  if (entity.speedHistory.length < 3) return false;
-
-  const wasMoving = entity.speedHistory.some(s => s > 2);
-  const nowStopped = entity.speed < 0.5;
-
-  if (wasMoving && nowStopped) {
-    // Person was moving fast and suddenly stopped
-    return true;
-  }
-  return false;
-}
-
-// ===== DISTANCE FILTERING =====
-// Critical: Only consider collisions at CLOSE range
-// Far-away objects passing each other should NEVER trigger alerts
-
-function isCloseRange(a: TrackedEntity, b: TrackedEntity): boolean {
-  const dist = Math.sqrt(
-    (a.kalman.getState().x - b.kalman.getState().x) ** 2 +
-    (a.kalman.getState().y - b.kalman.getState().y) ** 2
-  );
-  const combinedR = (Math.sqrt(a.w * a.h) + Math.sqrt(b.w * b.h)) / 2;
-  return dist < combinedR * 1.5; // must be VERY close
-}
-
-function areOverlapping(a: TrackedEntity, b: TrackedEntity): boolean {
+function isOverlapping(a: TrackedEntity, b: TrackedEntity): boolean {
   const ax = a.kalman.getState().x - a.w / 2;
   const ay = a.kalman.getState().y - a.h / 2;
   const bx = b.kalman.getState().x - b.w / 2;
@@ -125,98 +45,133 @@ function areOverlapping(a: TrackedEntity, b: TrackedEntity): boolean {
   return !(ax + a.w < bx || bx + b.w < ax || ay + a.h < by || by + b.h < ay);
 }
 
-// ===== MAIN COLLISION DETECTION =====
+function isVeryClose(a: TrackedEntity, b: TrackedEntity): boolean {
+  return dist(a, b) < combinedR(a, b) * 1.0;
+}
 
-function computeCollisionScore(a: TrackedEntity, b: TrackedEntity): {
+function wasFast(entity: TrackedEntity): boolean {
+  if (entity.speedHistory.length < 3) return false;
+  return entity.speedHistory.some(s => s > 2);
+}
+
+function isStopped(entity: TrackedEntity): boolean {
+  return entity.speed < 0.5;
+}
+
+function isStationary(entity: TrackedEntity): boolean {
+  if (entity.positions.length < 5) return false;
+  const last5 = entity.positions.slice(-5);
+  let maxMove = 0;
+  for (let i = 1; i < last5.length; i++) {
+    const d = Math.sqrt((last5[i].x - last5[0].x) ** 2 + (last5[i].y - last5[0].y) ** 2);
+    maxMove = Math.max(maxMove, d);
+  }
+  return maxMove < 8; // barely moved in 5 frames
+}
+
+// ===== BIKE FALL DETECTION =====
+function isBikeFall(entity: TrackedEntity): boolean {
+  if (entity.class !== "motorcycle") return false;
+  if (!wasFast(entity)) return false;
+  if (!isStopped(entity)) return false;
+  if (entity.headingHistory.length < 3) return false;
+
+  // Heading changed significantly while stopping
+  const headingDiff = Math.abs(
+    entity.headingHistory[entity.headingHistory.length - 1] -
+    entity.headingHistory[Math.max(0, entity.headingHistory.length - 3)]
+  );
+  if (headingDiff > Math.PI * 0.4) return true;
+
+  return false;
+}
+
+// ===== MAIN COLLISION SCORING =====
+function scoreCollision(a: TrackedEntity, b: TrackedEntity): {
   score: number;
   reason: string;
 } | null {
-  const dist = Math.sqrt(
-    (a.kalman.getState().x - b.kalman.getState().x) ** 2 +
-    (a.kalman.getState().y - b.kalman.getState().y) ** 2
-  );
-  const combinedR = (Math.sqrt(a.w * a.h) + Math.sqrt(b.w * b.h)) / 2;
+  const d = dist(a, b);
+  const cr = combinedR(a, b);
 
-  // HARD FILTER: Must be close range (within 1.5x combined radius)
-  if (dist > combinedR * 1.5) return null;
+  // HARD RULE: Must be close range
+  if (d > cr * 1.5) return null;
+
+  // HARD RULE: If both moving fast, it's passing — skip
+  if (a.speed > 1.5 && b.speed > 1.5) return null;
 
   let score = 0;
   const reasons: string[] = [];
 
-  // ===== SIGNAL 1: Overlapping bounding boxes (strongest) =====
-  if (areOverlapping(a, b)) {
-    score += 0.5;
+  // ===== Overlapping: strongest signal =====
+  if (isOverlapping(a, b)) {
+    score += 0.6;
     reasons.push("overlap");
   }
 
-  // ===== SIGNAL 2: One object stopped after being fast =====
-  const aStopped = wasMovingNowStopped(a);
-  const bStopped = wasMovingNowStopped(b);
+  // ===== Very close proximity =====
+  if (isVeryClose(a, b)) {
+    score += 0.15;
+    reasons.push("touching");
+  }
+
+  // ===== One stopped after being fast =====
+  const aStopped = wasFast(a) && isStopped(a);
+  const bStopped = wasFast(b) && isStopped(b);
 
   if (aStopped) {
-    score += 0.4;
-    reasons.push("A_stopped");
+    // Only count if also close to the other object
+    if (isVeryClose(a, b) || isOverlapping(a, b)) {
+      score += 0.3;
+      reasons.push("A_stopped_near");
+    }
   }
   if (bStopped) {
-    score += 0.4;
-    reasons.push("B_stopped");
+    if (isVeryClose(a, b) || isOverlapping(a, b)) {
+      score += 0.3;
+      reasons.push("B_stopped_near");
+    }
   }
 
-  // ===== SIGNAL 3: Stationary at this spot (sustained) =====
-  if (isStationary(a) && a.speedHistory.some(s => s > 2)) {
+  // ===== Both stopped after both were moving (post-impact) =====
+  if (aStopped && bStopped && wasFast(a) && wasFast(b)) {
     score += 0.2;
+    reasons.push("both_stopped");
+  }
+
+  // ===== Stationary at this position =====
+  if (isStationary(a) && wasFast(a)) {
+    score += 0.1;
     reasons.push("A_stationary");
   }
-  if (isStationary(b) && b.speedHistory.some(s => s > 2)) {
-    score += 0.2;
+  if (isStationary(b) && wasFast(b)) {
+    score += 0.1;
     reasons.push("B_stationary");
   }
 
-  // ===== SIGNAL 4: Bike fell =====
-  if (detectBikeFall(a)) {
-    score += 0.5;
-    reasons.push("bike_A_fell");
-  }
-  if (detectBikeFall(b)) {
-    score += 0.5;
-    reasons.push("bike_B_fell");
-  }
-
-  // ===== SIGNAL 5: Person thrown =====
-  if (detectPersonThrown(a)) {
-    score += 0.4;
-    reasons.push("person_A_thrown");
-  }
-  if (detectPersonThrown(b)) {
-    score += 0.4;
-    reasons.push("person_B_thrown");
-  }
-
   // ===== PENALTIES =====
-  // Both objects still moving fast = passing through, not collision
-  const speedA = a.speed;
-  const speedB = b.speed;
-  if (speedA > 1.5 && speedB > 1.5) {
-    score -= 0.6;
-    reasons.push("BOTH_MOVING");
-  }
-
-  // Same direction = parallel traffic
   const angleA = a.heading;
   const angleB = b.heading;
   let angleDiff = Math.abs(angleA - angleB);
   if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
   if (angleDiff < Math.PI * 0.3) {
-    score -= 0.3;
+    score -= 0.2;
     reasons.push("parallel");
   }
 
-  if (score < 0.4) return null;
+  // Far apart (close to threshold) = less likely collision
+  if (d > cr * 1.2) {
+    score -= 0.2;
+    reasons.push("far");
+  }
+
+  if (score < 0.5) return null;
 
   return { score: Math.min(score, 1), reason: reasons.join("+") };
 }
 
-// Find all collision pairs
+// ===== EXPORTS =====
+
 export function findAllTTCPairs(entities: TrackedEntity[]): TTCPair[] {
   const pairs: TTCPair[] = [];
   const candidates = entities.filter(e => e.age >= 1);
@@ -226,90 +181,81 @@ export function findAllTTCPairs(entities: TrackedEntity[]): TTCPair[] {
       const a = candidates[i], b = candidates[j];
       if (a.class === "person" && b.class === "person") continue;
 
-      const result = computeCollisionScore(a, b);
+      const result = scoreCollision(a, b);
       if (!result) continue;
-
-      const dist = Math.sqrt(
-        (a.kalman.getState().x - b.kalman.getState().x) ** 2 +
-        (a.kalman.getState().y - b.kalman.getState().y) ** 2
-      );
 
       let severity: TTCPair["severity"] = "none";
       if (result.score >= 0.7) severity = "impact";
       else if (result.score >= 0.55) severity = "critical";
-      else if (result.score >= 0.4) severity = "warning";
+      else severity = "warning";
 
-      pairs.push({
-        a, b, ttc: NaN, distance: dist, closingSpeed: 0, severity,
-      });
+      pairs.push({ a, b, ttc: NaN, distance: dist(a, b), closingSpeed: 0, severity });
     }
   }
 
-  pairs.sort((a, b) => b.distance - a.distance);
+  pairs.sort((a, b) => a.distance - b.distance); // closest first
   return pairs;
 }
 
-// Post-impact: both stopped + overlapping + were moving
 export function detectPostImpact(entities: TrackedEntity[], ttcPairs: TTCPair[]): AccidentEvidence | null {
   for (const pair of ttcPairs) {
-    if (pair.distance > 50) continue;
-
-    const speedA = pair.a.speed;
-    const speedB = pair.b.speed;
-
-    // Both must be nearly stopped
-    if (speedA > 0.5 || speedB > 0.5) continue;
-
-    // Both must have been moving recently
-    const wasMovingA = pair.a.speedHistory.length >= 3 && pair.a.speedHistory.some(s => s > 2);
-    const wasMovingB = pair.b.speedHistory.length >= 3 && pair.b.speedHistory.some(s => s > 2);
-    if (!wasMovingA || !wasMovingB) continue;
+    if (pair.distance > 60) continue;
+    if (!isStopped(pair.a) || !isStopped(pair.b)) continue;
+    if (!wasFast(pair.a) || !wasFast(pair.b)) continue;
+    if (!isOverlapping(pair.a, pair.b) && !isVeryClose(pair.a, pair.b)) continue;
 
     return {
       type: "post_impact",
       confidence: 0.9,
       objects: [pair.a.id, pair.b.id],
-      details: `Both stopped after moving (dist: ${pair.distance.toFixed(0)}px)`,
+      details: `Both stopped + close (dist: ${pair.distance.toFixed(0)}px)`,
     };
   }
   return null;
 }
 
-// Main detection
 export function detectAccidents(
   entities: TrackedEntity[],
   ttcPairs: TTCPair[]
 ): AccidentEvidence[] {
   const evidence: AccidentEvidence[] = [];
 
-  // Active collision (speed change + close proximity)
+  // Active collision
   for (const pair of ttcPairs) {
     if (pair.severity === "impact" || pair.severity === "critical") {
-      const result = computeCollisionScore(pair.a, pair.b);
+      const result = scoreCollision(pair.a, pair.b);
       if (result && result.score >= 0.5) {
         evidence.push({
           type: "collision",
           confidence: Math.min(0.95, result.score),
           objects: [pair.a.id, pair.b.id],
-          details: `score: ${result.score.toFixed(2)} | ${result.reason} | dist: ${pair.distance.toFixed(0)}px`,
+          details: `score:${result.score.toFixed(2)} ${result.reason} dist:${pair.distance.toFixed(0)}px`,
         });
       }
     }
   }
 
-  // Post-impact (most reliable)
+  // Post-impact
   const postImpact = detectPostImpact(entities, ttcPairs);
   if (postImpact) evidence.push(postImpact);
 
-  // Bike falls (standalone — bike fell after being hit)
+  // Bike falls (standalone — bike was moving, now stopped with heading change)
   for (const entity of entities) {
-    if (detectBikeFall(entity)) {
-      evidence.push({
-        type: "bike_fall",
-        confidence: 0.75,
-        objects: [entity.id],
-        details: `Bike fell: heading change + stopped`,
-      });
+    if (isBikeFall(entity)) {
+      // Only alert if bike is close to another object (likely hit by something)
+      const nearbyVehicle = entities.find(e =>
+        e.id !== entity.id &&
+        (e.class === "car" || e.class === "motorcycle") &&
+        dist(e, entity) < combinedR(e, entity) * 3
+      );
+      if (nearbyVehicle) {
+        evidence.push({
+          type: "bike_fall",
+          confidence: 0.8,
+          objects: [entity.id, nearbyVehicle.id],
+          details: `Bike fell near vehicle #${nearbyVehicle.id}`,
+        });
+      }
     }
   }
 

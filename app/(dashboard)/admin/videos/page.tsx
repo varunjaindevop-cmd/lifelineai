@@ -442,10 +442,10 @@ export default function VideoAnalysisPage() {
     alert: "bg-red-500/20 text-red-500 animate-pulse",
   };
 
-  const envModes: { key: EnvMode; label: string; icon: React.ReactNode; color: string }[] = [
+  const envModes: { key: EnvMode; label: string; icon: React.ReactNode; color: string; disabled?: boolean }[] = [
     { key: "isolated", label: "Isolated Road", icon: <Car size={14} />, color: "blue" },
-    { key: "traffic", label: "Traffic", icon: <Car size={14} />, color: "orange" },
-    { key: "marketplace", label: "Marketplace", icon: <Users size={14} />, color: "purple" },
+    { key: "traffic", label: "Traffic (Beta)", icon: <Car size={14} />, color: "orange", disabled: true },
+    { key: "marketplace", label: "Marketplace", icon: <Users size={14} />, color: "purple", disabled: true },
   ];
 
   return (
@@ -511,9 +511,11 @@ export default function VideoAnalysisPage() {
                   <span className="text-muted-foreground text-xs">{selectedClip.name}</span>
                   <div className="flex gap-1 ml-auto">
                     {envModes.map(m => (
-                      <button key={m.key} onClick={() => setEnvMode(m.key)}
+                      <button key={m.key} onClick={() => !m.disabled && setEnvMode(m.key)}
+                        disabled={m.disabled}
                         className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
-                          envMode === m.key
+                          m.disabled ? "bg-gray-700 text-gray-500 cursor-not-allowed opacity-50"
+                          : envMode === m.key
                             ? m.color === "blue" ? "bg-blue-600 text-white" : m.color === "orange" ? "bg-orange-600 text-white" : "bg-purple-600 text-white"
                             : "bg-card border border-border text-muted-foreground hover:bg-background"
                         }`}>
