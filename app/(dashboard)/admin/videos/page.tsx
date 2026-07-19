@@ -85,17 +85,31 @@ export default function VideoAnalysisPage() {
     };
   }, []);
 
-  // When clip is selected, auto-play it
+  // When clip is selected, mark as not ready; src is set in JSX
   useEffect(() => {
-    if (!selectedClip || !videoRef.current) return;
     setVideoReady(false);
-    const video = videoRef.current;
-    video.src = selectedClip.src;
-    video.load();
-    const onReady = () => setVideoReady(true);
-    video.addEventListener("loadeddata", onReady);
-    return () => video.removeEventListener("loadeddata", onReady);
+    prevFrameRef.current = null;
+
+    // Timeout fallback: force ready after 8 seconds even if events don't fire
+    const timeout = setTimeout(() => {
+      setVideoReady(true);
+    }, 8000);
+
+    return () => clearTimeout(timeout);
   }, [selectedClip]);
+
+  const handleVideoReady = () => {
+    setVideoReady(true);
+  };
+
+  const handleVideoError = () => {
+    // Retry once after a short delay
+    setTimeout(() => {
+      if (videoRef.current) {
+        videoRef.current.load();
+      }
+    }, 1000);
+  };
 
   const captureFrame = useCallback((): ImageData | null => {
     const video = videoRef.current;
@@ -317,9 +331,18 @@ export default function VideoAnalysisPage() {
     try {
       await video.play();
     } catch {
-      toast.error("Could not play video. Try again.");
-      return;
+      // If autoplay is blocked, try unmuting
+      video.muted = false;
+      try {
+        await video.play();
+      } catch {
+        toast.error("Could not play video. Try again.");
+        return;
+      }
     }
+
+    // Force ready if not yet
+    setVideoReady(true);
 
     setIsAnalyzing(true);
     setDetections([]);
@@ -515,10 +538,14 @@ export default function VideoAnalysisPage() {
                 <div className="aspect-video bg-black relative">
                   <video
                     ref={videoRef}
+                    src={selectedClip.src}
                     className="w-full h-full object-contain"
                     playsInline
                     muted
                     loop
+                    onLoadedData={handleVideoReady}
+                    onCanPlay={handleVideoReady}
+                    onError={handleVideoError}
                   />
                   <canvas
                     ref={canvasRef}
