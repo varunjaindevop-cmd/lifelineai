@@ -1,15 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { createClient } from "@/lib/supabase/client";
 import {
   Camera,
   Plus,
-  Edit,
   Trash2,
   MapPin,
   ToggleLeft,
   ToggleRight,
+  Play,
+  Pause,
+  Video,
 } from "lucide-react";
 import { toast } from "sonner";
 import Link from "next/link";
@@ -23,6 +25,123 @@ interface Camera {
   stream_url: string;
   stream_type: string;
   is_active: boolean;
+}
+
+// Demo video clips mapped to cameras
+const DEMO_CLIPS: Record<string, { src: string; label: string }> = {
+  accident_sample: { src: "/videos/accident_sample.mp4", label: "Accident Sample" },
+  camera2_demo: { src: "/videos/camera2_demo.mp4", label: "Camera 2 Demo" },
+  camera4_demo: { src: "/videos/camera4_demo.mp4", label: "Camera 4 Demo" },
+  checking: { src: "/videos/checking.mp4", label: "System Check" },
+};
+
+const DEMO_CLIP_KEYS = Object.keys(DEMO_CLIPS);
+
+function CameraCard({ camera, clipIndex }: { camera: Camera; clipIndex: number }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const clip = DEMO_CLIPS[DEMO_CLIP_KEYS[clipIndex % DEMO_CLIP_KEYS.length]];
+
+  const togglePlay = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!videoRef.current) return;
+    if (isPlaying) {
+      videoRef.current.pause();
+      setIsPlaying(false);
+    } else {
+      videoRef.current.play();
+      setIsPlaying(true);
+    }
+  };
+
+  return (
+    <div className="bg-card rounded-xl border border-border overflow-hidden">
+      {/* Video preview */}
+      <div className="aspect-video bg-black relative group">
+        <video
+          ref={videoRef}
+          src={clip.src}
+          className="w-full h-full object-cover"
+          muted
+          loop
+          playsInline
+          preload="metadata"
+          onMouseEnter={() => {
+            if (videoRef.current) videoRef.current.play();
+            setIsPlaying(true);
+          }}
+          onMouseLeave={() => {
+            if (videoRef.current) {
+              videoRef.current.pause();
+              videoRef.current.currentTime = 0;
+            }
+            setIsPlaying(false);
+          }}
+        />
+        {/* Play/Pause overlay */}
+        <button
+          onClick={togglePlay}
+          className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/30 transition-colors"
+        >
+          <div className={`w-12 h-12 rounded-full bg-black/50 flex items-center justify-center transition-opacity ${isPlaying ? "opacity-0 group-hover:opacity-100" : "opacity-100"}`}>
+            {isPlaying ? (
+              <Pause className="w-5 h-5 text-white" />
+            ) : (
+              <Play className="w-5 h-5 text-white ml-0.5" />
+            )}
+          </div>
+        </button>
+        {/* Clip badge */}
+        <div className="absolute top-2 left-2 flex items-center gap-1 bg-black/60 px-2 py-1 rounded text-xs text-white">
+          <Video size={10} />
+          {clip.label}
+        </div>
+        {!camera.is_active && (
+          <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+            <span className="px-3 py-1 bg-severity-critical/20 text-severity-critical rounded text-sm">
+              Offline
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Info */}
+      <div className="p-4">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="font-semibold">{camera.name}</h3>
+          <button
+            className={camera.is_active ? "text-green-500" : "text-muted-foreground"}
+          >
+            {camera.is_active ? <ToggleRight size={24} /> : <ToggleLeft size={24} />}
+          </button>
+        </div>
+        <p className="text-sm text-muted-foreground flex items-center gap-1 mb-3">
+          <MapPin size={12} />
+          {camera.location_name || "No location set"}
+        </p>
+        <div className="flex items-center justify-between">
+          <span className="px-2 py-1 bg-card border border-border rounded text-xs">
+            {camera.stream_type.toUpperCase()}
+          </span>
+          <div className="flex gap-2">
+            <Link
+              href={`/cameras/${camera.id}`}
+              className="px-3 py-1 bg-primary/20 text-primary rounded text-sm hover:bg-primary/30"
+            >
+              View Feed
+            </Link>
+            <Link
+              href={`/admin/videos`}
+              className="px-3 py-1 bg-green-500/20 text-green-500 rounded text-sm hover:bg-green-500/30"
+            >
+              AI Analysis
+            </Link>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default function CamerasPage() {
@@ -85,13 +204,6 @@ export default function CamerasPage() {
     fetchCameras();
   };
 
-  const toggleCamera = async (id: string, currentState: boolean) => {
-    await supabase.from("cameras").update({ is_active: !currentState }).eq("id", id);
-    setCameras((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, is_active: !c.is_active } : c))
-    );
-  };
-
   const deleteCamera = async (id: string) => {
     if (!confirm("Are you sure you want to delete this camera?")) return;
 
@@ -129,67 +241,8 @@ export default function CamerasPage() {
             No cameras configured. Add your first camera!
           </div>
         ) : (
-          cameras.map((camera) => (
-            <div
-              key={camera.id}
-              className="bg-card rounded-xl border border-border overflow-hidden"
-            >
-              {/* Preview placeholder */}
-              <div className="aspect-video bg-background flex items-center justify-center relative">
-                <Camera className="w-12 h-12 text-muted-foreground" />
-                {!camera.is_active && (
-                  <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-                    <span className="px-3 py-1 bg-severity-critical/20 text-severity-critical rounded text-sm">
-                      Offline
-                    </span>
-                  </div>
-                )}
-              </div>
-
-              {/* Info */}
-              <div className="p-4">
-                <div className="flex items-center justify-between mb-2">
-                  <h3 className="font-semibold">{camera.name}</h3>
-                  <button
-                    onClick={() => toggleCamera(camera.id, camera.is_active)}
-                    className={
-                      camera.is_active
-                        ? "text-green-500"
-                        : "text-muted-foreground"
-                    }
-                  >
-                    {camera.is_active ? (
-                      <ToggleRight size={24} />
-                    ) : (
-                      <ToggleLeft size={24} />
-                    )}
-                  </button>
-                </div>
-                <p className="text-sm text-muted-foreground flex items-center gap-1 mb-3">
-                  <MapPin size={12} />
-                  {camera.location_name || "No location set"}
-                </p>
-                <div className="flex items-center justify-between">
-                  <span className="px-2 py-1 bg-card border border-border rounded text-xs">
-                    {camera.stream_type.toUpperCase()}
-                  </span>
-                  <div className="flex gap-2">
-                    <Link
-                      href={`/cameras/${camera.id}`}
-                      className="px-3 py-1 bg-primary/20 text-primary rounded text-sm hover:bg-primary/30"
-                    >
-                      View Feed
-                    </Link>
-                    <button
-                      onClick={() => deleteCamera(camera.id)}
-                      className="px-3 py-1 bg-severity-critical/20 text-severity-critical rounded text-sm hover:bg-severity-critical/30"
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
+          cameras.map((camera, index) => (
+            <CameraCard key={camera.id} camera={camera} clipIndex={index} />
           ))
         )}
       </div>
