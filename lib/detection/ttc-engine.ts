@@ -17,7 +17,7 @@ export interface TTCPair {
 }
 
 export interface AccidentEvidence {
-  type: "collision";
+  type: "collision" | "person_fall" | "bike_off_track";
   confidence: number;
   objects: number[];
   details: string;
@@ -121,6 +121,85 @@ function detectTrafficAlerts(entities: TrackedEntity[]): AccidentEvidence[] {
   return evidence;
 }
 
+// ========== PERSON FALL DETECTION ==========
+// Person was standing (tall bbox), now lying (wide bbox) + dropped in Y
+function detectPersonFall(entities: TrackedEntity[]): AccidentEvidence[] {
+  const evidence: AccidentEvidence[] = [];
+
+  for (const entity of entities) {
+    if (entity.class !== "person" || entity.age < 5) continue;
+    if (entity.aspectHistory.length < 4) continue;
+
+    const currentAR = entity.aspectHistory[entity.aspectHistory.length - 1];
+    const prevAR = (entity.aspectHistory[0] + entity.aspectHistory[1]) / 2;
+
+    // Standing person: aspect ratio < 0.7 (tall and narrow)
+    // Lying person: aspect ratio > 1.0 (wide)
+    const wasStanding = prevAR < 0.8;
+    const nowLying = currentAR > 0.9;
+
+    if (wasStanding && nowLying) {
+      // Also check Y position dropped (fell to ground)
+      const lastY = entity.positions[entity.positions.length - 1].y;
+      const prevY = entity.positions[Math.max(0, entity.positions.length - 3)].y;
+      const dropped = lastY > prevY + 3;
+
+      // And was moving (not just standing still)
+      const wasMoving = entity.speedHistory.some(s => s > 1);
+
+      if (dropped || wasMoving) {
+        evidence.push({
+          type: "person_fall",
+          confidence: 0.8,
+          objects: [entity.id],
+          details: `Person fell: AR ${prevAR.toFixed(2)}→${currentAR.toFixed(2)}, Y dropped`,
+        });
+      }
+    }
+  }
+
+  return evidence;
+}
+
+// ========== BIKE OFF-TRACK DETECTION ==========
+// Bike was moving straight, suddenly changed direction dramatically
+function detectBikeOffTrack(entities: TrackedEntity[]): AccidentEvidence[] {
+  const evidence: AccidentEvidence[] = [];
+
+  for (const entity of entities) {
+    if (entity.class !== "motorcycle" || entity.age < 5) continue;
+    if (entity.headingHistory.length < 5) continue;
+
+    // Check if heading changed dramatically in last 3 frames
+    const recentHeading = entity.headingHistory[entity.headingHistory.length - 1];
+    const prevHeading = entity.headingHistory[entity.headingHistory.length - 4];
+    let headingChange = Math.abs(recentHeading - prevHeading);
+    if (headingChange > Math.PI) headingChange = 2 * Math.PI - headingChange;
+
+    // Was moving fast, now heading changed > 60 degrees
+    const wasFast = entity.speedHistory.some(s => s > 2);
+    const significantChange = headingChange > Math.PI * 0.33; // 60 degrees
+
+    if (wasFast && significantChange) {
+      // Find nearby vehicle (likely what caused the off-track)
+      const nearbyVehicle = entities.find(e =>
+        e.id !== entity.id &&
+        (e.class === "car" || e.class === "motorcycle") &&
+        dist(e, entity) < combinedR(e, entity) * 4
+      );
+
+      evidence.push({
+        type: "bike_off_track",
+        confidence: 0.7,
+        objects: nearbyVehicle ? [entity.id, nearbyVehicle.id] : [entity.id],
+        details: `Bike heading changed ${(headingChange * 180 / Math.PI).toFixed(0)}°${nearbyVehicle ? ` near #${nearbyVehicle.id}` : ""}`,
+      });
+    }
+  }
+
+  return evidence;
+}
+
 // ========== EXPORTS ==========
 
 export function findAllTTCPairs(entities: TrackedEntity[]): TTCPair[] {
@@ -132,30 +211,35 @@ export function detectAccidents(
   ttcPairs: TTCPair[],
   envMode: "isolated" | "traffic" | "marketplace"
 ): AccidentEvidence[] {
+  let evidence: AccidentEvidence[] = [];
+
   if (envMode === "traffic") {
-    return detectTrafficAlerts(entities);
-  }
+    evidence = detectTrafficAlerts(entities);
+  } else {
+    // Isolated / marketplace: v3 scoring
+    const candidates = entities.filter(e => e.age >= 3);
 
-  // Isolated / marketplace: use v3 scoring
-  const evidence: AccidentEvidence[] = [];
-  const candidates = entities.filter(e => e.age >= 3);
+    for (let i = 0; i < candidates.length; i++) {
+      for (let j = i + 1; j < candidates.length; j++) {
+        const a = candidates[i], b = candidates[j];
+        if (a.class === "person" && b.class === "person") continue;
 
-  for (let i = 0; i < candidates.length; i++) {
-    for (let j = i + 1; j < candidates.length; j++) {
-      const a = candidates[i], b = candidates[j];
-      if (a.class === "person" && b.class === "person") continue;
-
-      const result = scoreIsolated(a, b);
-      if (result && result.score >= 0.5) {
-        evidence.push({
-          type: "collision",
-          confidence: Math.min(0.95, result.score),
-          objects: [a.id, b.id],
-          details: `score:${result.score.toFixed(2)} ${result.reason} dist:${dist(a, b).toFixed(0)}px`,
-        });
+        const result = scoreIsolated(a, b);
+        if (result && result.score >= 0.5) {
+          evidence.push({
+            type: "collision",
+            confidence: Math.min(0.95, result.score),
+            objects: [a.id, b.id],
+            details: `score:${result.score.toFixed(2)} ${result.reason} dist:${dist(a, b).toFixed(0)}px`,
+          });
+        }
       }
     }
   }
+
+  // Add fall and off-track detection for ALL modes
+  evidence.push(...detectPersonFall(entities));
+  evidence.push(...detectBikeOffTrack(entities));
 
   evidence.sort((a, b) => b.confidence - a.confidence);
   return evidence;

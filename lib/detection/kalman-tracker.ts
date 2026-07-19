@@ -115,15 +115,15 @@ export interface TrackedEntity {
   confidence: number;
   kalman: KalmanTracker;
   lastSeen: number;
-  age: number;           // frames tracked
+  age: number;
   positions: { x: number; y: number }[];
   speedHistory: number[];
   headingHistory: number[];
-  // Derived
-  speed: number;         // Kalman-smoothed speed (pixels/frame)
+  aspectHistory: number[];
+  speed: number;
   heading: number;
   acceleration: number;
-  w: number; h: number;  // latest bounding box
+  w: number; h: number;
 }
 
 export class MultiObjectTracker {
@@ -174,6 +174,9 @@ export class MultiObjectTracker {
         if (entity.speedHistory.length > 10) entity.speedHistory.shift();
         entity.headingHistory.push(entity.heading);
         if (entity.headingHistory.length > 10) entity.headingHistory.shift();
+        const ar = det.w / Math.max(det.h, 1);
+        entity.aspectHistory.push(ar);
+        if (entity.aspectHistory.length > 10) entity.aspectHistory.shift();
         
         matched.add(bestDet);
       }
@@ -190,6 +193,7 @@ export class MultiObjectTracker {
         id, class: det.class, confidence: det.confidence,
         kalman, lastSeen: frame, age: 1,
         positions: [pos], speedHistory: [0], headingHistory: [0],
+        aspectHistory: [det.w / Math.max(det.h, 1)],
         speed: 0, heading: 0, acceleration: 0,
         w: det.w, h: det.h,
       });

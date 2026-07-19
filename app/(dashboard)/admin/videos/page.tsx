@@ -160,7 +160,7 @@ export default function VideoAnalysisPage() {
     }
     ctx.clearRect(0, 0, videoW, videoH);
 
-    // Draw objects
+    // Draw objects with ESP boxes
     for (const entity of entities) {
       if (entity.age < 1) continue;
       const isInvolved = evidence.some(e => e.objects.includes(entity.id));
@@ -169,30 +169,67 @@ export default function VideoAnalysisPage() {
       const cx = entity.kalman.getState().x, cy = entity.kalman.getState().y;
       const bx = cx - entity.w / 2, by = cy - entity.h / 2;
 
+      // Bounding box with rounded corners effect
       ctx.strokeStyle = color;
       ctx.lineWidth = isInvolved ? 3 : 2;
       ctx.strokeRect(bx, by, entity.w, entity.h);
 
-      // Heading arrow
-      const arrowLen = Math.min(entity.w, entity.h) * 0.5;
+      // Corner markers for precision
+      const cornerLen = Math.min(8, entity.w * 0.15, entity.h * 0.15);
+      ctx.lineWidth = 3;
+      // Top-left
+      ctx.beginPath(); ctx.moveTo(bx, by + cornerLen); ctx.lineTo(bx, by); ctx.lineTo(bx + cornerLen, by); ctx.stroke();
+      // Top-right
+      ctx.beginPath(); ctx.moveTo(bx + entity.w - cornerLen, by); ctx.lineTo(bx + entity.w, by); ctx.lineTo(bx + entity.w, by + cornerLen); ctx.stroke();
+      // Bottom-left
+      ctx.beginPath(); ctx.moveTo(bx, by + entity.h - cornerLen); ctx.lineTo(bx, by + entity.h); ctx.lineTo(bx + cornerLen, by + entity.h); ctx.stroke();
+      // Bottom-right
+      ctx.beginPath(); ctx.moveTo(bx + entity.w - cornerLen, by + entity.h); ctx.lineTo(bx + entity.w, by + entity.h); ctx.lineTo(bx + entity.w, by + entity.h - cornerLen); ctx.stroke();
+
+      // Heading arrow with arrowhead
+      const arrowLen = Math.min(entity.w, entity.h) * 0.6;
+      const endX = cx + Math.cos(entity.heading) * arrowLen;
+      const endY = cy + Math.sin(entity.heading) * arrowLen;
       ctx.beginPath();
       ctx.moveTo(cx, cy);
-      ctx.lineTo(cx + Math.cos(entity.heading) * arrowLen, cy + Math.sin(entity.heading) * arrowLen);
+      ctx.lineTo(endX, endY);
       ctx.strokeStyle = isInvolved ? "#ef4444" : "#fff";
       ctx.lineWidth = 2;
       ctx.stroke();
+      // Arrowhead
+      const headLen = 6;
+      const headAngle = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(endX, endY);
+      ctx.lineTo(endX - headLen * Math.cos(entity.heading - headAngle), endY - headLen * Math.sin(entity.heading - headAngle));
+      ctx.moveTo(endX, endY);
+      ctx.lineTo(endX - headLen * Math.cos(entity.heading + headAngle), endY - headLen * Math.sin(entity.heading + headAngle));
+      ctx.stroke();
 
-      // Label
+      // Trail (last 5 positions)
+      if (entity.positions.length > 1) {
+        ctx.beginPath();
+        ctx.strokeStyle = `${color}66`;
+        ctx.lineWidth = 1;
+        const trail = entity.positions.slice(-5);
+        for (let i = 0; i < trail.length; i++) {
+          i === 0 ? ctx.moveTo(trail[i].x, trail[i].y) : ctx.lineTo(trail[i].x, trail[i].y);
+        }
+        ctx.stroke();
+      }
+
+      // ESP info label
       const { current: speedKmh } = calculateRealSpeed(entity, pixelsPerMeterRef.current);
       const corrected = perspectiveCorrectedSpeed(speedKmh, cy, videoH);
-      const accelLabel = entity.acceleration < -0.3 ? " BRAKE" : "";
-      const label = `${entity.class} ${corrected}km/h${accelLabel}`;
-      ctx.font = "bold 11px Arial";
+      const accelLabel = entity.acceleration < -0.3 ? " BRAKE" : entity.acceleration > 0.3 ? " ACC" : "";
+      const headingDeg = Math.round(entity.heading * 180 / Math.PI);
+      const label = `#${entity.id} ${entity.class} ${corrected}km/h ${headingDeg}°${accelLabel}`;
+      ctx.font = "bold 10px monospace";
       const tw = ctx.measureText(label).width;
-      ctx.fillStyle = isInvolved ? "#ef4444" : "rgba(0,0,0,0.75)";
-      ctx.fillRect(bx, by - 18, tw + 8, 16);
+      ctx.fillStyle = isInvolved ? "#ef4444" : "rgba(0,0,0,0.8)";
+      ctx.fillRect(bx, by - 20, tw + 8, 18);
       ctx.fillStyle = "#fff";
-      ctx.fillText(label, bx + 4, by - 5);
+      ctx.fillText(label, bx + 4, by - 6);
     }
 
     // TTC lines
@@ -373,16 +410,13 @@ export default function VideoAnalysisPage() {
         const hasCollision = evidence.length > 0;
 
         if (hasCollision) consecutiveAnomalyRef.current++;
-        else consecutiveAnomalyRef.current = 0; // instant reset when no collision
+        else consecutiveAnomalyRef.current = 0;
 
         let st = stateRef.current;
 
-        // Alert immediately on collision (no waiting)
         if (hasCollision && consecutiveAnomalyRef.current >= 2) {
           st = "alert";
-        }
-        // Instant decay when no collision
-        else if (!hasCollision) {
+        } else if (!hasCollision) {
           st = "monitoring";
         }
 
@@ -393,7 +427,15 @@ export default function VideoAnalysisPage() {
 
           const topEv = evidence[0];
           let incidentType = "vehicle_collision";
-          let severity = topEv?.confidence === 0.9 ? "critical" : "major";
+          let severity = "major";
+
+          if (topEv?.type === "person_fall") {
+            incidentType = "pedestrian_collision";
+          } else if (topEv?.type === "bike_off_track") {
+            incidentType = "vehicle_collision";
+          } else if (topEv?.confidence && topEv.confidence > 0.8) {
+            severity = "critical";
+          }
 
           if (incidentType) {
             createIncident({
