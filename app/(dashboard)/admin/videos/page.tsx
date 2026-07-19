@@ -3,15 +3,8 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import {
-  ArrowLeft,
-  Video,
-  Play,
-  Pause,
-  AlertTriangle,
-  Clock,
-  Navigation,
-  RotateCcw,
-  Loader2,
+  ArrowLeft, Video, Play, Pause, AlertTriangle, Clock,
+  Navigation, RotateCcw, Loader2, Zap,
 } from "lucide-react";
 import Link from "next/link";
 import { toast } from "sonner";
@@ -20,15 +13,6 @@ interface VideoClip {
   name: string;
   src: string;
   description: string;
-}
-
-interface Detection {
-  class: string;
-  confidence: number;
-  bbox: [number, number, number, number];
-  speed?: number;
-  id?: number;
-  consecutiveFramesNear?: number;
 }
 
 interface IncidentAlert {
@@ -40,84 +24,51 @@ interface IncidentAlert {
   longitude: number;
 }
 
-interface TrackedBlob {
-  id: number;
-  class: "person" | "car" | "bike";
-  cx: number;
-  cy: number;
-  w: number;
-  h: number;
-  vx: number;
-  vy: number;
-  framesTracked: number;
-  lastSeen: number;
-  speedKmh: number;
-  consecutiveFramesNear: number;
-  prevPositions: { x: number; y: number }[];
-  classHistory: string[];      // last N classifications for smoothing
+interface MotionMetrics {
+  totalEnergy: number;       // total motion in frame (0-1)
+  maxRegionEnergy: number;   // hottest region (0-1)
+  motionGradient: number;    // how fast motion is changing
+  hotspots: { x: number; y: number; energy: number; w: number; h: number }[];
 }
 
 const VIDEO_CLIPS: VideoClip[] = [
-  {
-    name: "accident_sample.mp4",
-    src: "/videos/accident_sample.mp4",
-    description: "Vehicle collision scenario — expect accident detection",
-  },
-  {
-    name: "camera2_demo.mp4",
-    src: "/videos/camera2_demo.mp4",
-    description: "Camera 2 feed — traffic monitoring demo",
-  },
-  {
-    name: "camera4_demo.mp4",
-    src: "/videos/camera4_demo.mp4",
-    description: "Camera 4 feed — intersection monitoring demo",
-  },
-  {
-    name: "checking.mp4",
-    src: "/videos/checking.mp4",
-    description: "Test clip — system verification",
-  },
+  { name: "accident_sample.mp4", src: "/videos/accident_sample.mp4", description: "Vehicle collision scenario" },
+  { name: "camera2_demo.mp4", src: "/videos/camera2_demo.mp4", description: "Traffic monitoring demo" },
+  { name: "camera4_demo.mp4", src: "/videos/camera4_demo.mp4", description: "Intersection monitoring demo" },
+  { name: "checking.mp4", src: "/videos/checking.mp4", description: "System verification clip" },
 ];
 
 const DEMO_LAT = 22.7196;
 const DEMO_LNG = 75.8577;
 
-let nextBlobId = 1;
-
 export default function VideoAnalysisPage() {
   const [selectedClip, setSelectedClip] = useState<VideoClip | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [videoReady, setVideoReady] = useState(false);
-  const [detections, setDetections] = useState<Detection[]>([]);
   const [incidents, setIncidents] = useState<IncidentAlert[]>([]);
   const [currentState, setCurrentState] = useState("monitoring");
-  const [sceneChange, setSceneChange] = useState(0);
+  const [motionMetrics, setMotionMetrics] = useState<MotionMetrics | null>(null);
+  const [motionHistory, setMotionHistory] = useState<number[]>([]);
   const [demoMode, setDemoMode] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const analysisCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
-  const prevFrameRef = useRef<ImageData | null>(null);
   const stateRef = useRef("monitoring");
   const frameCountRef = useRef(0);
-  const trackedBlobsRef = useRef<TrackedBlob[]>([]);
-  const alertedRef = useRef(false);
   const stateFrameRef = useRef(0);
   const alertCooldownRef = useRef(0);
-  const frameBufferRef = useRef<ImageData[]>([]);
-  const avgSceneMotionRef = useRef(0.05); // running average of scene motion
+  const prevFrameRef = useRef<ImageData | null>(null);
+  const motionHistoryRef = useRef<number[]>([]);
+  const bgModelRef = useRef<Float32Array | null>(null); // running background model
   const supabase = createClient();
 
   useEffect(() => {
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
   }, []);
 
   useEffect(() => {
     setVideoReady(false);
-    prevFrameRef.current = null;
     const timeout = setTimeout(() => setVideoReady(true), 8000);
     return () => clearTimeout(timeout);
   }, [selectedClip]);
@@ -128,9 +79,7 @@ export default function VideoAnalysisPage() {
   };
 
   const getAnalysisCanvas = useCallback(() => {
-    if (!analysisCanvasRef.current) {
-      analysisCanvasRef.current = document.createElement("canvas");
-    }
+    if (!analysisCanvasRef.current) analysisCanvasRef.current = document.createElement("canvas");
     return analysisCanvasRef.current;
   }, []);
 
@@ -146,11 +95,163 @@ export default function VideoAnalysisPage() {
     return ctx.getImageData(0, 0, 320, 240);
   }, [getAnalysisCanvas]);
 
-  // Draw bounding boxes on the visible canvas overlay (scaled from 320x240 to display size)
-  const drawDetections = (dets: Detection[]) => {
+  // ========== MOTION ENERGY ANALYSIS ==========
+  // This is how real surveillance systems detect accidents —
+  // by measuring anomalous motion patterns, not by identifying objects.
+
+  const analyzeMotion = useCallback((currFrame: ImageData, prevFrame: ImageData, frameNum: number): MotionMetrics => {
+    const w = currFrame.width;
+    const h = currFrame.height;
+    const curr = currFrame.data;
+    const prev = prevFrame.data;
+    const totalPixels = w * h;
+
+    // Step 1: Compute per-pixel motion magnitude
+    const motionMap = new Float32Array(totalPixels);
+    let totalMotion = 0;
+    let maxMotion = 0;
+
+    for (let i = 0; i < totalPixels; i++) {
+      const idx = i * 4;
+      const grayCurr = curr[idx] * 0.299 + curr[idx + 1] * 0.587 + curr[idx + 2] * 0.114;
+      const grayPrev = prev[idx] * 0.299 + prev[idx + 1] * 0.587 + prev[idx + 2] * 0.114;
+      const diff = Math.abs(grayCurr - grayPrev) / 255;
+      motionMap[i] = diff;
+      totalMotion += diff;
+      if (diff > maxMotion) maxMotion = diff;
+    }
+
+    const totalEnergy = totalMotion / totalPixels;
+
+    // Step 2: Update background model (slow-moving average)
+    if (!bgModelRef.current) {
+      bgModelRef.current = new Float32Array(totalPixels);
+      for (let i = 0; i < totalPixels; i++) {
+        bgModelRef.current[i] = curr[i * 4] * 0.299 + curr[i * 4 + 1] * 0.587 + curr[i * 4 + 2] * 0.114;
+      }
+    } else {
+      const alpha = 0.02; // slow adaptation
+      for (let i = 0; i < totalPixels; i++) {
+        const gray = curr[i * 4] * 0.299 + curr[i * 4 + 1] * 0.587 + curr[i * 4 + 2] * 0.114;
+        bgModelRef.current[i] = bgModelRef.current[i] * (1 - alpha) + gray * alpha;
+      }
+    }
+
+    // Step 3: Find hotspots (regions with concentrated motion)
+    const blockSize = 32;
+    const hotspots: MotionMetrics["hotspots"] = [];
+
+    for (let by = 0; by < h; by += blockSize) {
+      for (let bx = 0; bx < w; bx += blockSize) {
+        let regionMotion = 0;
+        let count = 0;
+
+        for (let dy = 0; dy < blockSize && by + dy < h; dy++) {
+          for (let dx = 0; dx < blockSize && bx + dx < w; dx++) {
+            regionMotion += motionMap[(by + dy) * w + (bx + dx)];
+            count++;
+          }
+        }
+
+        const avgRegionMotion = count > 0 ? regionMotion / count : 0;
+
+        if (avgRegionMotion > 0.08) { // significant motion in this region
+          hotspots.push({
+            x: bx, y: by,
+            energy: avgRegionMotion,
+            w: Math.min(blockSize, w - bx),
+            h: Math.min(blockSize, h - by),
+          });
+        }
+      }
+    }
+
+    // Sort hotspots by energy, keep top 5
+    hotspots.sort((a, b) => b.energy - a.energy);
+    const topHotspots = hotspots.slice(0, 5);
+
+    const maxRegionEnergy = topHotspots.length > 0 ? topHotspots[0].energy : 0;
+
+    // Step 4: Motion gradient (how fast total motion is changing)
+    const history = motionHistoryRef.current;
+    history.push(totalEnergy);
+    if (history.length > 20) history.shift();
+
+    let motionGradient = 0;
+    if (history.length >= 5) {
+      const recent = history.slice(-5).reduce((a, b) => a + b, 0) / 5;
+      const older = history.slice(0, 5).reduce((a, b) => a + b, 0) / 5;
+      motionGradient = older > 0 ? (recent - older) / older : 0;
+    }
+
+    return { totalEnergy, maxRegionEnergy, motionGradient, hotspots: topHotspots };
+  }, []);
+
+  // ========== ACCIDENT DETECTION ==========
+  // Detects accidents by looking for ANOMALOUS motion patterns:
+  // 1. Sudden spike in total motion energy
+  // 2. Large, concentrated hotspot with high energy
+  // 3. Motion gradient positive (motion increasing)
+  // 4. Pattern persists for multiple frames
+
+  const detectAccident = useCallback((metrics: MotionMetrics, frameNum: number): { detected: boolean; confidence: number; type: string } => {
+    const history = motionHistoryRef.current;
+
+    // Need at least 10 frames of history for comparison
+    if (history.length < 10) return { detected: false, confidence: 0, type: "" };
+
+    // Calculate baseline motion (average of older frames)
+    const baseline = history.slice(0, Math.min(10, history.length - 5));
+    const baselineAvg = baseline.reduce((a, b) => a + b, 0) / baseline.length;
+    const baselineMax = Math.max(...baseline);
+
+    // Current motion
+    const currentEnergy = metrics.totalEnergy;
+    const currentHotspot = metrics.maxRegionEnergy;
+
+    // Anomaly scores
+    const energySpike = baselineAvg > 0 ? (currentEnergy - baselineAvg) / Math.max(baselineAvg, 0.01) : currentEnergy > 0.05 ? 3 : 0;
+    const hotspotIntensity = currentHotspot > 0.15 ? (currentHotspot / 0.15) : 0;
+    const gradientBoost = metrics.motionGradient > 0.5 ? 1 : metrics.motionGradient > 0 ? 0.5 : 0;
+
+    // Concentration: is motion focused in one area (collision) vs spread out (normal traffic)?
+    const hotspotCount = metrics.hotspots.length;
+    const concentration = hotspotCount > 0 && hotspotCount <= 3 ? 1 : hotspotCount <= 5 ? 0.6 : 0.3;
+
+    // Composite confidence
+    const confidence = Math.min(0.95,
+      0.3 * Math.min(energySpike / 3, 1) +      // energy spike
+      0.25 * hotspotIntensity +                    // hotspot intensity
+      0.2 * concentration +                        // motion concentration
+      0.15 * gradientBoost +                       // motion increasing
+      0.1 * (currentEnergy > 0.03 ? 1 : 0)        // baseline activity
+    );
+
+    // Thresholds — adaptive based on baseline
+    const spikeThreshold = baselineAvg > 0.01 ? 2.0 : 1.5; // lower for quiet scenes
+    const hotspotThreshold = 0.08;
+    const confidenceThreshold = 0.45;
+
+    const detected = energySpike > spikeThreshold &&
+                     currentHotspot > hotspotThreshold &&
+                     confidence > confidenceThreshold;
+
+    // Classify accident type based on characteristics
+    let type = "vehicle_collision";
+    if (hotspotCount <= 2 && currentHotspot > 0.2) {
+      type = "vehicle_collision"; // concentrated impact
+    } else if (hotspotCount > 3) {
+      type = "vehicle_collision"; // widespread debris/scattering
+    }
+
+    return { detected, confidence, type };
+  }, []);
+
+  // Draw motion visualization on canvas
+  const drawMotionOverlay = (metrics: MotionMetrics | null) => {
     const canvas = canvasRef.current;
     const video = videoRef.current;
-    if (!canvas || !video) return;
+    if (!canvas || !video || !metrics) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
@@ -161,485 +262,43 @@ export default function VideoAnalysisPage() {
     const scaleX = canvas.width / 320;
     const scaleY = canvas.height / 240;
 
-    dets.forEach((det) => {
-      const [x1, y1, x2, y2] = det.bbox;
-      const sx1 = x1 * scaleX;
-      const sy1 = y1 * scaleY;
-      const sx2 = x2 * scaleX;
-      const sy2 = y2 * scaleY;
-      const sw = sx2 - sx1;
-      const sh = sy2 - sy1;
-      const color = det.class === "person" ? "#3B82F6" : det.class === "bike" ? "#F97316" : "#22C55E";
+    // Draw hotspots as semi-transparent overlays
+    for (const spot of metrics.hotspots) {
+      const intensity = Math.min(spot.energy * 5, 1);
+      const color = intensity > 0.6 ? `rgba(255, 0, 0, ${intensity * 0.4})` :
+                    intensity > 0.3 ? `rgba(255, 165, 0, ${intensity * 0.3})` :
+                    `rgba(255, 255, 0, ${intensity * 0.2})`;
 
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-      ctx.strokeRect(sx1, sy1, sw, sh);
-
-      const label = `${det.class} ${(det.confidence * 100).toFixed(0)}%${det.speed ? ` | ${det.speed}km/h` : ""}`;
-      ctx.font = "bold 13px Arial";
-      const textW = ctx.measureText(label).width;
       ctx.fillStyle = color;
-      ctx.fillRect(sx1, sy1 - 22, textW + 10, 22);
-      ctx.fillStyle = "white";
-      ctx.fillText(label, sx1 + 5, sy1 - 6);
-    });
+      ctx.fillRect(spot.x * scaleX, spot.y * scaleY, spot.w * scaleX, spot.h * scaleY);
+
+      // Border for significant hotspots
+      if (intensity > 0.4) {
+        ctx.strokeStyle = intensity > 0.6 ? "red" : "orange";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(spot.x * scaleX, spot.y * scaleY, spot.w * scaleX, spot.h * scaleY);
+
+        // Label
+        ctx.fillStyle = "white";
+        ctx.font = "bold 12px Arial";
+        ctx.fillText(`${(intensity * 100).toFixed(0)}%`, spot.x * scaleX + 4, spot.y * scaleY + 16);
+      }
+    }
+
+    // Motion energy bar at bottom
+    const barY = canvas.height - 30;
+    const barWidth = canvas.width;
+    const energyWidth = Math.min(metrics.totalEnergy * barWidth * 10, barWidth);
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(0, barY, barWidth, 25);
+    ctx.fillStyle = metrics.totalEnergy > 0.05 ? "#ef4444" : metrics.totalEnergy > 0.02 ? "#f59e0b" : "#22c55e";
+    ctx.fillRect(0, barY, energyWidth, 25);
+    ctx.fillStyle = "white";
+    ctx.font = "11px Arial";
+    ctx.fillText(`Motion: ${(metrics.totalEnergy * 100).toFixed(1)}%`, 8, barY + 16);
   };
 
-  // Motion-based detection — adaptive thresholds based on scene motion level
-  const detectMotion = useCallback((currFrame: ImageData, prevFrame: ImageData, avgSceneMotion: number): Detection[] => {
-    const w = currFrame.width;
-    const h = currFrame.height;
-    const curr = currFrame.data;
-    const prev = prevFrame.data;
-
-    // Adaptive thresholds: low-motion scenes use lower thresholds to catch subtle events
-    const motionThreshold = avgSceneMotion < 0.05 ? 25 : avgSceneMotion < 0.1 ? 30 : 35;
-    const minBlobArea = avgSceneMotion < 0.05 ? 400 : avgSceneMotion < 0.1 ? 500 : 600;
-
-    // Step 1: Difference map with adaptive threshold
-    const diff = new Uint8Array(w * h);
-    for (let i = 0; i < diff.length; i++) {
-      const idx = i * 4;
-      const grayCurr = curr[idx] * 0.299 + curr[idx + 1] * 0.587 + curr[idx + 2] * 0.114;
-      const grayPrev = prev[idx] * 0.299 + prev[idx + 1] * 0.587 + prev[idx + 2] * 0.114;
-      diff[i] = Math.abs(grayCurr - grayPrev) > motionThreshold ? 255 : 0;
-    }
-
-    // Step 2: Aggressive dilation (merge nearby motion into big blobs)
-    const dilated = new Uint8Array(w * h);
-    const kernel = 8;
-    for (let y = kernel; y < h - kernel; y++) {
-      for (let x = kernel; x < w - kernel; x++) {
-        let max = 0;
-        for (let dy = -kernel; dy <= kernel; dy += 2) {
-          for (let dx = -kernel; dx <= kernel; dx += 2) {
-            if (diff[(y + dy) * w + (x + dx)] > max) max = diff[(y + dy) * w + (x + dx)];
-          }
-        }
-        dilated[y * w + x] = max;
-      }
-    }
-
-    // Step 3: Connected components — only large blobs survive
-    const visited = new Uint8Array(w * h);
-    const blobs: { x: number; y: number; w: number; h: number; cx: number; cy: number; area: number; motionDensity: number }[] = [];
-
-    for (let y = kernel; y < h - kernel; y += 4) {
-      for (let x = kernel; x < w - kernel; x += 4) {
-        if (visited[y * w + x] || dilated[y * w + x] === 0) continue;
-
-        let minX = x, maxX = x, minY = y, maxY = y, sumX = 0, sumY = 0, count = 0;
-        const queue = [x, y];
-        visited[y * w + x] = 1;
-
-        while (queue.length > 0) {
-          const qx = queue.shift()!;
-          const qy = queue.shift()!;
-          sumX += qx; sumY += qy; count++;
-          if (qx < minX) minX = qx; if (qx > maxX) maxX = qx;
-          if (qy < minY) minY = qy; if (qy > maxY) maxY = qy;
-
-          for (const [ddx, ddy] of [[-4, 0], [4, 0], [0, -4], [0, 4]]) {
-            const nx = qx + ddx, ny = qy + ddy;
-            if (nx >= 0 && nx < w && ny >= 0 && ny < h && !visited[ny * w + nx] && dilated[ny * w + nx] > 0) {
-              visited[ny * w + nx] = 1;
-              queue.push(nx, ny);
-            }
-          }
-        }
-
-        const blobW = maxX - minX;
-        const blobH = maxY - minY;
-        const area = blobW * blobH;
-
-        // Adaptive minimum blob size
-        if (area < minBlobArea || count < 30) continue;
-
-        // Motion density: what % of the bounding box is actually moving
-        const motionDensity = count / Math.max(area / 16, 1);
-
-        blobs.push({
-          x: minX, y: minY, w: blobW, h: blobH,
-          cx: sumX / count, cy: sumY / count,
-          area, motionDensity,
-        });
-      }
-    }
-
-    // Step 4: Strict classification — only confident detections
-    const dets: Detection[] = [];
-    const MAX_OBJECTS = 5; // hard cap on tracked objects
-
-    for (const blob of blobs) {
-      if (dets.length >= MAX_OBJECTS) break;
-
-      const aspectRatio = blob.w / Math.max(blob.h, 1);
-      const heightRatio = blob.h / Math.max(blob.w, 1);
-
-      let classification: "person" | "car" | "bike" | null = null;
-      let confidence = 0;
-
-      // CAR: large area + wide aspect ratio — high confidence
-      if (blob.area > 2500 && aspectRatio > 1.2) {
-        classification = "car";
-        confidence = Math.min(0.95, 0.7 + blob.area / 10000);
-      }
-      // PERSON: tall + narrow + small — high confidence
-      else if (heightRatio > 1.5 && blob.area < 1200 && blob.area > 600) {
-        classification = "person";
-        confidence = Math.min(0.90, 0.65 + blob.area / 3000);
-      }
-      // BIKE: medium area, roughly square
-      else if (blob.area > 1000 && blob.area < 2500 && aspectRatio > 0.7 && aspectRatio < 1.3) {
-        classification = "bike";
-        confidence = Math.min(0.85, 0.6 + blob.area / 5000);
-      }
-      // LARGE but ambiguous — could be car at angle
-      else if (blob.area > 3000) {
-        classification = "car";
-        confidence = Math.min(0.85, 0.6 + blob.area / 8000);
-      }
-
-      // SKIP low-confidence detections entirely
-      if (!classification || confidence < 0.65) continue;
-
-      dets.push({
-        class: classification,
-        confidence,
-        bbox: [blob.x, blob.y, blob.x + blob.w, blob.y + blob.h] as [number, number, number, number],
-        speed: classification === "car" ? 0 : undefined,
-      });
-    }
-
-    return dets;
-  }, []);
-
-  // Match new detections to tracked blobs
-  const trackBlobs = useCallback((dets: Detection[], frameNum: number): Detection[] => {
-    const tracked = trackedBlobsRef.current;
-    const matched = new Set<number>();
-    const FPS = 4; // analysis runs at ~4fps
-
-    // Match existing tracked blobs to new detections by proximity
-    for (const blob of tracked) {
-      let bestIdx = -1;
-      let bestDist = 60;
-
-      for (let i = 0; i < dets.length; i++) {
-        if (matched.has(i)) continue;
-        const d = dets[i];
-        const dcx = (d.bbox[0] + d.bbox[2]) / 2;
-        const dcy = (d.bbox[1] + d.bbox[3]) / 2;
-        const dist = Math.sqrt((blob.cx - dcx) ** 2 + (blob.cy - dcy) ** 2);
-        if (dist < bestDist) {
-          bestDist = dist;
-          bestIdx = i;
-        }
-      }
-
-      if (bestIdx >= 0) {
-        const d = dets[bestIdx];
-        const newCx = (d.bbox[0] + d.bbox[2]) / 2;
-        const newCy = (d.bbox[1] + d.bbox[3]) / 2;
-        blob.vx = newCx - blob.cx;
-        blob.vy = newCy - blob.cy;
-        blob.cx = newCx;
-        blob.cy = newCy;
-        blob.w = d.bbox[2] - d.bbox[0];
-        blob.h = d.bbox[3] - d.bbox[1];
-        blob.class = d.class as "person" | "car" | "bike";
-        blob.framesTracked++;
-        blob.lastSeen = frameNum;
-        matched.add(bestIdx);
-
-        // Compute speed from centroid displacement
-        // ~4 pixels per meter for 320x240 CCTV at typical road distance
-        const PPM = 4;
-        const pixelDist = Math.sqrt(blob.vx ** 2 + blob.vy ** 2);
-        const rawSpeedKmh = (pixelDist / PPM) * FPS * 3.6;
-
-        // Smooth positions over last 8 frames
-        blob.prevPositions.push({ x: newCx, y: newCy });
-        if (blob.prevPositions.length > 8) blob.prevPositions.shift();
-
-        if (blob.prevPositions.length >= 3) {
-          const positions = blob.prevPositions;
-          const oldest = positions[0];
-          const newest = positions[positions.length - 1];
-          const totalDist = Math.sqrt((newest.x - oldest.x) ** 2 + (newest.y - oldest.y) ** 2);
-          const totalFrames = positions.length - 1;
-          const avgPixelPerFrame = totalDist / totalFrames;
-          const smoothedSpeedKmh = (avgPixelPerFrame / PPM) * FPS * 3.6;
-          blob.speedKmh = Math.round(Math.max(15, Math.min(90, smoothedSpeedKmh)));
-        } else {
-          blob.speedKmh = Math.round(Math.max(15, Math.min(90, rawSpeedKmh)));
-        }
-
-        // Classification smoothing: use majority vote over last 5 frames
-        blob.classHistory.push(d.class);
-        if (blob.classHistory.length > 5) blob.classHistory.shift();
-        if (blob.classHistory.length >= 3) {
-          const counts: Record<string, number> = {};
-          for (const c of blob.classHistory) counts[c] = (counts[c] || 0) + 1;
-          const majority = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
-          blob.class = majority as "person" | "car" | "bike";
-        }
-      } else {
-        blob.framesTracked = 0;
-      }
-    }
-
-    // Create new tracked blobs for unmatched detections
-    for (let i = 0; i < dets.length; i++) {
-      if (matched.has(i)) continue;
-      const d = dets[i];
-      const cx = (d.bbox[0] + d.bbox[2]) / 2;
-      const cy = (d.bbox[1] + d.bbox[3]) / 2;
-      tracked.push({
-        id: nextBlobId++,
-        class: d.class as "person" | "car" | "bike",
-        cx,
-        cy,
-        w: d.bbox[2] - d.bbox[0],
-        h: d.bbox[3] - d.bbox[1],
-        vx: 0,
-        vy: 0,
-        framesTracked: 1,
-        lastSeen: frameNum,
-        speedKmh: 0,
-        consecutiveFramesNear: 0,
-        prevPositions: [{ x: cx, y: cy }],
-        classHistory: [d.class],
-      });
-    }
-
-    // Remove blobs not seen for 5 frames, cap at 5 tracked objects
-    trackedBlobsRef.current = tracked
-      .filter((b) => frameNum - b.lastSeen < 5)
-      .sort((a, b) => b.framesTracked - a.framesTracked)
-      .slice(0, 5);
-
-    // Return objects tracked for 5+ frames
-    return trackedBlobsRef.current
-      .filter((b) => b.framesTracked >= 5)
-      .map((b) => ({
-        class: b.class,
-        confidence: Math.min(0.95, 0.7 + b.framesTracked * 0.02),
-        bbox: [b.cx - b.w / 2, b.cy - b.h / 2, b.cx + b.w / 2, b.cy + b.h / 2] as [number, number, number, number],
-        speed: b.class === "car" ? b.speedKmh : undefined,
-        id: b.id,
-      }));
-  }, []);
-
-  const calculateSceneChange = (prev: ImageData, curr: ImageData): number => {
-    let diff = 0;
-    const step = 8;
-    let count = 0;
-    for (let i = 0; i < prev.data.length; i += step * 4) {
-      const pg = prev.data[i] * 0.299 + prev.data[i + 1] * 0.587 + prev.data[i + 2] * 0.114;
-      const cg = curr.data[i] * 0.299 + curr.data[i + 1] * 0.587 + curr.data[i + 2] * 0.114;
-      diff += Math.abs(pg - cg);
-      count++;
-    }
-    return count > 0 ? diff / count / 255 : 0;
-  };
-
-  const checkForAccident = (tracked: TrackedBlob[], sceneScore: number): IncidentAlert | null => {
-    const vehicles = tracked.filter((b) => (b.class === "car" || b.class === "bike") && b.framesTracked >= 4);
-    const persons = tracked.filter((b) => b.class === "person" && b.framesTracked >= 4);
-    const allObjects = [...vehicles, ...persons];
-
-    // Strategy 1: Proximity + convergence (works for all collision angles)
-    for (let i = 0; i < allObjects.length; i++) {
-      for (let j = i + 1; j < allObjects.length; j++) {
-        const a = allObjects[i];
-        const b = allObjects[j];
-
-        // Skip same-type pairs that are just passing (person-person or bike-bike far apart)
-        if (a.class === b.class && a.class === "person") continue;
-
-        const dist = Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2);
-        const combinedRadius = (a.w + b.w) / 2;
-
-        // Convergence: are they moving toward each other?
-        const toBx = b.cx - a.cx;
-        const toBy = b.cy - a.cy;
-        const distDot = a.vx * toBx + a.vy * toBy;
-        const converging = distDot > 0;
-
-        // Separation speed (how fast they're approaching)
-        const approachSpeed = converging ? Math.abs(distDot) / Math.max(dist, 1) : 0;
-
-        // Track sustained proximity
-        if (dist < combinedRadius * 1.5) {
-          a.consecutiveFramesNear++;
-          b.consecutiveFramesNear++;
-        } else {
-          a.consecutiveFramesNear = Math.max(0, a.consecutiveFramesNear - 1);
-          b.consecutiveFramesNear = Math.max(0, b.consecutiveFramesNear - 1);
-        }
-
-        const sustainedNear = Math.min(a.consecutiveFramesNear, b.consecutiveFramesNear);
-
-        // Detection: close + converging + sustained OR very close
-        const veryClose = dist < combinedRadius * 0.8;
-        const closeAndConverging = dist < combinedRadius * 1.2 && converging && approachSpeed > 0.5;
-        const sustained = sustainedNear >= 4 && converging;
-
-        if (veryClose || closeAndConverging || sustained) {
-          // Direction analysis: passing vs colliding
-          const aAngle = Math.atan2(a.vy, a.vx);
-          const bAngle = Math.atan2(b.vy, b.vx);
-          const angleDiff = Math.abs(aAngle - bAngle);
-          const parallel = angleDiff < Math.PI * 0.25 || angleDiff > Math.PI * 1.75;
-
-          // Don't trigger if clearly parallel (just passing)
-          if (parallel && dist > combinedRadius * 0.6) continue;
-
-          const confidence = Math.min(0.95,
-            0.3 * (1 - Math.min(dist / (combinedRadius * 1.5), 1)) +
-            0.25 * (converging ? approachSpeed : 0) +
-            0.2 * (veryClose ? 1 : sustained ? 0.8 : 0.5) +
-            0.15 * (!parallel ? 1 : 0.3) +
-            0.1 * Math.min(sceneScore / 0.2, 1)
-          );
-
-          if (confidence > 0.55) {
-            const isVehicleCollision = (a.class === "car" || a.class === "bike") && (b.class === "car" || b.class === "bike");
-            return {
-              type: isVehicleCollision ? "vehicle_collision" : "pedestrian_collision",
-              severity: confidence > 0.75 ? "critical" : "major",
-              confidence,
-              timestamp: new Date().toISOString(),
-              latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
-              longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
-            };
-          }
-        }
-      }
-    }
-
-    // Strategy 2: Sudden stop detection (vehicle stopped abruptly = potential collision aftermath)
-    for (const obj of vehicles) {
-      if (obj.framesTracked < 6) continue;
-      if (obj.prevPositions.length < 4) continue;
-
-      const recent = obj.prevPositions.slice(-4);
-      const recentSpeed = Math.sqrt(
-        (recent[3].x - recent[0].x) ** 2 + (recent[3].y - recent[0].y) ** 2
-      ) / 3;
-
-      const older = obj.prevPositions.slice(0, 4);
-      if (older.length >= 4) {
-        const olderSpeed = Math.sqrt(
-          (older[3].x - older[0].x) ** 2 + (older[3].y - older[0].y) ** 2
-        ) / 3;
-
-        // Speed dropped dramatically (>70% reduction) = possible collision
-        if (olderSpeed > 2 && recentSpeed < olderSpeed * 0.3) {
-          // Check if another object is nearby
-          const nearbyOther = allObjects.find(
-            (o) => o.id !== obj.id && Math.sqrt((o.cx - obj.cx) ** 2 + (o.cy - obj.cy) ** 2) < (obj.w + o.w)
-          );
-          if (nearbyOther) {
-            return {
-              type: "vehicle_collision",
-              severity: "major",
-              confidence: 0.72,
-              timestamp: new Date().toISOString(),
-              latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
-              longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
-            };
-          }
-        }
-      }
-    }
-
-    return null;
-  };
-
-  // Helper: combined radius for two objects
-  function combinedRadius(a: { w: number }, b: { w: number }): number {
-    return (a.w + b.w) / 2;
-  }
-
-  const recordClipAndAlert = async (alert: IncidentAlert) => {
-    // Record the clip as an encoded image composite (reliable, no MediaRecorder)
-    const frames = frameBufferRef.current;
-    let clipUrl: string | undefined;
-
-    // Try to encode frames as a single composite image (strip of frames)
-    if (frames.length >= 4) {
-      try {
-        const COLS = 4;
-        const ROWS = Math.min(3, Math.ceil(frames.length / COLS));
-        const FRAME_W = 240;
-        const FRAME_H = 180;
-        const canvas = document.createElement("canvas");
-        canvas.width = COLS * FRAME_W;
-        canvas.height = ROWS * FRAME_H;
-        const ctx = canvas.getContext("2d")!;
-
-        // Draw sampled frames in a grid
-        const step = Math.max(1, Math.floor(frames.length / (COLS * ROWS)));
-        let idx = 0;
-        for (let row = 0; row < ROWS && idx < frames.length; row++) {
-          for (let col = 0; col < COLS && idx < frames.length; col++) {
-            const frame = frames[Math.min(idx * step, frames.length - 1)];
-            const tmpCanvas = document.createElement("canvas");
-            tmpCanvas.width = 320;
-            tmpCanvas.height = 240;
-            const tmpCtx = tmpCanvas.getContext("2d")!;
-            tmpCtx.putImageData(frame, 0, 0);
-            ctx.drawImage(tmpCanvas, col * FRAME_W, row * FRAME_H, FRAME_W, FRAME_H);
-            idx++;
-          }
-        }
-
-        // Draw detection boxes on the last frame
-        const lastFrame = frames[frames.length - 1];
-        const tmpCanvas = document.createElement("canvas");
-        tmpCanvas.width = 320;
-        tmpCanvas.height = 240;
-        const tmpCtx = tmpCanvas.getContext("2d")!;
-        tmpCtx.putImageData(lastFrame, 0, 0);
-
-        const blob = await new Promise<Blob | null>((resolve) =>
-          canvas.toBlob(resolve, "image/jpeg", 0.85)
-        );
-
-        if (blob && blob.size > 1000) {
-          const filename = `clips/${Date.now()}-frames.jpg`;
-          const { data } = await supabase.storage
-            .from("incident-clips")
-            .upload(filename, blob, { contentType: "image/jpeg" });
-
-          if (data) {
-            const { data: urlData } = supabase.storage
-              .from("incident-clips")
-              .getPublicUrl(filename);
-            clipUrl = urlData?.publicUrl;
-          }
-        }
-      } catch (err) {
-        console.error("Frame encoding failed:", err);
-      }
-    }
-
-    // Determine the best clip URL: prefer source video, fallback to encoded frames
-    const videoSrc = selectedClip?.src || null;
-    const videoTime = videoRef.current ? Math.floor(videoRef.current.currentTime) : 0;
-
-    // Store source video info in detection_data so ambulance can play the actual clip
-    const detectionData = {
-      source: "video_analysis",
-      clip: selectedClip?.name,
-      video_src: videoSrc,
-      video_timestamp: videoTime,
-      frames_captured: frames.length,
-    };
-
-    // Create incident
+  const createIncidentFromDetection = async (alert: IncidentAlert) => {
     const { data: incident, error } = await supabase
       .from("incidents")
       .insert({
@@ -649,8 +308,8 @@ export default function VideoAnalysisPage() {
         longitude: alert.longitude,
         location_name: `Video Analysis: ${selectedClip?.name}`,
         detection_confidence: alert.confidence,
-        detection_data: detectionData,
-        video_clip_url: clipUrl || videoSrc || null,
+        detection_data: { source: "motion_energy", clip: selectedClip?.name },
+        video_clip_url: selectedClip?.src || null,
         status: "detected",
       })
       .select()
@@ -658,38 +317,24 @@ export default function VideoAnalysisPage() {
 
     if (error) {
       console.error("Incident insert error:", error);
-      setIncidents((prev) => [...prev, { ...alert, video_clip_url: clipUrl || videoSrc || undefined }]);
-      toast.error(`ACCIDENT DETECTED: ${alert.type.replace(/_/g, " ")} (${alert.severity})`);
-      return;
     }
 
-    setIncidents((prev) => [...prev, { ...alert, video_clip_url: clipUrl || videoSrc || undefined }]);
+    setIncidents((prev) => [...prev, alert]);
     toast.error(`ACCIDENT DETECTED: ${alert.type.replace(/_/g, " ")} (${alert.severity}) — dispatching ambulance!`);
 
-    // Broadcast to ambulance with full data
-    supabase.channel("alerts:ambulance").send({
-      type: "broadcast",
-      event: "new_incident",
-      payload: {
-        incident_id: incident.id,
-        severity: alert.severity,
-        incident_type: alert.type,
-        latitude: alert.latitude,
-        longitude: alert.longitude,
-        video_clip_url: clipUrl || videoSrc,
-        video_src: videoSrc,
-        video_timestamp: videoTime,
-        message: `ACCIDENT from video analysis: ${alert.type.replace(/_/g, " ")}`,
-      },
-    });
-
-    // If we later get a better clip URL, update it
-    if (clipUrl && clipUrl !== videoSrc) {
-      await supabase.from("incidents").update({ video_clip_url: clipUrl }).eq("id", incident.id);
+    if (incident) {
       supabase.channel("alerts:ambulance").send({
         type: "broadcast",
-        event: "clip_ready",
-        payload: { incident_id: incident.id, video_clip_url: clipUrl },
+        event: "new_incident",
+        payload: {
+          incident_id: incident.id,
+          severity: alert.severity,
+          incident_type: alert.type,
+          latitude: alert.latitude,
+          longitude: alert.longitude,
+          video_clip_url: selectedClip?.src,
+          message: `ACCIDENT from video analysis: ${alert.type.replace(/_/g, " ")}`,
+        },
       });
     }
   };
@@ -698,9 +343,7 @@ export default function VideoAnalysisPage() {
     if (!videoRef.current || !selectedClip) return;
 
     const video = videoRef.current;
-    try {
-      await video.play();
-    } catch {
+    try { await video.play(); } catch {
       video.muted = false;
       try { await video.play(); } catch {
         toast.error("Could not play video. Try again.");
@@ -710,18 +353,16 @@ export default function VideoAnalysisPage() {
 
     setVideoReady(true);
     setIsAnalyzing(true);
-    setDetections([]);
     setIncidents([]);
     setCurrentState("monitoring");
     stateRef.current = "monitoring";
     stateFrameRef.current = 0;
-    prevFrameRef.current = null;
     frameCountRef.current = 0;
-    alertedRef.current = false;
     alertCooldownRef.current = 0;
-    trackedBlobsRef.current = [];
-    frameBufferRef.current = [];
-    nextBlobId = 1;
+    prevFrameRef.current = null;
+    motionHistoryRef.current = [];
+    bgModelRef.current = null;
+    setMotionHistory([]);
 
     await new Promise((r) => setTimeout(r, 300));
 
@@ -732,88 +373,67 @@ export default function VideoAnalysisPage() {
       frameCountRef.current++;
       const fn = frameCountRef.current;
 
-      // Maintain 60-frame buffer (~15s) for clip recording
-      frameBufferRef.current.push(frame);
-      if (frameBufferRef.current.length > 60) frameBufferRef.current.shift();
-
-      // Alert cooldown (60 frames = 15 seconds between alerts)
       if (alertCooldownRef.current > 0) alertCooldownRef.current--;
 
-      // Scene change
-      let sceneScore = 0;
+      let metrics: MotionMetrics | null = null;
       if (prevFrameRef.current) {
-        sceneScore = calculateSceneChange(prevFrameRef.current, frame);
-      }
-      setSceneChange(sceneScore);
+        metrics = analyzeMotion(frame, prevFrameRef.current, fn);
+        setMotionMetrics(metrics);
+        setMotionHistory([...motionHistoryRef.current]);
 
-      // Update running average scene motion
-      avgSceneMotionRef.current = avgSceneMotionRef.current * 0.9 + sceneScore * 0.1;
+        // Draw overlay
+        drawMotionOverlay(metrics);
 
-      // Real motion detection + tracking with adaptive thresholds
-      let dets: Detection[];
-      if (prevFrameRef.current) {
-        const motionDets = detectMotion(frame, prevFrameRef.current, avgSceneMotionRef.current);
-        dets = trackBlobs(motionDets, fn);
-      } else {
-        dets = [];
+        // Detect accident
+        const result = detectAccident(metrics, fn);
+
+        stateFrameRef.current++;
+        let state = stateRef.current;
+
+        if (result.detected) {
+          if (state === "monitoring") state = "watching";
+          else if (state === "watching") state = "confirming";
+          else if (state === "confirming") state = "alert";
+        } else if (!demoMode) {
+          // Decay in real mode
+          if (state !== "monitoring" && fn % 4 === 0) {
+            state = state === "alert" ? "confirming" : state === "confirming" ? "watching" : "monitoring";
+          }
+        }
+
+        // Demo mode: time-based
+        if (demoMode) {
+          const sf = stateFrameRef.current;
+          if (sf === 15 && state === "monitoring") state = "watching";
+          if (sf === 25 && state === "watching") state = "confirming";
+          if (sf >= 35 && state === "confirming") state = "alert";
+        }
+
+        // Trigger alert
+        if (state === "alert" && stateRef.current !== "alert" && alertCooldownRef.current <= 0) {
+          alertCooldownRef.current = 80;
+
+          createIncidentFromDetection({
+            type: result.type || "vehicle_collision",
+            severity: result.confidence > 0.7 ? "critical" : "major",
+            confidence: result.confidence,
+            timestamp: new Date().toISOString(),
+            latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
+            longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
+          });
+
+          setTimeout(() => {
+            stateRef.current = "monitoring";
+            stateFrameRef.current = 0;
+            setCurrentState("monitoring");
+          }, 5000);
+        }
+
+        stateRef.current = state;
+        setCurrentState(state);
       }
 
       prevFrameRef.current = frame;
-      setDetections(dets);
-      drawDetections(dets);
-
-      // State machine
-      stateFrameRef.current++;
-      const sf = stateFrameRef.current;
-
-      // Check for real collision from tracked objects
-      const accident = checkForAccident(trackedBlobsRef.current, sceneScore);
-
-      let state = stateRef.current;
-
-      if (accident) {
-        // Only progress state on REAL detections
-        if (state === "monitoring") state = "watching";
-        else if (state === "watching") state = "confirming";
-        else if (state === "confirming") state = "alert";
-      } else if (!demoMode) {
-        // REAL mode: decay back to monitoring if no sustained accident signal
-        if (state !== "monitoring" && sf % 5 === 0) {
-          state = state === "alert" ? "confirming" : state === "confirming" ? "watching" : "monitoring";
-        }
-      }
-
-      // Demo mode: time-based progression (for testing only)
-      if (demoMode) {
-        if (sf === 15 && state === "monitoring") state = "watching";
-        if (sf === 25 && state === "watching") state = "confirming";
-        if (sf >= 35 && state === "confirming") state = "alert";
-      }
-
-      // Trigger alert
-      if (state === "alert" && stateRef.current !== "alert" && alertCooldownRef.current <= 0) {
-        alertCooldownRef.current = 80; // 20 second cooldown
-
-        const alertData: IncidentAlert = accident || {
-          type: "vehicle_collision",
-          severity: demoMode ? "critical" : "major",
-          confidence: demoMode ? 0.88 : 0.7,
-          timestamp: new Date().toISOString(),
-          latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
-          longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
-        };
-
-        recordClipAndAlert(alertData);
-
-        setTimeout(() => {
-          stateRef.current = "monitoring";
-          stateFrameRef.current = 0;
-          setCurrentState("monitoring");
-        }, 5000);
-      }
-
-      stateRef.current = state;
-      setCurrentState(state);
     }, 250);
   };
 
@@ -827,14 +447,15 @@ export default function VideoAnalysisPage() {
 
   const resetClip = () => {
     stopAnalysis();
-    setDetections([]);
     setIncidents([]);
-    setSceneChange(0);
+    setMotionMetrics(null);
+    setMotionHistory([]);
     prevFrameRef.current = null;
     frameCountRef.current = 0;
     stateFrameRef.current = 0;
-    alertedRef.current = false;
-    trackedBlobsRef.current = [];
+    alertCooldownRef.current = 0;
+    motionHistoryRef.current = [];
+    bgModelRef.current = null;
   };
 
   const stateColors: Record<string, string> = {
@@ -847,25 +468,19 @@ export default function VideoAnalysisPage() {
   return (
     <div className="space-y-6">
       <Link href="/admin" className="inline-flex items-center gap-2 text-muted-foreground hover:text-foreground">
-        <ArrowLeft size={16} />
-        Back to Admin
+        <ArrowLeft size={16} /> Back to Admin
       </Link>
 
       <div>
         <h1 className="text-2xl font-bold">Video Analysis</h1>
-        <p className="text-muted-foreground">
-          AI-powered analysis of camera clips — accidents auto-dispatch ambulance
-        </p>
+        <p className="text-muted-foreground">Motion energy anomaly detection — accidents auto-dispatch ambulance</p>
       </div>
 
       {!selectedClip ? (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {VIDEO_CLIPS.map((clip) => (
-            <button
-              key={clip.name}
-              onClick={() => setSelectedClip(clip)}
-              className="bg-card p-5 rounded-xl border border-border hover:border-primary/50 transition-colors text-left"
-            >
+            <button key={clip.name} onClick={() => setSelectedClip(clip)}
+              className="bg-card p-5 rounded-xl border border-border hover:border-primary/50 transition-colors text-left">
               <div className="flex items-start gap-4">
                 <div className="w-16 h-16 bg-background rounded-lg flex items-center justify-center shrink-0">
                   <Video className="w-8 h-8 text-primary" />
@@ -884,33 +499,22 @@ export default function VideoAnalysisPage() {
         </div>
       ) : (
         <div className="space-y-4">
-          <button
-            onClick={() => { resetClip(); setSelectedClip(null); setVideoReady(false); }}
-            className="text-sm text-primary hover:underline"
-          >
-            &larr; Choose different clip
-          </button>
+          <button onClick={() => { resetClip(); setSelectedClip(null); setVideoReady(false); }}
+            className="text-sm text-primary hover:underline">&larr; Choose different clip</button>
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <div className="lg:col-span-2 space-y-4">
               <div className="bg-card rounded-xl border border-border overflow-hidden">
                 <div className="aspect-video bg-black relative">
-                  <video
-                    ref={videoRef}
-                    src={selectedClip.src}
-                    className="w-full h-full object-contain"
-                    playsInline muted loop
-                    onLoadedData={handleVideoReady}
-                    onCanPlay={handleVideoReady}
-                    onError={handleVideoError}
-                  />
+                  <video ref={videoRef} src={selectedClip.src}
+                    className="w-full h-full object-contain" playsInline muted loop
+                    onLoadedData={handleVideoReady} onCanPlay={handleVideoReady} onError={handleVideoError} />
                   <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ pointerEvents: "none" }} />
 
                   {!videoReady && (
                     <div className="absolute inset-0 flex items-center justify-center bg-black/50">
                       <div className="flex items-center gap-2 text-white">
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                        <span className="text-sm">Loading video...</span>
+                        <Loader2 className="w-5 h-5 animate-spin" /> <span className="text-sm">Loading video...</span>
                       </div>
                     </div>
                   )}
@@ -919,11 +523,13 @@ export default function VideoAnalysisPage() {
                     <>
                       <div className="absolute top-4 left-4 flex items-center gap-2">
                         <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
-                        <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">AI Analyzing</span>
+                        <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">Motion Analysis Active</span>
                       </div>
-                      <div className="absolute top-4 right-4 bg-black/60 px-3 py-1 rounded text-sm">
-                        Objects: {detections.length}
-                      </div>
+                      {motionMetrics && (
+                        <div className="absolute top-4 right-4 bg-black/60 px-3 py-1 rounded text-sm">
+                          Energy: {(motionMetrics.totalEnergy * 100).toFixed(1)}%
+                        </div>
+                      )}
                     </>
                   )}
                 </div>
@@ -931,9 +537,9 @@ export default function VideoAnalysisPage() {
                 <div className="p-4 border-t border-border flex items-center gap-3 flex-wrap">
                   {!isAnalyzing ? (
                     <button onClick={startAnalysis} disabled={!videoReady}
-                      className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+                      className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2 disabled:opacity-50">
                       {videoReady ? <Play size={16} /> : <Loader2 size={16} className="animate-spin" />}
-                      {videoReady ? "Start AI Analysis" : "Loading..."}
+                      {videoReady ? "Start Analysis" : "Loading..."}
                     </button>
                   ) : (
                     <>
@@ -945,16 +551,12 @@ export default function VideoAnalysisPage() {
                       </button>
                     </>
                   )}
-
-                  {/* Demo Mode toggle */}
                   <label className="flex items-center gap-2 text-sm cursor-pointer select-none ml-auto">
                     <span className={`px-2 py-0.5 rounded text-xs font-medium ${demoMode ? "bg-yellow-500/20 text-yellow-500" : "bg-green-500/20 text-green-500"}`}>
                       {demoMode ? "DEMO" : "REAL"}
                     </span>
-                    <div
-                      onClick={() => !isAnalyzing && setDemoMode(!demoMode)}
-                      className={`w-10 h-5 rounded-full transition-colors relative ${demoMode ? "bg-yellow-500" : "bg-green-600"}`}
-                    >
+                    <div onClick={() => !isAnalyzing && setDemoMode(!demoMode)}
+                      className={`w-10 h-5 rounded-full transition-colors relative ${demoMode ? "bg-yellow-500" : "bg-green-600"}`}>
                       <div className={`w-4 h-4 bg-white rounded-full absolute top-0.5 transition-transform ${demoMode ? "translate-x-5" : "translate-x-0.5"}`} />
                     </div>
                     <span className="text-muted-foreground">{selectedClip.name}</span>
@@ -964,6 +566,7 @@ export default function VideoAnalysisPage() {
             </div>
 
             <div className="space-y-4">
+              {/* Detection State */}
               <div className="bg-card p-4 rounded-xl border border-border">
                 <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> Detection State</h3>
                 <div className="space-y-2">
@@ -976,48 +579,75 @@ export default function VideoAnalysisPage() {
                 </div>
               </div>
 
+              {/* Motion Energy */}
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3">Scene Analysis</h3>
-                <div className="space-y-2 text-sm">
-                  <div className="flex justify-between">
-                    <span className="text-muted-foreground">Motion Detected</span>
-                    <span className={sceneChange > 0.3 ? "text-red-500 font-bold" : sceneChange > 0.15 ? "text-yellow-500" : ""}>
-                      {(sceneChange * 100).toFixed(1)}%
-                    </span>
+                <h3 className="font-semibold mb-3 flex items-center gap-2"><Zap size={16} /> Motion Energy</h3>
+                {motionMetrics ? (
+                  <div className="space-y-3">
+                    <div>
+                      <div className="flex justify-between text-sm mb-1">
+                        <span className="text-muted-foreground">Total Energy</span>
+                        <span className={motionMetrics.totalEnergy > 0.05 ? "text-red-500 font-bold" : ""}>
+                          {(motionMetrics.totalEnergy * 100).toFixed(1)}%
+                        </span>
+                      </div>
+                      <div className="w-full bg-background rounded-full h-2">
+                        <div className={`h-2 rounded-full transition-all ${motionMetrics.totalEnergy > 0.05 ? "bg-red-500" : motionMetrics.totalEnergy > 0.02 ? "bg-yellow-500" : "bg-green-500"}`}
+                          style={{ width: `${Math.min(motionMetrics.totalEnergy * 500, 100)}%` }} />
+                      </div>
+                    </div>
+                    <div>
+                      <div className="flex justify-between text-sm mb-1">
+                        <span className="text-muted-foreground">Hotspot Intensity</span>
+                        <span className={motionMetrics.maxRegionEnergy > 0.15 ? "text-red-500 font-bold" : ""}>
+                          {(motionMetrics.maxRegionEnergy * 100).toFixed(1)}%
+                        </span>
+                      </div>
+                      <div className="w-full bg-background rounded-full h-2">
+                        <div className={`h-2 rounded-full transition-all ${motionMetrics.maxRegionEnergy > 0.15 ? "bg-red-500" : "bg-green-500"}`}
+                          style={{ width: `${Math.min(motionMetrics.maxRegionEnergy * 300, 100)}%` }} />
+                      </div>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">Gradient</span>
+                      <span className={motionMetrics.motionGradient > 0.5 ? "text-orange-500" : ""}>
+                        {motionMetrics.motionGradient > 0 ? "+" : ""}{(motionMetrics.motionGradient * 100).toFixed(0)}%
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">Hotspots</span>
+                      <span>{motionMetrics.hotspots.length}</span>
+                    </div>
                   </div>
-                  <div className="w-full bg-background rounded-full h-2">
-                    <div className={`h-2 rounded-full transition-all ${sceneChange > 0.3 ? "bg-red-500" : sceneChange > 0.15 ? "bg-yellow-500" : "bg-green-500"}`}
-                      style={{ width: `${Math.min(sceneChange * 200, 100)}%` }} />
-                  </div>
-                </div>
+                ) : (
+                  <p className="text-sm text-muted-foreground">{isAnalyzing ? "Analyzing motion..." : "Start analysis"}</p>
+                )}
               </div>
 
+              {/* Motion History Chart */}
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3">Detected Objects</h3>
-                <div className="space-y-2 max-h-48 overflow-y-auto">
-                  {detections.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">{isAnalyzing ? "Scanning for motion..." : "Start analysis to detect objects"}</p>
+                <h3 className="font-semibold mb-3">Motion Timeline</h3>
+                <div className="h-16 flex items-end gap-px">
+                  {motionHistory.length === 0 ? (
+                    <p className="text-xs text-muted-foreground w-full text-center">No data yet</p>
                   ) : (
-                    detections.map((det, i) => (
-                      <div key={i} className="flex items-center justify-between p-2 bg-background rounded">
-                        <div className="flex items-center gap-2">
-                          <div className={`w-2 h-2 rounded-full ${det.class === "person" ? "bg-blue-500" : det.class === "bike" ? "bg-orange-500" : "bg-green-500"}`} />
-                          <span className="text-sm capitalize">{det.class}</span>
-                        </div>
-                        <div className="text-right">
-                          <span className="text-sm">{(det.confidence * 100).toFixed(0)}%</span>
-                          {det.speed && <span className="text-xs text-orange-500 ml-2">{det.speed}km/h</span>}
-                        </div>
-                      </div>
+                    motionHistory.map((val, i) => (
+                      <div key={i} className="flex-1 rounded-t"
+                        style={{
+                          height: `${Math.min(val * 800, 100)}%`,
+                          backgroundColor: val > 0.05 ? "#ef4444" : val > 0.02 ? "#f59e0b" : "#22c55e",
+                          opacity: 0.5 + (i / motionHistory.length) * 0.5,
+                        }} />
                     ))
                   )}
                 </div>
               </div>
 
+              {/* Incidents */}
               <div className="bg-card p-4 rounded-xl border border-border">
                 <h3 className="font-semibold mb-3">Detected Incidents</h3>
                 {incidents.length === 0 ? (
-                  <p className="text-sm text-muted-foreground">{isAnalyzing ? "Monitoring for accidents..." : "No accidents detected yet"}</p>
+                  <p className="text-sm text-muted-foreground">{isAnalyzing ? "Monitoring for accidents..." : "No incidents detected"}</p>
                 ) : (
                   <div className="space-y-2">
                     {incidents.map((inc, i) => (
