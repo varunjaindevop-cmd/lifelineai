@@ -261,12 +261,12 @@ export default function VideoAnalysisPage() {
   const consecutiveAnomalyRef = useRef(0); // consecutive frames with real anomaly evidence
   const FLOW_GRID = 4; // 4x3 flow grid
   const DISRUPTION_PERSIST_THRESHOLD = 8; // require ~8 consecutive disrupted frames (~1.6s at 5fps)
-  const STATE_ADVANCE_THRESHOLD = 15; // require 15 consecutive anomaly frames before going from confirming->alert
+  const STATE_ADVANCE_THRESHOLD = 25; // require 25 consecutive anomaly frames (~5 seconds) before alert
 
   const analyzeTrafficFlow = (tracked: Blob[]): { disrupted: boolean; confidence: number; reason: string } => {
     const validBlobs = tracked.filter(b => b.frames >= 3);
     // Need enough objects to meaningfully analyze flow
-    if (validBlobs.length < 5) {
+    if (validBlobs.length < 6) {
       disruptionFramesRef.current = Math.max(0, disruptionFramesRef.current - 1);
       return { disrupted: false, confidence: 0, reason: "" };
     }
@@ -310,36 +310,48 @@ export default function VideoAnalysisPage() {
     }
 
     const avgSpeed = cellCount > 0 ? totalSpeed / cellCount : 0;
-    // If nothing is moving, no traffic anomaly — just an empty or static scene
-    if (avgSpeed < 0.3) {
+    // If nothing is moving much, no traffic anomaly — just slow/empty scene
+    if (avgSpeed < 1.0) {
       disruptionFramesRef.current = Math.max(0, disruptionFramesRef.current - 2);
       return { disrupted: false, confidence: 0, reason: "" };
     }
 
-    // Anomaly 1: Speed differential — one cell much slower than average (traffic blocked)
-    // In traffic, some cells being slower is NORMAL (e.g., vehicles stopping at light)
-    // We need a cell to be DRAMATICALLY slower while others are moving fast
-    let maxSpeedDiff = 0;
-    let slowCell = { r: 0, c: 0, speed: 0 };
-    let fastCells = 0;
+    // Count how many cells have meaningful movement (speed > 1.5)
+    let movingCells = 0;
+    let stoppedCells = 0;
     for (let r = 0; r < 3; r++) {
       for (let c = 0; c < FLOW_GRID; c++) {
         if (flowGrid[r][c].count > 0) {
-          if (speeds[r][c] > avgSpeed * 0.8) fastCells++;
+          if (speeds[r][c] > 1.5) movingCells++;
+          if (speeds[r][c] < 0.5) stoppedCells++;
+        }
+      }
+    }
+
+    // Anomaly 1: Speed differential — one area completely blocked while others flow freely
+    // Normal traffic has SOME variation. Accident = one area near-zero while others move fast.
+    let maxSpeedDiff = 0;
+    let slowCellSpeed = 0;
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < FLOW_GRID; c++) {
+        if (flowGrid[r][c].count > 0) {
           const diff = avgSpeed - speeds[r][c];
           if (diff > maxSpeedDiff) {
             maxSpeedDiff = diff;
-            slowCell = { r, c, speed: speeds[r][c] };
+            slowCellSpeed = speeds[r][c];
           }
         }
       }
     }
-    // Require: significant differential AND fast-moving cells nearby (traffic should be flowing elsewhere)
-    const speedBlocked = maxSpeedDiff > avgSpeed * 0.7 && avgSpeed > 2.0 && fastCells >= 2;
+    // The slow cell must be NEARLY STOPPED (< 20% of avg) while avg speed is decent
+    const speedBlocked = maxSpeedDiff > avgSpeed * 0.8
+      && avgSpeed > 2.5
+      && slowCellSpeed < avgSpeed * 0.2
+      && movingCells >= 3;
 
-    // Anomaly 2: Cluster detection — many objects piled up in one cell
-    // Normal dense traffic has objects distributed across cells
-    // A pile-up concentrates many objects in a single cell while being still
+    // Anomaly 2: Cluster detection — massive pile-up, not just a red light
+    // At a red light: objects are spread across multiple cells, all stopped
+    // Pile-up: objects CRASHED into ONE cell, creating a dense stopped cluster
     let maxCluster = 0;
     let clusterCell = { r: 0, c: 0, count: 0 };
     let clusterStoppedCount = 0;
@@ -351,23 +363,27 @@ export default function VideoAnalysisPage() {
         }
       }
     }
-    // Count stopped blobs in the cluster cell
+    // Count stopped blobs in the densest cell
     for (const blob of validBlobs) {
       const gc = Math.min(Math.floor(blob.cx / cellW), FLOW_GRID - 1);
       const gr = Math.min(Math.floor(blob.cy / cellH), 2);
       if (gc === clusterCell.c && gr === clusterCell.r) {
         const blobSpeed = Math.sqrt(blob.vx ** 2 + blob.vy ** 2);
-        if (blobSpeed < 1) clusterStoppedCount++;
+        if (blobSpeed < 0.8) clusterStoppedCount++;
       }
     }
     const avgCount = cellCount > 0 ? validBlobs.length / cellCount : 1;
-    // Pile-up: many objects concentrated in one cell AND they're stopped
-    const piledUp = maxCluster > avgCount * 2.5 && maxCluster >= 4 && clusterStoppedCount >= 3;
+    // Pile-up requires: dense cluster (3x average), lots of stopped objects, AND
+    // other cells still have movement (accident disrupts one area, traffic flows elsewhere)
+    const piledUp = maxCluster > avgCount * 3
+      && maxCluster >= 5
+      && clusterStoppedCount >= 4
+      && movingCells >= 2;
 
-    // Anomaly 3: Direction chaos — objects in nearby cells moving in opposite directions
-    // In normal traffic, flow is somewhat coherent. Accident scenes cause chaotic movement.
+    // Anomaly 3: Direction chaos — vehicles scattering in opposite directions
+    // Normal traffic: flow is roughly coherent (same road direction)
+    // Accident: vehicles swerving, reversing, going every direction
     let chaosScore = 0;
-    let chaosPairs = 0;
     for (let r = 0; r < 3; r++) {
       for (let c = 0; c < FLOW_GRID; c++) {
         if (flowGrid[r][c].count === 0) continue;
@@ -383,35 +399,35 @@ export default function VideoAnalysisPage() {
           const dot = flowGrid[r][c].vx * n.vx + flowGrid[r][c].vy * n.vy;
           const magA = flowGrid[r][c].speed;
           const magB = n.speed;
-          if (magA > 1.5 && magB > 1.5) {
+          if (magA > 2.0 && magB > 2.0) {
             const cosAngle = dot / (magA * magB);
-            if (cosAngle < -0.4) { chaosScore++; chaosPairs++; }
+            if (cosAngle < -0.5) chaosScore++;
           }
         }
       }
     }
-    // Chaos needs multiple opposite-direction pairs AND enough moving objects
-    const chaotic = chaosScore >= 3 && validBlobs.length >= 5;
+    // Chaos needs many opposite-direction pairs AND both cells must be moving fast
+    const chaotic = chaosScore >= 4 && validBlobs.length >= 6;
 
-    // Evaluate anomalies — require at least 2 indicators for disruption
+    // Evaluate — ALL anomalies require at least 2 indicators to count as disruption
+    // A single indicator is too weak (could be normal traffic variation)
     const indicators = [speedBlocked, piledUp, chaotic].filter(Boolean).length;
 
     const confidence = Math.min(0.95,
       (speedBlocked ? 0.35 : 0) +
-      (piledUp ? 0.3 : 0) +
-      (chaotic ? 0.25 : 0) +
-      (validBlobs.length > 8 ? 0.1 : 0)
+      (piledUp ? 0.35 : 0) +
+      (chaotic ? 0.3 : 0)
     );
 
-    // Track sustained disruption
-    if (indicators >= 2 || (indicators >= 1 && confidence > 0.5)) {
+    // Require 2+ indicators for ANY disruption — single indicator is too unreliable
+    if (indicators >= 2) {
       disruptionFramesRef.current++;
     } else {
       disruptionFramesRef.current = Math.max(0, disruptionFramesRef.current - 2);
     }
 
-    // Only report disruption if it's been sustained
-    if (disruptionFramesRef.current >= DISRUPTION_PERSIST_THRESHOLD) {
+    // Only report disruption if sustained AND high confidence
+    if (disruptionFramesRef.current >= DISRUPTION_PERSIST_THRESHOLD && confidence >= 0.5) {
       const reason = piledUp ? "pile-up" : speedBlocked ? "traffic blocked" : "flow disruption";
       return { disrupted: true, confidence, reason };
     }
