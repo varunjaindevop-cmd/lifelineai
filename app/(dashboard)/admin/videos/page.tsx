@@ -182,12 +182,13 @@ export default function VideoAnalysisPage() {
   };
 
   // ========== COLLISION DETECTION ==========
-  // Requires: (1) objects are moving, (2) they converge, (3) sustained proximity
+  // Runs in BOTH normal and traffic modes. A collision is a collision regardless of mode.
   // False positive suppression: parallel-moving vehicles in same direction = traffic, not collision
   const detectCollision = (blobs: Blob[]): { detected: boolean; confidence: number; a: Blob; b: Blob } | null => {
-    // Only consider blobs tracked for enough frames AND moving
-    const vehicles = blobs.filter(b => b.class === "car" && b.frames >= 5);
-    const pedestrians = blobs.filter(b => b.class === "person" && b.frames >= 4);
+    // In traffic mode, lower the frame requirement — accidents happen fast
+    const minFrames = analysisMode === "traffic" ? 3 : 5;
+    const vehicles = blobs.filter(b => b.class === "car" && b.frames >= minFrames);
+    const pedestrians = blobs.filter(b => b.class === "person" && b.frames >= minFrames);
     const all = [...vehicles, ...pedestrians];
 
     for (let i = 0; i < all.length; i++) {
@@ -579,8 +580,9 @@ export default function VideoAnalysisPage() {
         }
         prevFrameData = new Uint8ClampedArray(data);
 
-        // Detect collision or traffic anomaly based on mode
-        const collision = analysisMode === "normal" ? detectCollision(tracked) : null;
+        // Detect collision in BOTH modes — a collision is always an accident
+        // Traffic flow analysis runs as secondary signal in traffic mode
+        const collision = detectCollision(tracked);
         const trafficAnomaly = analysisMode === "traffic" ? analyzeTrafficFlow(tracked) : null;
 
         // Also check accumulated change anomaly — but suppress in marketplace-like scenes
@@ -595,12 +597,15 @@ export default function VideoAnalysisPage() {
         const accumAnomaly = avgChange > accumThreshold;
 
         // In traffic mode, motion is EXPECTED. Only real anomaly evidence counts:
-        // - collision (direct impact detected)
-        // - trafficAnomaly.disrupted (sustained flow disruption)
+        // - collision (direct impact detected) — highest priority, always valid
+        // - trafficAnomaly.disrupted (sustained flow disruption) — secondary signal
         // accumulated change alone should NOT trigger alerts in traffic mode
         const hasRealAnomaly = analysisMode === "traffic"
           ? !!(collision || trafficAnomaly?.disrupted)
           : !!(collision || trafficAnomaly?.disrupted || accumAnomaly);
+
+        // Direct collision is high-confidence evidence — state machine advances faster
+        const isDirectCollision = !!collision && collision.confidence > 0.45;
 
         // Draw
         drawBoxes(tracked, collision);
@@ -613,15 +618,22 @@ export default function VideoAnalysisPage() {
           consecutiveAnomalyRef.current = 0;
         }
 
-        // State machine — require sustained anomaly, not single-frame spikes
+        // State machine — require sustained anomaly, but respond faster to direct collisions
         stateFrameRef.current++;
         let st = stateRef.current;
 
         if (hasRealAnomaly && consecutiveAnomalyRef.current >= 3) {
-          // Only advance state if real anomaly has persisted for multiple frames
           if (st === "monitoring") st = "watching";
-          else if (st === "watching" && consecutiveAnomalyRef.current >= 8) st = "confirming";
-          else if (st === "confirming" && consecutiveAnomalyRef.current >= STATE_ADVANCE_THRESHOLD) st = "alert";
+          else if (st === "watching") {
+            // Direct collision: advance to confirming faster (3 frames vs 8)
+            const confirmThreshold = isDirectCollision ? 3 : 8;
+            if (consecutiveAnomalyRef.current >= confirmThreshold) st = "confirming";
+          }
+          else if (st === "confirming") {
+            // Direct collision: advance to alert faster (8 frames vs 25)
+            const alertThreshold = isDirectCollision ? 8 : STATE_ADVANCE_THRESHOLD;
+            if (consecutiveAnomalyRef.current >= alertThreshold) st = "alert";
+          }
         } else if (!demoMode && frameRef.current % 6 === 0) {
           // Decay: only step down every 6 frames to avoid oscillation
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
@@ -638,19 +650,19 @@ export default function VideoAnalysisPage() {
           cooldownRef.current = 90; // 18 seconds at 5fps — long cooldown for traffic
           consecutiveAnomalyRef.current = 0; // reset after alert
 
-          // Determine correct incident type based on what was detected
+          // Determine correct incident type — collision takes priority (direct evidence)
           let incidentType = "vehicle_collision";
           let severity = "major";
 
-          if (trafficAnomaly?.disrupted) {
-            // Traffic flow disruption — classify by cause
-            incidentType = trafficAnomaly.reason === "pile-up" ? "vehicle_collision" : "traffic_disruption";
-            severity = (trafficAnomaly.confidence || 0) > 0.65 ? "critical" : "major";
-          } else if (collision) {
-            // Direct collision detected
+          if (collision) {
+            // Direct collision detected — highest confidence
             const isPedCollision = collision.a.class === "person" || collision.b.class === "person";
             incidentType = isPedCollision ? "pedestrian_collision" : "vehicle_collision";
             severity = collision.confidence > 0.7 ? "critical" : collision.confidence > 0.5 ? "major" : "minor";
+          } else if (trafficAnomaly?.disrupted) {
+            // Traffic flow disruption — secondary signal
+            incidentType = trafficAnomaly.reason === "pile-up" ? "vehicle_collision" : "traffic_disruption";
+            severity = (trafficAnomaly.confidence || 0) > 0.65 ? "critical" : "major";
           } else {
             // No real evidence — suppress
             incidentType = "";
