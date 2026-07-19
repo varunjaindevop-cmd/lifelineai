@@ -616,24 +616,30 @@ export default function VideoAnalysisPage() {
         let hasAnomaly = false;
         let anomalyConfidence = 0;
         let anomalyType = "";
+        let isCollisionSignal = false; // true only for actual collision evidence (not pre-accident)
 
         if (collision) {
           // Direct collision: highest priority
           hasAnomaly = true;
           anomalyConfidence = collision.confidence;
           anomalyType = "collision";
+          // Check if collision has IMPACT evidence (not just proximity)
+          const hasImpact = collision.evidence.includes("sudden_stop") ||
+            collision.evidence.includes("shape_change") ||
+            collision.evidence.includes("hard_brake");
+          isCollisionSignal = hasImpact;
         } else if (flowDisruption && analysisMode === "traffic") {
-          // Persistent flow disruption: secondary
           hasAnomaly = true;
           anomalyConfidence = 0.6;
           anomalyType = "flow_disruption";
+          isCollisionSignal = true; // persistent flow disruption = real event
         } else if (analysisMode === "normal") {
-          // Normal mode: accumulated change
           const avgChange = totalChange / (GRID_COLS * GRID_ROWS);
           if (avgChange > 0.04) {
             hasAnomaly = true;
             anomalyConfidence = Math.min(0.8, avgChange * 8);
             anomalyType = "change";
+            isCollisionSignal = avgChange > 0.08; // high change = real event
           }
         }
 
@@ -642,7 +648,7 @@ export default function VideoAnalysisPage() {
         // Draw
         drawBoxes(tracked, collision);
 
-        // Consecutive anomaly tracking
+        // Consecutive tracking — separate counters for general anomaly vs collision signal
         if (hasAnomaly) {
           consecutiveAnomalyRef.current++;
         } else {
@@ -650,13 +656,16 @@ export default function VideoAnalysisPage() {
         }
 
         // ========== STATE MACHINE ==========
+        // KEY: monitoring→watching→confirming can use ANY anomaly (deceleration, proximity)
+        // BUT confirming→alert REQUIRES collision-specific evidence (impact, shape change)
         stateFrameRef.current++;
         let st = stateRef.current;
 
         if (hasAnomaly && consecutiveAnomalyRef.current >= 3) {
           if (st === "monitoring") st = "watching";
-          else if (st === "watching" && consecutiveAnomalyRef.current >= (isHighConf ? 3 : 6)) st = "confirming";
-          else if (st === "confirming" && consecutiveAnomalyRef.current >= (isHighConf ? 6 : 12)) st = "alert";
+          else if (st === "watching" && consecutiveAnomalyRef.current >= 6) st = "confirming";
+          // ALERT: ONLY with collision signal (impact evidence) — not just deceleration
+          else if (st === "confirming" && isCollisionSignal && consecutiveAnomalyRef.current >= 8) st = "alert";
         } else if (!demoMode && frameRef.current % 5 === 0) {
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
@@ -820,8 +829,9 @@ export default function VideoAnalysisPage() {
             </div>
 
             <div className="space-y-4">
+              {/* State Machine */}
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> State</h3>
+                <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> Detection State</h3>
                 <div className="space-y-2">
                   {["monitoring", "watching", "confirming", "alert"].map(s => (
                     <div key={s} className={`flex items-center gap-2 p-2 rounded ${state === s ? stateColors[s] : "text-muted-foreground"}`}>
@@ -830,6 +840,78 @@ export default function VideoAnalysisPage() {
                     </div>
                   ))}
                 </div>
+                {cooldownRef.current > 0 && (
+                  <div className="mt-2 text-xs text-muted-foreground">Cooldown: {cooldownRef.current} frames</div>
+                )}
+              </div>
+
+              {/* Change Detection Grid */}
+              <div className="bg-card p-4 rounded-xl border border-border">
+                <h3 className="font-semibold mb-3 flex items-center gap-2">
+                  <Zap size={16} /> Change Detection
+                </h3>
+                <p className="text-xs text-muted-foreground mb-2">Region-level pixel change (accumulated)</p>
+                <div className="grid gap-px" style={{ gridTemplateColumns: `repeat(${GRID_COLS}, 1fr)` }}>
+                  {Array.from(accumRef.current).map((v, i) => (
+                    <div key={i} className="aspect-square rounded-sm" style={{
+                      backgroundColor: v > 0.08 ? `rgb(${Math.min(255, Math.floor(v * 2000))},0,0)` :
+                        v > 0.03 ? `rgb(${Math.min(255, Math.floor(v * 1500))},${Math.floor(v * 500)},0)` :
+                          `rgb(0,${Math.min(255, Math.floor(v * 3000))},0)`
+                    }} />
+                  ))}
+                </div>
+                <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                  <span>Green = calm</span>
+                  <span>Red = high change</span>
+                </div>
+              </div>
+
+              {/* Anomaly Heatmap */}
+              <div className="bg-card p-4 rounded-xl border border-border">
+                <h3 className="font-semibold mb-3 flex items-center gap-2">
+                  <AlertTriangle size={16} /> Anomaly Heatmap
+                </h3>
+                <p className="text-xs text-muted-foreground mb-2">Persistent anomaly cells (red = sustained anomaly)</p>
+                <div className="grid gap-px" style={{ gridTemplateColumns: `repeat(${GRID_COLS}, 1fr)` }}>
+                  {Array.from(anomalyHeatmapRef.current).map((v, i) => (
+                    <div key={i} className="aspect-square rounded-sm" style={{
+                      backgroundColor: v > 8 ? `rgba(255,0,0,${Math.min(v / 15, 1)})` :
+                        v > 4 ? `rgba(255,165,0,${v / 10})` :
+                          v > 1 ? `rgba(255,255,0,${v / 5})` : "rgba(255,255,255,0.05)"
+                    }} />
+                  ))}
+                </div>
+                <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                  <span>Threshold: 6 frames</span>
+                  <span>Cluster: 3+ cells</span>
+                </div>
+              </div>
+
+              {/* Collision Status */}
+              <div className="bg-card p-4 rounded-xl border border-border">
+                <h3 className="font-semibold mb-3 flex items-center gap-2">
+                  <AlertTriangle size={16} /> Collision Detection
+                </h3>
+                {(() => {
+                  const collision = detectPhysicsCollision(blobsRef.current);
+                  if (!collision) return <p className="text-sm text-green-400">No collision detected</p>;
+                  return (
+                    <div className="space-y-2">
+                      <div className="p-2 bg-red-500/10 border border-red-500/30 rounded">
+                        <div className="text-sm font-medium text-red-400">COLLISION DETECTED</div>
+                        <div className="text-xs text-muted-foreground mt-1">
+                          Confidence: {(collision.confidence * 100).toFixed(0)}%
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          Evidence: {collision.evidence}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          Objects: #{collision.a.id} ({collision.a.class}) + #{collision.b.id} ({collision.b.class})
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
 
               {/* ESP Vehicle Telemetry */}
@@ -853,7 +935,11 @@ export default function VideoAnalysisPage() {
                             <span>{speedKmh} km/h</span>
                             <span>a:{b.acceleration.toFixed(1)}</span>
                             <span>θ:{Math.round(b.heading * 180 / Math.PI)}°</span>
-                            <span>AR:{b.aspectRatio.toFixed(1)}</span>
+                          </div>
+                          <div className="flex gap-3 text-muted-foreground">
+                            <span>AR:{b.aspectRatio.toFixed(2)}</span>
+                            <span>brake:{b.decelFrames}f</span>
+                            <span>pos:({Math.round(b.cx)},{Math.round(b.cy)})</span>
                           </div>
                         </div>
                       );
@@ -862,6 +948,7 @@ export default function VideoAnalysisPage() {
                 </div>
               </div>
 
+              {/* Incidents */}
               <div className="bg-card p-4 rounded-xl border border-border">
                 <h3 className="font-semibold mb-3">Incidents</h3>
                 {incidents.length === 0 ? (
