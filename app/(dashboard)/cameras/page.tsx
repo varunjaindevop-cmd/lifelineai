@@ -145,8 +145,8 @@ export default function CamerasPage() {
   const [newCamera, setNewCamera] = useState({
     name: "",
     location_name: "",
-    latitude: 28.6139,
-    longitude: 77.209,
+    latitude: 22.7196,
+    longitude: 75.8577,
     stream_url: "",
     stream_type: "browser",
   });
@@ -190,8 +190,8 @@ export default function CamerasPage() {
     setNewCamera({
       name: "",
       location_name: "",
-      latitude: 28.6139,
-      longitude: 77.209,
+      latitude: 22.7196,
+      longitude: 75.8577,
       stream_url: "",
       stream_type: "browser",
     });

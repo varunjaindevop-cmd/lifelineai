@@ -51,9 +51,10 @@ interface TrackedBlob {
   vy: number;
   framesTracked: number;
   lastSeen: number;
-  speedKmh: number;           // smoothed speed in km/h
-  consecutiveFramesNear: number; // how many frames two objects have been close
-  prevPositions: { x: number; y: number }[]; // last N positions for speed smoothing
+  speedKmh: number;
+  consecutiveFramesNear: number;
+  prevPositions: { x: number; y: number }[];
+  classHistory: string[];      // last N classifications for smoothing
 }
 
 const VIDEO_CLIPS: VideoClip[] = [
@@ -79,8 +80,8 @@ const VIDEO_CLIPS: VideoClip[] = [
   },
 ];
 
-const DEMO_LAT = 28.6139;
-const DEMO_LNG = 77.209;
+const DEMO_LAT = 22.7196;
+const DEMO_LNG = 75.8577;
 
 let nextBlobId = 1;
 
@@ -102,6 +103,8 @@ export default function VideoAnalysisPage() {
   const trackedBlobsRef = useRef<TrackedBlob[]>([]);
   const alertedRef = useRef(false);
   const stateFrameRef = useRef(0);
+  const alertCooldownRef = useRef(0); // frames to wait before next alert
+  const frameBufferRef = useRef<ImageData[]>([]); // last 60 frames (~15s) for clip recording
   const supabase = createClient();
 
   useEffect(() => {
@@ -364,18 +367,15 @@ export default function VideoAnalysisPage() {
         matched.add(bestIdx);
 
         // Compute speed from centroid displacement
-        // pixels-per-frame → assume ~50 pixels per meter (typical CCTV at 10-15m distance)
-        const PPM = 50;
+        // ~2 pixels per meter for 320x240 CCTV at typical road distance
+        const PPM = 2;
         const pixelDist = Math.sqrt(blob.vx ** 2 + blob.vy ** 2);
-        const metersPerFrame = pixelDist / PPM;
-        const metersPerSecond = metersPerFrame * FPS;
-        const rawSpeedKmh = metersPerSecond * 3.6;
+        const rawSpeedKmh = (pixelDist / PPM) * FPS * 3.6;
 
-        // Smooth with exponential moving average
+        // Smooth positions over last 8 frames
         blob.prevPositions.push({ x: newCx, y: newCy });
         if (blob.prevPositions.length > 8) blob.prevPositions.shift();
 
-        // If we have at least 3 positions, compute smoothed speed
         if (blob.prevPositions.length >= 3) {
           const positions = blob.prevPositions;
           const oldest = positions[0];
@@ -384,10 +384,19 @@ export default function VideoAnalysisPage() {
           const totalFrames = positions.length - 1;
           const avgPixelPerFrame = totalDist / totalFrames;
           const smoothedSpeedKmh = (avgPixelPerFrame / PPM) * FPS * 3.6;
-          // Clamp to realistic range (5-120 km/h for urban CCTV)
-          blob.speedKmh = Math.round(Math.max(5, Math.min(120, smoothedSpeedKmh)));
+          blob.speedKmh = Math.round(Math.max(15, Math.min(90, smoothedSpeedKmh)));
         } else {
-          blob.speedKmh = Math.round(Math.max(5, Math.min(120, rawSpeedKmh)));
+          blob.speedKmh = Math.round(Math.max(15, Math.min(90, rawSpeedKmh)));
+        }
+
+        // Classification smoothing: use majority vote over last 5 frames
+        blob.classHistory.push(d.class);
+        if (blob.classHistory.length > 5) blob.classHistory.shift();
+        if (blob.classHistory.length >= 3) {
+          const counts: Record<string, number> = {};
+          for (const c of blob.classHistory) counts[c] = (counts[c] || 0) + 1;
+          const majority = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+          blob.class = majority as "person" | "car" | "bike";
         }
       } else {
         blob.framesTracked = 0;
@@ -414,6 +423,7 @@ export default function VideoAnalysisPage() {
         speedKmh: 0,
         consecutiveFramesNear: 0,
         prevPositions: [{ x: cx, y: cy }],
+        classHistory: [d.class],
       });
     }
 
@@ -539,8 +549,68 @@ export default function VideoAnalysisPage() {
     return null;
   };
 
-  const createIncidentFromDetection = async (alert: IncidentAlert) => {
-    // Insert WITHOUT camera_id to avoid foreign key violation
+  const recordClipAndAlert = async (alert: IncidentAlert) => {
+    // Record the last 15 seconds of frames as a WebM clip
+    const frames = frameBufferRef.current;
+    let videoClipUrl: string | undefined;
+
+    if (frames.length > 10 && typeof MediaRecorder !== "undefined") {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = 320;
+        canvas.height = 240;
+        const ctx = canvas.getContext("2d")!;
+
+        const stream = canvas.captureStream(4); // 4 FPS
+        const recorder = new MediaRecorder(stream, { mimeType: "video/webm;codecs=vp8" });
+        const chunks: Blob[] = [];
+
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) chunks.push(e.data);
+        };
+
+        const clipBlob = await new Promise<Blob | null>((resolve) => {
+          recorder.onstop = () => resolve(new Blob(chunks, { type: "video/webm" }));
+          recorder.start();
+
+          let i = 0;
+          const drawNext = () => {
+            if (i >= frames.length) {
+              recorder.stop();
+              return;
+            }
+            ctx.putImageData(frames[i], 0, 0);
+            i++;
+            setTimeout(drawNext, 250); // 4 FPS
+          };
+          drawNext();
+
+          // Timeout safety
+          setTimeout(() => {
+            if (recorder.state === "recording") recorder.stop();
+          }, 30000);
+        });
+
+        if (clipBlob && clipBlob.size > 1000) {
+          // Upload to Supabase Storage
+          const filename = `clips/${Date.now()}-clip.webm`;
+          const { data: uploadData } = await supabase.storage
+            .from("incident-clips")
+            .upload(filename, clipBlob, { contentType: "video/webm" });
+
+          if (uploadData) {
+            const { data: urlData } = supabase.storage
+              .from("incident-clips")
+              .getPublicUrl(filename);
+            videoClipUrl = urlData?.publicUrl;
+          }
+        }
+      } catch (err) {
+        console.error("Clip recording failed:", err);
+      }
+    }
+
+    // Create incident with clip URL
     const { data: incident, error } = await supabase
       .from("incidents")
       .insert({
@@ -551,6 +621,7 @@ export default function VideoAnalysisPage() {
         location_name: `Video Analysis: ${selectedClip?.name}`,
         detection_confidence: alert.confidence,
         detection_data: { source: "video_analysis", clip: selectedClip?.name },
+        video_clip_url: videoClipUrl || null,
         status: "detected",
       })
       .select()
@@ -558,17 +629,15 @@ export default function VideoAnalysisPage() {
 
     if (error) {
       console.error("Incident insert error:", error);
-      // Still show the alert in UI even if DB fails
-      setIncidents((prev) => [...prev, alert]);
+      setIncidents((prev) => [...prev, { ...alert, video_clip_url: videoClipUrl }]);
       toast.error(`ACCIDENT DETECTED: ${alert.type.replace(/_/g, " ")} (${alert.severity})`);
       return;
     }
 
     if (incident) {
-      setIncidents((prev) => [...prev, alert]);
+      setIncidents((prev) => [...prev, { ...alert, video_clip_url: videoClipUrl }]);
       toast.error(`ACCIDENT DETECTED: ${alert.type.replace(/_/g, " ")} (${alert.severity}) — dispatching ambulance!`);
 
-      // Broadcast to ambulance
       supabase.channel("alerts:ambulance").send({
         type: "broadcast",
         event: "new_incident",
@@ -578,6 +647,7 @@ export default function VideoAnalysisPage() {
           incident_type: alert.type,
           latitude: alert.latitude,
           longitude: alert.longitude,
+          video_clip_url: videoClipUrl,
           message: `ACCIDENT from video analysis: ${alert.type.replace(/_/g, " ")}`,
         },
       });
@@ -608,7 +678,9 @@ export default function VideoAnalysisPage() {
     prevFrameRef.current = null;
     frameCountRef.current = 0;
     alertedRef.current = false;
+    alertCooldownRef.current = 0;
     trackedBlobsRef.current = [];
+    frameBufferRef.current = [];
     nextBlobId = 1;
 
     await new Promise((r) => setTimeout(r, 300));
@@ -619,6 +691,13 @@ export default function VideoAnalysisPage() {
 
       frameCountRef.current++;
       const fn = frameCountRef.current;
+
+      // Maintain 60-frame buffer (~15s) for clip recording
+      frameBufferRef.current.push(frame);
+      if (frameBufferRef.current.length > 60) frameBufferRef.current.shift();
+
+      // Alert cooldown (60 frames = 15 seconds between alerts)
+      if (alertCooldownRef.current > 0) alertCooldownRef.current--;
 
       // Scene change
       let sceneScore = 0;
@@ -650,20 +729,20 @@ export default function VideoAnalysisPage() {
       let state = stateRef.current;
 
       if (accident) {
-        // Accelerate state on real detection
         if (state === "monitoring") state = "watching";
         else if (state === "watching") state = "confirming";
         else if (state === "confirming") state = "alert";
       }
 
       // Time-based state progression (guaranteed demo flow)
-      // monitoring → watching at frame 20, watching → confirming at frame 30, confirming → alert at frame 40
       if (sf === 20 && state === "monitoring") state = "watching";
       if (sf === 30 && state === "watching") state = "confirming";
       if (sf >= 40 && state === "confirming") state = "alert";
 
-      // Trigger alert
-      if (state === "alert" && stateRef.current !== "alert") {
+      // Trigger alert only if not on cooldown
+      if (state === "alert" && stateRef.current !== "alert" && alertCooldownRef.current <= 0) {
+        alertCooldownRef.current = 60; // 15 second cooldown
+
         const alertData: IncidentAlert = accident || {
           type: "vehicle_collision",
           severity: "critical",
@@ -672,9 +751,10 @@ export default function VideoAnalysisPage() {
           latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
           longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
         };
-        createIncidentFromDetection(alertData);
 
-        // Reset after 4 seconds
+        // Record the clip and attach to incident
+        recordClipAndAlert(alertData);
+
         setTimeout(() => {
           stateRef.current = "monitoring";
           stateFrameRef.current = 0;
