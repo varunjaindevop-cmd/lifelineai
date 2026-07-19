@@ -345,25 +345,29 @@ export default function VideoAnalysisPage() {
 
         drawFrame(validEntities, ttcPairs, evidence, video.videoWidth || 640, video.videoHeight || 480);
 
-        // State machine
+        // State machine — conservative, requires sustained evidence
         const hasCollision = evidence.some(e => e.type === "collision" && e.confidence > 0.5);
         const hasPostImpact = evidence.some(e => e.type === "post_impact");
         const hasBikeFall = evidence.some(e => e.type === "bike_fall");
         const hasStrongEvidence = hasCollision || hasPostImpact || hasBikeFall;
 
         if (hasStrongEvidence) consecutiveAnomalyRef.current++;
-        else consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 1);
+        else consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 2); // decay fast
 
         let st = stateRef.current;
 
-        // Post-impact or bike fall = immediate alert
+        // Post-impact or bike fall = immediate alert (these are definitive)
         if (hasPostImpact || hasBikeFall) {
           st = "alert";
-        } else if (hasStrongEvidence && consecutiveAnomalyRef.current >= 3) {
+        }
+        // Active collision needs sustained evidence
+        else if (hasStrongEvidence && consecutiveAnomalyRef.current >= 5) {
           if (st === "monitoring") st = "watching";
-          else if (st === "watching" && consecutiveAnomalyRef.current >= 5) st = "confirming";
-          else if (st === "confirming" && consecutiveAnomalyRef.current >= 8) st = "alert";
-        } else if (now % 1000 < 20) {
+          else if (st === "watching" && consecutiveAnomalyRef.current >= 8) st = "confirming";
+          else if (st === "confirming" && consecutiveAnomalyRef.current >= 12) st = "alert";
+        }
+        // Decay every 1.5 seconds
+        else if (now % 1500 < 20) {
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
 
@@ -442,10 +446,10 @@ export default function VideoAnalysisPage() {
     alert: "bg-red-500/20 text-red-500 animate-pulse",
   };
 
-  const envModes: { key: EnvMode; label: string; icon: React.ReactNode; color: string; disabled?: boolean }[] = [
+  const envModes: { key: EnvMode; label: string; icon: React.ReactNode; color: string }[] = [
     { key: "isolated", label: "Isolated Road", icon: <Car size={14} />, color: "blue" },
-    { key: "traffic", label: "Traffic (Beta)", icon: <Car size={14} />, color: "orange", disabled: true },
-    { key: "marketplace", label: "Marketplace", icon: <Users size={14} />, color: "purple", disabled: true },
+    { key: "traffic", label: "Traffic", icon: <Car size={14} />, color: "orange" },
+    { key: "marketplace", label: "Marketplace", icon: <Users size={14} />, color: "purple" },
   ];
 
   return (
@@ -511,11 +515,9 @@ export default function VideoAnalysisPage() {
                   <span className="text-muted-foreground text-xs">{selectedClip.name}</span>
                   <div className="flex gap-1 ml-auto">
                     {envModes.map(m => (
-                      <button key={m.key} onClick={() => !m.disabled && setEnvMode(m.key)}
-                        disabled={m.disabled}
+                      <button key={m.key} onClick={() => setEnvMode(m.key)}
                         className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
-                          m.disabled ? "bg-gray-700 text-gray-500 cursor-not-allowed opacity-50"
-                          : envMode === m.key
+                          envMode === m.key
                             ? m.color === "blue" ? "bg-blue-600 text-white" : m.color === "orange" ? "bg-orange-600 text-white" : "bg-purple-600 text-white"
                             : "bg-card border border-border text-muted-foreground hover:bg-background"
                         }`}>
