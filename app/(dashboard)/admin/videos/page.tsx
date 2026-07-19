@@ -188,63 +188,39 @@ export default function VideoAnalysisPage() {
   }, []);
 
   // ========== ACCIDENT DETECTION ==========
-  // Detects accidents by looking for ANOMALOUS motion patterns:
-  // 1. Sudden spike in total motion energy
-  // 2. Large, concentrated hotspot with high energy
-  // 3. Motion gradient positive (motion increasing)
-  // 4. Pattern persists for multiple frames
+  // Simple rule: if total motion energy suddenly spikes above baseline, it's an accident.
+  // No hotspot requirement — motion can be spread or concentrated.
 
   const detectAccident = useCallback((metrics: MotionMetrics, frameNum: number): { detected: boolean; confidence: number; type: string } => {
     const history = motionHistoryRef.current;
 
-    // Need at least 10 frames of history for comparison
-    if (history.length < 10) return { detected: false, confidence: 0, type: "" };
+    // Need at least 8 frames of baseline
+    if (history.length < 8) return { detected: false, confidence: 0, type: "" };
 
-    // Calculate baseline motion (average of older frames)
-    const baseline = history.slice(0, Math.min(10, history.length - 5));
-    const baselineAvg = baseline.reduce((a, b) => a + b, 0) / baseline.length;
-    const baselineMax = Math.max(...baseline);
+    // Baseline = average of frames 3 ago through 8 ago (skip the most recent 2)
+    const baselineStart = Math.max(0, history.length - 8);
+    const baselineEnd = Math.max(0, history.length - 2);
+    const baselineSlice = history.slice(baselineStart, baselineEnd);
+    const baselineAvg = baselineSlice.length > 0 ? baselineSlice.reduce((a, b) => a + b, 0) / baselineSlice.length : 0.01;
 
-    // Current motion
     const currentEnergy = metrics.totalEnergy;
-    const currentHotspot = metrics.maxRegionEnergy;
 
-    // Anomaly scores
-    const energySpike = baselineAvg > 0 ? (currentEnergy - baselineAvg) / Math.max(baselineAvg, 0.01) : currentEnergy > 0.05 ? 3 : 0;
-    const hotspotIntensity = currentHotspot > 0.15 ? (currentHotspot / 0.15) : 0;
-    const gradientBoost = metrics.motionGradient > 0.5 ? 1 : metrics.motionGradient > 0 ? 0.5 : 0;
+    // Energy spike ratio (how much higher than baseline)
+    const spikeRatio = baselineAvg > 0.001 ? currentEnergy / baselineAvg : currentEnergy > 0.02 ? 5 : 0;
 
-    // Concentration: is motion focused in one area (collision) vs spread out (normal traffic)?
-    const hotspotCount = metrics.hotspots.length;
-    const concentration = hotspotCount > 0 && hotspotCount <= 3 ? 1 : hotspotCount <= 5 ? 0.6 : 0.3;
+    // Absolute energy check (even in quiet scenes, must have some motion)
+    const hasSignificantMotion = currentEnergy > 0.015;
 
-    // Composite confidence
-    const confidence = Math.min(0.95,
-      0.3 * Math.min(energySpike / 3, 1) +      // energy spike
-      0.25 * hotspotIntensity +                    // hotspot intensity
-      0.2 * concentration +                        // motion concentration
-      0.15 * gradientBoost +                       // motion increasing
-      0.1 * (currentEnergy > 0.03 ? 1 : 0)        // baseline activity
-    );
+    // Gradient: motion increasing rapidly
+    const risingGradient = metrics.motionGradient > 0.3;
 
-    // Thresholds — adaptive based on baseline
-    const spikeThreshold = baselineAvg > 0.01 ? 2.0 : 1.5; // lower for quiet scenes
-    const hotspotThreshold = 0.08;
-    const confidenceThreshold = 0.45;
+    // Confidence based on spike magnitude
+    const confidence = Math.min(0.95, Math.min(spikeRatio / 4, 1) * 0.7 + (hasSignificantMotion ? 0.2 : 0) + (risingGradient ? 0.1 : 0));
 
-    const detected = energySpike > spikeThreshold &&
-                     currentHotspot > hotspotThreshold &&
-                     confidence > confidenceThreshold;
+    // Detection: spike > 1.8x baseline OR spike > 1.4x with rising gradient
+    const detected = (spikeRatio > 1.8 && hasSignificantMotion) || (spikeRatio > 1.4 && risingGradient && hasSignificantMotion);
 
-    // Classify accident type based on characteristics
-    let type = "vehicle_collision";
-    if (hotspotCount <= 2 && currentHotspot > 0.2) {
-      type = "vehicle_collision"; // concentrated impact
-    } else if (hotspotCount > 3) {
-      type = "vehicle_collision"; // widespread debris/scattering
-    }
-
-    return { detected, confidence, type };
+    return { detected, confidence, type: "vehicle_collision" };
   }, []);
 
   // Draw motion visualization on canvas
