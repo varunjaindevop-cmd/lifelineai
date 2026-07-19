@@ -64,17 +64,15 @@ export function findAllTTCPairs(entities: TrackedEntity[]): TTCPair[] {
       nowActive.add(key);
 
       if (isOverlapping(a, b)) {
-        // Track consecutive overlap frames
         const prev = overlapHistory.get(key) || 0;
         overlapHistory.set(key, prev + 1);
-
         const overlapFrames = overlapHistory.get(key)!;
 
-        // Must overlap for 3+ consecutive frames to count
-        if (overlapFrames >= 3) {
+        // Overlap threshold: 2 frames at 3 FPS = ~0.7 seconds
+        if (overlapFrames >= 2) {
           let severity: TTCPair["severity"] = "warning";
-          if (overlapFrames >= 8) severity = "impact";
-          else if (overlapFrames >= 5) severity = "critical";
+          if (overlapFrames >= 6) severity = "impact";
+          else if (overlapFrames >= 4) severity = "critical";
 
           pairs.push({
             a, b, ttc: NaN, distance: dist(a, b), closingSpeed: 0, severity,

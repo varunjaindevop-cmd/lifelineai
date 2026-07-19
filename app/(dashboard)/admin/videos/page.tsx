@@ -353,11 +353,11 @@ export default function VideoAnalysisPage() {
 
         let st = stateRef.current;
 
-        if (consecutiveAnomalyRef.current >= 3) {
+        if (consecutiveAnomalyRef.current >= 2) {
           if (st === "monitoring") st = "watching";
-          else if (st === "watching" && consecutiveAnomalyRef.current >= 5) st = "confirming";
-          else if (st === "confirming" && consecutiveAnomalyRef.current >= 8) st = "alert";
-        } else if (now % 1500 < 20) {
+          else if (st === "watching" && consecutiveAnomalyRef.current >= 4) st = "confirming";
+          else if (st === "confirming" && consecutiveAnomalyRef.current >= 6) st = "alert";
+        } else if (now % 2000 < 20) {
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
 
