@@ -32,6 +32,7 @@ export default function VideoAnalysisPage() {
   const [state, setState] = useState("monitoring");
   const [demoMode, setDemoMode] = useState(false);
   const [objectCount, setObjectCount] = useState(0);
+  const [analysisMode, setAnalysisMode] = useState<"normal" | "traffic">("normal");
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const tmpCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -243,6 +244,133 @@ export default function VideoAnalysisPage() {
     return null;
   };
 
+  // ========== TRAFFIC FLOW ANALYSIS ==========
+  // For rush areas: detects anomalies in traffic flow patterns
+  // Key insight: in traffic, ACCIDENTS cause FLOW DISRUPTIONS,
+  // not just motion spikes. We detect when flow becomes abnormal.
+
+  const flowHistoryRef = useRef<Float32Array[]>([]); // last N flow snapshots
+  const FLOW_GRID = 4; // 4x3 flow grid
+
+  const analyzeTrafficFlow = (tracked: Blob[]): { disrupted: boolean; confidence: number; reason: string } => {
+    const validBlobs = tracked.filter(b => b.frames >= 3);
+    if (validBlobs.length < 3) return { disrupted: false, confidence: 0, reason: "" };
+
+    // Build flow grid: average velocity per region
+    const cellW = W / FLOW_GRID, cellH = H / 3;
+    const flowGrid: { vx: number; vy: number; count: number; speed: number }[][] = [];
+    for (let r = 0; r < 3; r++) {
+      flowGrid[r] = [];
+      for (let c = 0; c < FLOW_GRID; c++) {
+        flowGrid[r][c] = { vx: 0, vy: 0, count: 0, speed: 0 };
+      }
+    }
+
+    for (const blob of validBlobs) {
+      const gc = Math.min(Math.floor(blob.cx / cellW), FLOW_GRID - 1);
+      const gr = Math.min(Math.floor(blob.cy / cellH), 2);
+      const cell = flowGrid[gr][gc];
+      cell.vx += blob.vx;
+      cell.vy += blob.vy;
+      cell.count++;
+    }
+
+    // Calculate average speed per cell
+    let totalSpeed = 0;
+    let cellCount = 0;
+    const speeds: number[][] = [];
+    for (let r = 0; r < 3; r++) {
+      speeds[r] = [];
+      for (let c = 0; c < FLOW_GRID; c++) {
+        const cell = flowGrid[r][c];
+        if (cell.count > 0) {
+          cell.vx /= cell.count;
+          cell.vy /= cell.count;
+          cell.speed = Math.sqrt(cell.vx ** 2 + cell.vy ** 2);
+          totalSpeed += cell.speed;
+          cellCount++;
+        }
+        speeds[r][c] = cell.speed;
+      }
+    }
+
+    const avgSpeed = cellCount > 0 ? totalSpeed / cellCount : 0;
+    if (avgSpeed < 0.5) return { disrupted: false, confidence: 0, reason: "" }; // too few moving objects
+
+    // Anomaly 1: Speed differential — one cell much slower than average (traffic blocked)
+    let maxSpeedDiff = 0;
+    let slowCell = { r: 0, c: 0, speed: 0 };
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < FLOW_GRID; c++) {
+        if (flowGrid[r][c].count > 0) {
+          const diff = avgSpeed - speeds[r][c];
+          if (diff > maxSpeedDiff) {
+            maxSpeedDiff = diff;
+            slowCell = { r, c, speed: speeds[r][c] };
+          }
+        }
+      }
+    }
+
+    // Anomaly 2: Cluster detection — many objects in one cell (pile-up)
+    let maxCluster = 0;
+    let clusterCell = { r: 0, c: 0, count: 0 };
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < FLOW_GRID; c++) {
+        if (flowGrid[r][c].count > maxCluster) {
+          maxCluster = flowGrid[r][c].count;
+          clusterCell = { r, c, count: flowGrid[r][c].count };
+        }
+      }
+    }
+
+    const avgCount = cellCount > 0 ? validBlobs.length / cellCount : 1;
+
+    // Anomaly 3: Direction chaos — objects in nearby cells moving in opposite directions
+    let chaosScore = 0;
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < FLOW_GRID; c++) {
+        if (flowGrid[r][c].count === 0) continue;
+        const neighbors = [
+          r > 0 ? flowGrid[r-1][c] : null,
+          r < 2 ? flowGrid[r+1][c] : null,
+          c > 0 ? flowGrid[r][c-1] : null,
+          c < FLOW_GRID-1 ? flowGrid[r][c+1] : null,
+        ].filter(n => n && n.count > 0);
+
+        for (const n of neighbors) {
+          if (!n) continue;
+          const dot = flowGrid[r][c].vx * n.vx + flowGrid[r][c].vy * n.vy;
+          const magA = flowGrid[r][c].speed;
+          const magB = n.speed;
+          if (magA > 1 && magB > 1) {
+            const cosAngle = dot / (magA * magB);
+            if (cosAngle < -0.3) chaosScore++; // opposite directions
+          }
+        }
+      }
+    }
+
+    // Evaluate anomalies
+    const speedBlocked = maxSpeedDiff > avgSpeed * 0.6 && avgSpeed > 1.5;
+    const piledUp = maxCluster > avgCount * 2 && maxCluster >= 3;
+    const chaotic = chaosScore >= 2;
+
+    const confidence = Math.min(0.95,
+      (speedBlocked ? 0.35 : 0) +
+      (piledUp ? 0.3 : 0) +
+      (chaotic ? 0.2 : 0) +
+      (validBlobs.length > 5 ? 0.15 : 0)
+    );
+
+    if (speedBlocked || piledUp || chaotic) {
+      const reason = piledUp ? "pile-up" : speedBlocked ? "traffic blocked" : "flow disruption";
+      return { disrupted: true, confidence, reason };
+    }
+
+    return { disrupted: false, confidence: 0, reason: "" };
+  };
+
   // Draw bounding boxes on video
   const drawBoxes = (tracked: Blob[], collision: ReturnType<typeof detectCollision>) => {
     const canvas = canvasRef.current;
@@ -302,7 +430,7 @@ export default function VideoAnalysisPage() {
     ctx.fillRect(0, barY, Math.min(score * canvas.width * 5, canvas.width), 22);
     ctx.fillStyle = "white";
     ctx.font = "11px Arial";
-    ctx.fillText(`Objects: ${tracked.filter(b=>b.frames>=3).length} | Change: ${(score*100).toFixed(1)}%`, 8, barY + 15);
+    ctx.fillText(`${analysisMode === "traffic" ? "Traffic" : "Normal"} | Objects: ${tracked.filter(b=>b.frames>=3).length} | Change: ${(score*100).toFixed(1)}%`, 8, barY + 15);
   };
 
   const createIncident = async (alert: IncidentAlert) => {
@@ -385,12 +513,15 @@ export default function VideoAnalysisPage() {
         }
         prevFrameData = new Uint8ClampedArray(data);
 
-        // Detect collision
-        const collision = detectCollision(tracked);
+        // Detect collision or traffic anomaly based on mode
+        const collision = analysisMode === "normal" ? detectCollision(tracked) : null;
+        const trafficAnomaly = analysisMode === "traffic" ? analyzeTrafficFlow(tracked) : null;
 
         // Also check accumulated change anomaly
         const avgChange = gridChange / 48;
-        const accumAnomaly = avgChange > 0.04; // sustained change threshold
+        const accumAnomaly = avgChange > 0.04;
+
+        const anyAnomaly = collision || trafficAnomaly?.disrupted || accumAnomaly;
 
         // Draw
         drawBoxes(tracked, collision);
@@ -400,7 +531,7 @@ export default function VideoAnalysisPage() {
         stateFrameRef.current++;
         let st = stateRef.current;
 
-        if (collision || accumAnomaly) {
+        if (anyAnomaly) {
           if (st === "monitoring") st = "watching";
           else if (st === "watching") st = "confirming";
           else if (st === "confirming") st = "alert";
@@ -418,9 +549,9 @@ export default function VideoAnalysisPage() {
         if (st === "alert" && stateRef.current !== "alert" && cooldownRef.current <= 0) {
           cooldownRef.current = 40;
           createIncident({
-            type: collision ? "vehicle_collision" : "vehicle_collision",
-            severity: (collision?.confidence || 0) > 0.65 ? "critical" : "major",
-            confidence: collision?.confidence || 0.7,
+            type: trafficAnomaly?.disrupted ? "vehicle_collision" : "vehicle_collision",
+            severity: ((collision?.confidence || trafficAnomaly?.confidence || 0)) > 0.65 ? "critical" : "major",
+            confidence: collision?.confidence || trafficAnomaly?.confidence || 0.7,
             timestamp: new Date().toISOString(),
             latitude: LAT + (Math.random()-0.5)*0.01,
             longitude: LNG + (Math.random()-0.5)*0.01,
@@ -529,6 +660,14 @@ export default function VideoAnalysisPage() {
                     <div onClick={() => !isAnalyzing && setDemoMode(!demoMode)} className={`w-10 h-5 rounded-full transition-colors relative ${demoMode ? "bg-yellow-500" : "bg-green-600"}`}>
                       <div className={`w-4 h-4 bg-white rounded-full absolute top-0.5 transition-transform ${demoMode ? "translate-x-5" : "translate-x-0.5"}`} />
                     </div>
+                    <span className="text-muted-foreground">|</span>
+                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${analysisMode === "traffic" ? "bg-orange-500/20 text-orange-500" : "bg-blue-500/20 text-blue-500"}`}>
+                      {analysisMode === "traffic" ? "TRAFFIC" : "NORMAL"}
+                    </span>
+                    <div onClick={() => !isAnalyzing && setAnalysisMode(analysisMode === "normal" ? "traffic" : "normal")}
+                      className={`w-10 h-5 rounded-full transition-colors relative ${analysisMode === "traffic" ? "bg-orange-500" : "bg-blue-600"}`}>
+                      <div className={`w-4 h-4 bg-white rounded-full absolute top-0.5 transition-transform ${analysisMode === "traffic" ? "translate-x-5" : "translate-x-0.5"}`} />
+                    </div>
                     <span className="text-muted-foreground">{selectedClip.name}</span>
                   </label>
                 </div>
@@ -549,7 +688,15 @@ export default function VideoAnalysisPage() {
               </div>
 
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2"><Zap size={16} /> Scene Change</h3>
+                <h3 className="font-semibold mb-3 flex items-center gap-2">
+                  {analysisMode === "traffic" ? <><Zap size={16} /> Flow Analysis</> : <><Zap size={16} /> Scene Change</>}
+                </h3>
+                {analysisMode === "traffic" ? (
+                  <div className="text-sm text-muted-foreground space-y-1">
+                    <p>Detects: traffic blocked, pile-ups, flow disruption</p>
+                    <p className="text-xs">High motion is normal in traffic — we look for flow anomalies instead</p>
+                  </div>
+                ) : null}
                 <div className="grid grid-cols-8 gap-px">
                   {Array.from(accumRef.current).map((v, i) => (
                     <div key={i} className="aspect-square rounded-sm" style={{
