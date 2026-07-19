@@ -36,6 +36,14 @@ function isClose(a: TrackedEntity, b: TrackedEntity, mult: number = 1.0): boolea
   return distance(a, b) < combinedRadius(a, b) * mult;
 }
 
+function hasBoundingBoxOverlap(a: TrackedEntity, b: TrackedEntity): boolean {
+  const ax = a.kalman.getState().x - a.w / 2;
+  const ay = a.kalman.getState().y - a.h / 2;
+  const bx = b.kalman.getState().x - b.w / 2;
+  const by = b.kalman.getState().y - b.h / 2;
+  return !(ax + a.w < bx || bx + b.w < ax || ay + a.h < by || by + b.h < ay);
+}
+
 // === THE CORE TEST: Did speed change near the other object? ===
 // This is the ONLY reliable differentiator between collision and passing.
 // 
@@ -74,8 +82,8 @@ function computeCollisionScore(a: TrackedEntity, b: TrackedEntity): {
   const dist = distance(a, b);
   const combinedR = combinedRadius(a, b);
 
-  // Must be within reasonable distance
-  if (dist > combinedR * 6) return null;
+  // Must be within 3x combined radius (close range only)
+  if (dist > combinedR * 3) return null;
 
   const speedA = Math.sqrt(a.kalman.getState().vx ** 2 + a.kalman.getState().vy ** 2);
   const speedB = Math.sqrt(b.kalman.getState().vx ** 2 + b.kalman.getState().vy ** 2);
@@ -86,27 +94,34 @@ function computeCollisionScore(a: TrackedEntity, b: TrackedEntity): {
   let score = 0;
   const reasons: string[] = [];
 
+  // === DIRECT OVERLAP (strongest — objects are on top of each other) ===
+  const overlap = hasBoundingBoxOverlap(a, b);
+  if (overlap) {
+    score += 0.6;
+    reasons.push("overlap");
+  }
+
   // === PRIMARY SIGNAL: Speed change at proximity ===
   const aSpeedChange = hasSpeedChangeNearOther(a, b);
   const bSpeedChange = hasSpeedChangeNearOther(b, a);
 
   // One or both objects decelerated near the other
   if (aSpeedChange.changed && aSpeedChange.wasMoving) {
-    score += 0.5;
+    score += 0.4;
     reasons.push(`A_brake(${aSpeedChange.deceleration.toFixed(1)})`);
   }
   if (bSpeedChange.changed && bSpeedChange.wasMoving) {
-    score += 0.5;
+    score += 0.4;
     reasons.push(`B_brake(${bSpeedChange.deceleration.toFixed(1)})`);
   }
 
-  // === SECONDARY SIGNAL: Both decelerated (strongest collision evidence) ===
+  // === Both decelerated ===
   if (aSpeedChange.changed && bSpeedChange.changed) {
     score += 0.2;
     reasons.push("both_brake");
   }
 
-  // === TERTIARY: Very close proximity ===
+  // === Close proximity ===
   if (isClose(a, b, 0.7)) {
     score += 0.2;
     reasons.push("touching");
@@ -180,7 +195,7 @@ export function findAllTTCPairs(entities: TrackedEntity[]): TTCPair[] {
 // Post-impact: both stopped + very close + were moving
 export function detectPostImpact(entities: TrackedEntity[], ttcPairs: TTCPair[]): AccidentEvidence | null {
   for (const pair of ttcPairs) {
-    if (pair.distance > 80) continue;
+    if (pair.distance > 60) continue; // must be very close for post-impact
 
     const speedA = pair.a.speed;
     const speedB = pair.b.speed;

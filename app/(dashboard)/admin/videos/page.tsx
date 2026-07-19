@@ -385,6 +385,34 @@ export default function VideoAnalysisPage() {
           }
 
           if (incidentType) {
+            // Play alert sound
+            try {
+              const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+              const osc = audioCtx.createOscillator();
+              const gain = audioCtx.createGain();
+              osc.connect(gain);
+              gain.connect(audioCtx.destination);
+              osc.frequency.value = 880;
+              osc.type = "sine";
+              gain.gain.value = 0.3;
+              osc.start();
+              gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+              osc.stop(audioCtx.currentTime + 0.5);
+              // Second beep
+              setTimeout(() => {
+                const osc2 = audioCtx.createOscillator();
+                const gain2 = audioCtx.createGain();
+                osc2.connect(gain2);
+                gain2.connect(audioCtx.destination);
+                osc2.frequency.value = 1100;
+                osc2.type = "sine";
+                gain2.gain.value = 0.3;
+                osc2.start();
+                gain2.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+                osc2.stop(audioCtx.currentTime + 0.5);
+              }, 200);
+            } catch {}
+
             createIncident({
               type: incidentType, severity,
               confidence: topEv?.confidence || 0.6,
