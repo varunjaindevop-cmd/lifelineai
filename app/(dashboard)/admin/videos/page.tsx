@@ -51,6 +51,7 @@ export default function VideoAnalysisPage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const tmpCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number>(0);
+  const analyzingRef = useRef(false); // use ref, not state, for loop control
   const trackerRef = useRef<MultiObjectTracker>(new MultiObjectTracker());
   const modelRef = useRef<any>(null);
   const stateRef = useRef("monitoring");
@@ -224,28 +225,41 @@ export default function VideoAnalysisPage() {
   };
 
   const createIncident = async (alert: IncidentAlert) => {
-    const { data: inc } = await supabase.from("incidents").insert({
-      severity: alert.severity, incident_type: alert.type,
-      latitude: alert.latitude, longitude: alert.longitude,
-      location_name: `Video Analysis: ${selectedClip?.name}`,
-      detection_confidence: alert.confidence,
-      detection_data: { source: "ttc_engine", clip: selectedClip?.name },
-      video_clip_url: selectedClip?.src || null,
-      status: "detected",
-    }).select().single();
-
     setIncidents(prev => [...prev, alert]);
     toast.error(`ACCIDENT: ${alert.type.replace(/_/g, " ")} (${alert.severity})`);
 
-    if (inc) {
-      supabase.channel("alerts:ambulance").send({
-        type: "broadcast", event: "new_incident",
-        payload: {
-          incident_id: inc.id, severity: alert.severity, incident_type: alert.type,
-          latitude: alert.latitude, longitude: alert.longitude, video_clip_url: selectedClip?.src,
-          message: `ACCIDENT: ${alert.type.replace(/_/g, " ")}`,
-        },
-      });
+    try {
+      const { data: inc, error } = await supabase.from("incidents").insert({
+        severity: alert.severity, incident_type: alert.type,
+        latitude: alert.latitude, longitude: alert.longitude,
+        location_name: `Video Analysis: ${selectedClip?.name}`,
+        detection_confidence: alert.confidence,
+        detection_data: { source: "ttc_engine", clip: selectedClip?.name },
+        video_clip_url: selectedClip?.src || null,
+        status: "detected",
+      }).select().single();
+
+      if (error) {
+        console.error("Failed to create incident:", error);
+        return;
+      }
+
+      if (inc) {
+        try {
+          supabase.channel("alerts:ambulance").send({
+            type: "broadcast", event: "new_incident",
+            payload: {
+              incident_id: inc.id, severity: alert.severity, incident_type: alert.type,
+              latitude: alert.latitude, longitude: alert.longitude, video_clip_url: selectedClip?.src,
+              message: `ACCIDENT: ${alert.type.replace(/_/g, " ")}`,
+            },
+          });
+        } catch (e) {
+          console.error("Broadcast failed:", e);
+        }
+      }
+    } catch (e) {
+      console.error("Incident creation failed:", e);
     }
   };
 
@@ -274,6 +288,7 @@ export default function VideoAnalysisPage() {
 
     setVideoReady(true);
     setIsAnalyzing(true);
+    analyzingRef.current = true;
     setIncidents([]);
     setState("monitoring");
     setObjectCount(0);
@@ -301,7 +316,7 @@ export default function VideoAnalysisPage() {
 
     const loop = () => {
       try {
-        if (!videoRef.current || videoRef.current.paused || videoRef.current.ended || !isAnalyzing) return;
+        if (!videoRef.current || videoRef.current.paused || videoRef.current.ended || !analyzingRef.current) return;
 
         frameRef.current++;
         if (cooldownRef.current > 0) cooldownRef.current--;
@@ -456,6 +471,7 @@ export default function VideoAnalysisPage() {
   };
 
   const stopAnalysis = () => {
+    analyzingRef.current = false;
     cancelAnimationFrame(rafRef.current);
     if (videoRef.current) { videoRef.current.pause(); videoRef.current.currentTime = 0; }
     setIsAnalyzing(false);
