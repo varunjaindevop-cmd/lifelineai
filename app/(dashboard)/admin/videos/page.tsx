@@ -96,7 +96,7 @@ export default function VideoAnalysisPage() {
 
   // COCO-SSD detection
   const detectObjects = async (video: HTMLVideoElement) => {
-    if (!modelRef.current) return [];
+    if (!modelRef.current || video.paused || video.ended) return [];
     try {
       const predictions = await modelRef.current.detect(video);
       return predictions
@@ -105,7 +105,10 @@ export default function VideoAnalysisPage() {
           const [x, y, w, h] = p.bbox;
           return { class: COCO_MAP[p.class], cx: x + w / 2, cy: y + h / 2, w, h, confidence: p.score };
         });
-    } catch { return []; }
+    } catch (e) {
+      console.error("COCO-SSD error:", e);
+      return [];
+    }
   };
 
   // Compute accumulated change grid
@@ -277,22 +280,36 @@ export default function VideoAnalysisPage() {
 
     let lastDetectTime = 0;
     let latestDetections: { class: string; cx: number; cy: number; w: number; h: number; confidence: number }[] = [];
+    let isDetecting = false;
 
-    const loop = async () => {
+    // Non-blocking detection — runs in background, doesn't block render
+    const scheduleDetection = (video: HTMLVideoElement) => {
+      if (isDetecting || !modelRef.current || video.paused || video.ended) return;
+      const now = Date.now();
+      if (now - lastDetectTime < 300) return;
+      isDetecting = true;
+      lastDetectTime = now;
+      modelRef.current.detect(video).then((predictions: any[]) => {
+        latestDetections = predictions
+          .filter((p: any) => p.class in COCO_MAP && p.score > 0.4)
+          .map((p: any) => {
+            const [x, y, w, h] = p.bbox;
+            return { class: COCO_MAP[p.class], cx: x + w / 2, cy: y + h / 2, w, h, confidence: p.score };
+          });
+      }).catch(() => {}).finally(() => { isDetecting = false; });
+    };
+
+    const loop = () => {
       try {
-        if (!videoRef.current || videoRef.current.paused || videoRef.current.ended) return;
+        if (!videoRef.current || videoRef.current.paused || videoRef.current.ended || !isAnalyzing) return;
 
         frameRef.current++;
         if (cooldownRef.current > 0) cooldownRef.current--;
 
-        // COCO-SSD detection every 100ms (~10 FPS)
-        const now = Date.now();
-        if (now - lastDetectTime > 100) {
-          lastDetectTime = now;
-          latestDetections = await detectObjects(video);
-        }
+        // Schedule non-blocking detection
+        scheduleDetection(videoRef.current);
 
-        // Track with Kalman filter
+        // Track with Kalman filter (uses last known detections)
         const entities = trackerRef.current.update(latestDetections, frameRef.current);
         const validEntities = entities.filter(e => e.age >= 2);
         setObjectCount(validEntities.length);
@@ -429,7 +446,11 @@ export default function VideoAnalysisPage() {
         stateRef.current = st;
         setState(st);
       } catch (e) { console.error(e); }
-      rafRef.current = requestAnimationFrame(loop);
+
+      // Stop loop if video ended or analysis stopped
+      if (videoRef.current && !videoRef.current.paused && !videoRef.current.ended && isAnalyzing) {
+        rafRef.current = requestAnimationFrame(loop);
+      }
     };
     rafRef.current = requestAnimationFrame(loop);
   };
