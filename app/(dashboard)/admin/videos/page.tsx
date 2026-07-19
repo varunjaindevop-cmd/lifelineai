@@ -346,23 +346,24 @@ export default function VideoAnalysisPage() {
         drawFrame(validEntities, ttcPairs, evidence, video.videoWidth || 640, video.videoHeight || 480);
 
         // State machine
-        const hasCollision = evidence.some(e => e.type === "collision" && e.confidence > 0.4);
+        const hasCollision = evidence.some(e => e.type === "collision" && e.confidence > 0.5);
         const hasPostImpact = evidence.some(e => e.type === "post_impact");
-        const hasStrongEvidence = hasCollision || hasPostImpact;
+        const hasBikeFall = evidence.some(e => e.type === "bike_fall");
+        const hasStrongEvidence = hasCollision || hasPostImpact || hasBikeFall;
 
         if (hasStrongEvidence) consecutiveAnomalyRef.current++;
         else consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 1);
 
         let st = stateRef.current;
 
-        if (hasPostImpact) {
+        // Post-impact or bike fall = immediate alert
+        if (hasPostImpact || hasBikeFall) {
           st = "alert";
         } else if (hasStrongEvidence && consecutiveAnomalyRef.current >= 3) {
           if (st === "monitoring") st = "watching";
           else if (st === "watching" && consecutiveAnomalyRef.current >= 5) st = "confirming";
           else if (st === "confirming" && consecutiveAnomalyRef.current >= 8) st = "alert";
         } else if (now % 1000 < 20) {
-          // Decay every 1 second
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
 
@@ -377,6 +378,9 @@ export default function VideoAnalysisPage() {
 
           if (topEv?.type === "post_impact") {
             severity = "critical";
+          } else if (topEv?.type === "bike_fall") {
+            incidentType = "vehicle_collision";
+            severity = "major";
           } else if (topEv?.type === "collision") {
             const hasPerson = topEv.objects.some(id => validEntities.find(v => v.id === id)?.class === "person");
             incidentType = hasPerson ? "pedestrian_collision" : "vehicle_collision";
