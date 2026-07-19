@@ -657,15 +657,15 @@ export default function VideoAnalysisPage() {
                   )}
                   <label className="flex items-center gap-2 text-sm cursor-pointer select-none ml-auto">
                     <span className={`px-2 py-0.5 rounded text-xs font-medium ${demoMode ? "bg-yellow-500/20 text-yellow-500" : "bg-green-500/20 text-green-500"}`}>{demoMode ? "DEMO" : "REAL"}</span>
-                    <div onClick={() => !isAnalyzing && setDemoMode(!demoMode)} className={`w-10 h-5 rounded-full transition-colors relative ${demoMode ? "bg-yellow-500" : "bg-green-600"}`}>
+                    <div onClick={() => setDemoMode(!demoMode)} className={`w-10 h-5 rounded-full transition-colors relative cursor-pointer ${demoMode ? "bg-yellow-500" : "bg-green-600"}`}>
                       <div className={`w-4 h-4 bg-white rounded-full absolute top-0.5 transition-transform ${demoMode ? "translate-x-5" : "translate-x-0.5"}`} />
                     </div>
                     <span className="text-muted-foreground">|</span>
                     <span className={`px-2 py-0.5 rounded text-xs font-medium ${analysisMode === "traffic" ? "bg-orange-500/20 text-orange-500" : "bg-blue-500/20 text-blue-500"}`}>
                       {analysisMode === "traffic" ? "TRAFFIC" : "NORMAL"}
                     </span>
-                    <div onClick={() => !isAnalyzing && setAnalysisMode(analysisMode === "normal" ? "traffic" : "normal")}
-                      className={`w-10 h-5 rounded-full transition-colors relative ${analysisMode === "traffic" ? "bg-orange-500" : "bg-blue-600"}`}>
+                    <div onClick={() => setAnalysisMode(analysisMode === "normal" ? "traffic" : "normal")}
+                      className={`w-10 h-5 rounded-full transition-colors relative cursor-pointer ${analysisMode === "traffic" ? "bg-orange-500" : "bg-blue-600"}`}>
                       <div className={`w-4 h-4 bg-white rounded-full absolute top-0.5 transition-transform ${analysisMode === "traffic" ? "translate-x-5" : "translate-x-0.5"}`} />
                     </div>
                     <span className="text-muted-foreground">{selectedClip.name}</span>
