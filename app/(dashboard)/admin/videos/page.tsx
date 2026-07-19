@@ -162,7 +162,7 @@ export default function VideoAnalysisPage() {
 
     // Draw objects
     for (const entity of entities) {
-      if (entity.age < 2) continue;
+      if (entity.age < 1) continue;
       const isInvolved = evidence.some(e => e.objects.includes(entity.id));
       const baseColor = entity.class === "car" ? "#22c55e" : entity.class === "motorcycle" ? "#f59e0b" : "#3b82f6";
       const color = isInvolved ? "#ef4444" : baseColor;
@@ -216,7 +216,7 @@ export default function VideoAnalysisPage() {
     ctx.fillStyle = "#fff";
     ctx.font = "11px Arial";
     const modeLabel = envMode === "traffic" ? "TRAFFIC" : envMode === "marketplace" ? "MARKETPLACE" : "ISOLATED";
-    ctx.fillText(`${modeLabel} | Objects: ${entities.filter(e => e.age >= 2).length} | PPM: ${pixelsPerMeterRef.current.toFixed(1)}`, 8, barY + 14);
+    ctx.fillText(`${modeLabel} | Objects: ${entities.filter(e => e.age >= 1).length} | PPM: ${pixelsPerMeterRef.current.toFixed(1)}`, 8, barY + 14);
   };
 
   const createIncident = async (alert: IncidentAlert) => {
@@ -280,18 +280,20 @@ export default function VideoAnalysisPage() {
     const scheduleDetection = (vid: HTMLVideoElement) => {
       if (isDetecting || !modelRef.current || vid.paused || vid.ended) return;
       const now = Date.now();
-      if (now - lastDetectTime < 500) return;
+      if (now - lastDetectTime < 300) return; // 3 FPS detection
       isDetecting = true;
       lastDetectTime = now;
       modelRef.current.detect(vid).then((preds: any[]) => {
         latestDetections = preds
-          .filter((p: any) => p.class in COCO_MAP && p.score > 0.3)
+          .filter((p: any) => p.class in COCO_MAP && p.score > 0.25) // lower threshold
           .map((p: any) => {
             const [x, y, w, h] = p.bbox;
             return { class: COCO_MAP[p.class], cx: x + w / 2, cy: y + h / 2, w, h, confidence: p.score };
           });
-        if (frameRef.current % 60 === 0) console.log(`[SAGE] ${preds.length} raw → ${latestDetections.length} filtered`);
-      }).catch(() => {}).finally(() => { isDetecting = false; });
+        console.log(`[SAGE] COCO-SSD: ${preds.length} raw → ${latestDetections.length} filtered`);
+      }).catch((e: any) => {
+        console.error("[SAGE] COCO-SSD error:", e);
+      }).finally(() => { isDetecting = false; });
     };
 
     let lastChangeTime = 0;
@@ -307,7 +309,7 @@ export default function VideoAnalysisPage() {
         scheduleDetection(videoRef.current);
 
         const entities = trackerRef.current.update(latestDetections, frameRef.current);
-        const validEntities = entities.filter(e => e.age >= 2);
+        const validEntities = entities.filter(e => e.age >= 1); // age 1 = just detected
 
         // Debug logging every 3 seconds
         if (now - (loop as any).lastLogTime > 3000) {
@@ -325,7 +327,7 @@ export default function VideoAnalysisPage() {
             const tmp = getTmp();
             tmp.width = video.videoWidth || 640;
             tmp.height = video.videoHeight || 480;
-            const tCtx = tmp.getContext("2d")!;
+            const tCtx = tmp.getContext("2d", { willReadFrequently: true })!;
             tCtx.drawImage(video, 0, 0, tmp.width, tmp.height);
             const imgData = tCtx.getImageData(0, 0, tmp.width, tmp.height);
             const changeGrid = computeChangeGrid(imgData.data, tmp.width, tmp.height);
@@ -344,7 +346,7 @@ export default function VideoAnalysisPage() {
         drawFrame(validEntities, ttcPairs, evidence, video.videoWidth || 640, video.videoHeight || 480);
 
         // State machine
-        const hasCollision = evidence.some(e => e.type === "collision" && e.confidence > 0.7);
+        const hasCollision = evidence.some(e => e.type === "collision" && e.confidence > 0.4);
         const hasPostImpact = evidence.some(e => e.type === "post_impact");
         const hasStrongEvidence = hasCollision || hasPostImpact;
 
@@ -355,10 +357,10 @@ export default function VideoAnalysisPage() {
 
         if (hasPostImpact) {
           st = "alert";
-        } else if (hasStrongEvidence && consecutiveAnomalyRef.current >= 8) {
+        } else if (hasStrongEvidence && consecutiveAnomalyRef.current >= 3) {
           if (st === "monitoring") st = "watching";
-          else if (st === "watching" && consecutiveAnomalyRef.current >= 12) st = "confirming";
-          else if (st === "confirming" && consecutiveAnomalyRef.current >= 16) st = "alert";
+          else if (st === "watching" && consecutiveAnomalyRef.current >= 5) st = "confirming";
+          else if (st === "confirming" && consecutiveAnomalyRef.current >= 8) st = "alert";
         } else if (now % 1000 < 20) {
           // Decay every 1 second
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
@@ -551,7 +553,7 @@ export default function VideoAnalysisPage() {
                 <div className="space-y-2 max-h-60 overflow-y-auto">
                   {(() => {
                     const entities = Array.from((trackerRef.current as any).entities?.values?.() || []) as TrackedEntity[];
-                    const filtered = entities.filter((b: any) => b.age >= 2);
+                    const filtered = entities.filter((b: any) => b.age >= 1);
                     if (filtered.length === 0) return <p className="text-sm text-muted-foreground">{isAnalyzing ? "Scanning..." : "Start"}</p>;
                     return filtered.map((b: any) => {
                       const { current: speedKmh } = calculateRealSpeed(b, pixelsPerMeterRef.current);
