@@ -550,67 +550,7 @@ export default function VideoAnalysisPage() {
   };
 
   const recordClipAndAlert = async (alert: IncidentAlert) => {
-    // Record the last 15 seconds of frames as a WebM clip
-    const frames = frameBufferRef.current;
-    let videoClipUrl: string | undefined;
-
-    if (frames.length > 10 && typeof MediaRecorder !== "undefined") {
-      try {
-        const canvas = document.createElement("canvas");
-        canvas.width = 320;
-        canvas.height = 240;
-        const ctx = canvas.getContext("2d")!;
-
-        const stream = canvas.captureStream(4); // 4 FPS
-        const recorder = new MediaRecorder(stream, { mimeType: "video/webm;codecs=vp8" });
-        const chunks: Blob[] = [];
-
-        recorder.ondataavailable = (e) => {
-          if (e.data.size > 0) chunks.push(e.data);
-        };
-
-        const clipBlob = await new Promise<Blob | null>((resolve) => {
-          recorder.onstop = () => resolve(new Blob(chunks, { type: "video/webm" }));
-          recorder.start();
-
-          let i = 0;
-          const drawNext = () => {
-            if (i >= frames.length) {
-              recorder.stop();
-              return;
-            }
-            ctx.putImageData(frames[i], 0, 0);
-            i++;
-            setTimeout(drawNext, 250); // 4 FPS
-          };
-          drawNext();
-
-          // Timeout safety
-          setTimeout(() => {
-            if (recorder.state === "recording") recorder.stop();
-          }, 30000);
-        });
-
-        if (clipBlob && clipBlob.size > 1000) {
-          // Upload to Supabase Storage
-          const filename = `clips/${Date.now()}-clip.webm`;
-          const { data: uploadData } = await supabase.storage
-            .from("incident-clips")
-            .upload(filename, clipBlob, { contentType: "video/webm" });
-
-          if (uploadData) {
-            const { data: urlData } = supabase.storage
-              .from("incident-clips")
-              .getPublicUrl(filename);
-            videoClipUrl = urlData?.publicUrl;
-          }
-        }
-      } catch (err) {
-        console.error("Clip recording failed:", err);
-      }
-    }
-
-    // Create incident with clip URL
+    // Step 1: Create incident immediately (no clip yet)
     const { data: incident, error } = await supabase
       .from("incidents")
       .insert({
@@ -621,7 +561,6 @@ export default function VideoAnalysisPage() {
         location_name: `Video Analysis: ${selectedClip?.name}`,
         detection_confidence: alert.confidence,
         detection_data: { source: "video_analysis", clip: selectedClip?.name },
-        video_clip_url: videoClipUrl || null,
         status: "detected",
       })
       .select()
@@ -629,28 +568,132 @@ export default function VideoAnalysisPage() {
 
     if (error) {
       console.error("Incident insert error:", error);
-      setIncidents((prev) => [...prev, { ...alert, video_clip_url: videoClipUrl }]);
+      setIncidents((prev) => [...prev, alert]);
       toast.error(`ACCIDENT DETECTED: ${alert.type.replace(/_/g, " ")} (${alert.severity})`);
       return;
     }
 
-    if (incident) {
-      setIncidents((prev) => [...prev, { ...alert, video_clip_url: videoClipUrl }]);
-      toast.error(`ACCIDENT DETECTED: ${alert.type.replace(/_/g, " ")} (${alert.severity}) — dispatching ambulance!`);
+    // Show incident immediately in UI
+    setIncidents((prev) => [...prev, alert]);
+    toast.error(`ACCIDENT DETECTED: ${alert.type.replace(/_/g, " ")} (${alert.severity}) — dispatching ambulance!`);
 
-      supabase.channel("alerts:ambulance").send({
-        type: "broadcast",
-        event: "new_incident",
-        payload: {
-          incident_id: incident.id,
-          severity: alert.severity,
-          incident_type: alert.type,
-          latitude: alert.latitude,
-          longitude: alert.longitude,
-          video_clip_url: videoClipUrl,
-          message: `ACCIDENT from video analysis: ${alert.type.replace(/_/g, " ")}`,
-        },
-      });
+    // Broadcast immediately (without clip — ambulance gets the alert)
+    supabase.channel("alerts:ambulance").send({
+      type: "broadcast",
+      event: "new_incident",
+      payload: {
+        incident_id: incident.id,
+        severity: alert.severity,
+        incident_type: alert.type,
+        latitude: alert.latitude,
+        longitude: alert.longitude,
+        message: `ACCIDENT from video analysis: ${alert.type.replace(/_/g, " ")}`,
+      },
+    });
+
+    // Step 2: Record clip async (non-blocking) and attach it
+    const frames = frameBufferRef.current;
+    if (frames.length > 5) {
+      // Fire and forget — don't block the alert
+      (async () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = 320;
+          canvas.height = 240;
+          const ctx = canvas.getContext("2d")!;
+
+          // Check if MediaRecorder is available
+          if (typeof MediaRecorder === "undefined") {
+            console.warn("MediaRecorder not available — skipping clip");
+            return;
+          }
+
+          const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8")
+            ? "video/webm;codecs=vp8"
+            : "video/webm";
+
+          const stream = canvas.captureStream(4);
+          const recorder = new MediaRecorder(stream, { mimeType });
+          const chunks: Blob[] = [];
+
+          recorder.ondataavailable = (e) => {
+            if (e.data.size > 0) chunks.push(e.data);
+          };
+
+          const clipBlob = await new Promise<Blob | null>((resolve) => {
+            const timeout = setTimeout(() => {
+              if (recorder.state === "recording") recorder.stop();
+            }, 20000);
+
+            recorder.onstop = () => {
+              clearTimeout(timeout);
+              resolve(new Blob(chunks, { type: "video/webm" }));
+            };
+            recorder.start();
+
+            let i = 0;
+            const drawNext = () => {
+              if (i >= frames.length || recorder.state !== "recording") {
+                recorder.stop();
+                return;
+              }
+              ctx.putImageData(frames[i], 0, 0);
+              i++;
+              setTimeout(drawNext, 250);
+            };
+            drawNext();
+          });
+
+          if (!clipBlob || clipBlob.size < 500) {
+            console.warn("Clip too small, skipping upload");
+            return;
+          }
+
+          // Upload to Supabase Storage
+          const filename = `clips/${incident.id}/${Date.now()}.webm`;
+          const { data: uploadData, error: uploadErr } = await supabase.storage
+            .from("incident-clips")
+            .upload(filename, clipBlob, { contentType: "video/webm" });
+
+          if (uploadErr) {
+            console.error("Upload error:", uploadErr);
+            // Try creating the bucket if it doesn't exist
+            await supabase.storage.createBucket("incident-clips", { public: true });
+            const { data: retry } = await supabase.storage
+              .from("incident-clips")
+              .upload(filename, clipBlob, { contentType: "video/webm" });
+            if (retry) {
+              const { data: urlData } = supabase.storage.from("incident-clips").getPublicUrl(filename);
+              if (urlData?.publicUrl) {
+                await supabase.from("incidents").update({ video_clip_url: urlData.publicUrl }).eq("id", incident.id);
+                // Broadcast clip URL to ambulance
+                supabase.channel("alerts:ambulance").send({
+                  type: "broadcast",
+                  event: "clip_ready",
+                  payload: { incident_id: incident.id, video_clip_url: urlData.publicUrl },
+                });
+              }
+            }
+            return;
+          }
+
+          if (uploadData) {
+            const { data: urlData } = supabase.storage.from("incident-clips").getPublicUrl(filename);
+            if (urlData?.publicUrl) {
+              // Update incident with clip URL
+              await supabase.from("incidents").update({ video_clip_url: urlData.publicUrl }).eq("id", incident.id);
+              // Broadcast clip URL to ambulance in real-time
+              supabase.channel("alerts:ambulance").send({
+                type: "broadcast",
+                event: "clip_ready",
+                payload: { incident_id: incident.id, video_clip_url: urlData.publicUrl },
+              });
+            }
+          }
+        } catch (err) {
+          console.error("Clip recording failed:", err);
+        }
+      })();
     }
   };
 
