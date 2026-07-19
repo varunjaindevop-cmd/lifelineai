@@ -8,8 +8,10 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { toast } from "sonner";
-import cocoSsd from "@tensorflow-models/coco-ssd";
-import * as tf from "@tensorflow/tfjs";
+
+// Dynamic imports for TensorFlow (avoids SSR issues)
+let cocoSsdModule: any = null;
+let tfModule: any = null;
 
 // ========== TYPES ==========
 interface VideoClip { name: string; src: string; description: string }
@@ -71,7 +73,7 @@ export default function VideoAnalysisPage() {
   const tmpCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number>(0);
   const blobsRef = useRef<TrackedObject[]>([]);
-  const modelRef = useRef<cocoSsd.ObjectDetection | null>(null);
+  const modelRef = useRef<any>(null);
   const stateRef = useRef("monitoring");
   const frameRef = useRef(0);
   const stateFrameRef = useRef(0);
@@ -86,8 +88,14 @@ export default function VideoAnalysisPage() {
     const loadModel = async () => {
       setModelLoading(true);
       try {
-        await tf.ready();
-        modelRef.current = await cocoSsd.load({ base: "lite_mobilenet_v2" });
+        const [tf, cocoSsd] = await Promise.all([
+          import("@tensorflow/tfjs"),
+          import("@tensorflow-models/coco-ssd"),
+        ]);
+        tfModule = tf;
+        cocoSsdModule = cocoSsd;
+        await tfModule.ready();
+        modelRef.current = await cocoSsdModule.load({ base: "lite_mobilenet_v2" });
         setModelReady(true);
       } catch (e) {
         console.error("Failed to load COCO-SSD:", e);
@@ -111,9 +119,9 @@ export default function VideoAnalysisPage() {
     if (!modelRef.current) return [];
     try {
       const predictions = await modelRef.current.detect(video);
-      return predictions
-        .filter(p => p.class in COCO_MAP && p.score > 0.4)
-        .map(p => {
+        return predictions
+          .filter((p: any) => p.class in COCO_MAP && p.score > 0.4)
+          .map((p: any) => {
           const [x, y, w, h] = p.bbox;
           return {
             class: COCO_MAP[p.class] || p.class,
@@ -379,6 +387,7 @@ export default function VideoAnalysisPage() {
 
     blobsRef.current = [];
     prevFrameRef.current = null;
+    accumRef.current = new Float32Array(80);
     frameRef.current = 0;
     stateFrameRef.current = 0;
     cooldownRef.current = 0;
@@ -394,6 +403,7 @@ export default function VideoAnalysisPage() {
 
     let lastDetectTime = 0;
     let latestDetections: { class: string; cx: number; cy: number; w: number; h: number; confidence: number }[] = [];
+    let prevChangeGrid: Float32Array | null = null;
 
     const loop = async () => {
       try {
@@ -413,13 +423,33 @@ export default function VideoAnalysisPage() {
         const tracked = trackObjects(latestDetections, frameRef.current);
         setObjectCount(tracked.filter(b => b.frames >= 2).length);
 
-        // Compute change score
+        // Compute change score + update accumulated grid
         const tmp = getTmp();
         tmp.width = 640; tmp.height = 480;
         const ctx = tmp.getContext("2d")!;
         ctx.drawImage(video, 0, 0, 640, 480);
         const imgData = ctx.getImageData(0, 0, 640, 480);
         const changeScore = computeChange(imgData);
+
+        // Update accum grid for display
+        const data = imgData.data;
+        const cw = Math.floor(640 / 10), ch = Math.floor(480 / 8);
+        const currGrid = new Float32Array(80);
+        for (let r = 0; r < 8; r++) for (let c = 0; c < 10; c++) {
+          let s = 0, n = 0;
+          for (let dy = 0; dy < ch; dy += 4) for (let dx = 0; dx < cw; dx += 4) {
+            const i = ((r * ch + dy) * 640 + (c * cw + dx)) * 4;
+            s += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114; n++;
+          }
+          currGrid[r * 10 + c] = n > 0 ? s / n : 128;
+        }
+        if (accumRef.current) {
+          for (let i = 0; i < 80; i++) {
+            const diff = prevChangeGrid ? Math.abs(currGrid[i] - prevChangeGrid[i]) / 255 : 0;
+            accumRef.current[i] = accumRef.current[i] * 0.95 + diff * 3;
+          }
+        }
+        prevChangeGrid = currGrid;
 
         // Collision detection (always active)
         const collision = detectCollision(tracked);
@@ -519,6 +549,7 @@ export default function VideoAnalysisPage() {
     setIncidents([]);
     blobsRef.current = [];
     prevFrameRef.current = null;
+    accumRef.current = new Float32Array(80);
     frameRef.current = 0;
     stateFrameRef.current = 0;
     cooldownRef.current = 0;
@@ -645,6 +676,27 @@ export default function VideoAnalysisPage() {
                 </div>
                 <div className="mt-2 text-xs text-muted-foreground">
                   Mode: {envMode} | Cooldown: {cooldownRef.current}f
+                </div>
+              </div>
+
+              {/* Change Detection Grid */}
+              <div className="bg-card p-4 rounded-xl border border-border">
+                <h3 className="font-semibold mb-3 flex items-center gap-2">
+                  <Zap size={16} /> Change Detection
+                </h3>
+                <p className="text-xs text-muted-foreground mb-2">Region-level pixel change (accumulated)</p>
+                <div className="grid gap-px" style={{ gridTemplateColumns: `repeat(10, 1fr)` }}>
+                  {Array.from(accumRef.current || new Float32Array(80)).map((v, i) => (
+                    <div key={i} className="aspect-square rounded-sm" style={{
+                      backgroundColor: v > 0.08 ? `rgb(${Math.min(255, Math.floor(v * 2000))},0,0)` :
+                        v > 0.03 ? `rgb(${Math.min(255, Math.floor(v * 1500))},${Math.floor(v * 500)},0)` :
+                          `rgb(0,${Math.min(255, Math.floor(v * 3000))},0)`
+                    }} />
+                  ))}
+                </div>
+                <div className="flex justify-between text-xs text-muted-foreground mt-1">
+                  <span>Green = calm</span>
+                  <span>Red = high change</span>
                 </div>
               </div>
 
