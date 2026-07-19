@@ -1,245 +1,311 @@
-// Time-to-Collision (TTC) Engine
-// Predicts accidents BEFORE they happen using trajectory extrapolation
+// Time-to-Collision (TTC) Engine v2
+// Key insight: TTC alone can't distinguish "passing by" from "colliding"
+// We need path intersection analysis + multiple confirmation signals
 
 import { TrackedEntity } from "./kalman-tracker";
 
 export interface TTCPair {
   a: TrackedEntity;
   b: TrackedEntity;
-  ttc: number;           // seconds to collision (NaN = not converging)
-  distance: number;      // current distance in pixels
-  closingSpeed: number;  // speed of approach (positive = approaching)
-  predictedOverlap: boolean; // will bounding boxes overlap?
+  ttc: number;
+  distance: number;
+  closingSpeed: number;
   severity: "none" | "warning" | "critical" | "impact";
 }
 
 export interface AccidentEvidence {
-  type: "ttc_critical" | "post_impact" | "trajectory_anomaly" | "sudden_stop" | "shape_change";
+  type: "collision" | "post_impact" | "perpendicular_impact";
   confidence: number;
   objects: number[];
   details: string;
 }
 
-// Calculate Time-to-Collision between two tracked entities
-export function computeTTC(a: TrackedEntity, b: TrackedEntity): TTCPair {
-  const ax = a.kalman.getState().x;
-  const ay = a.kalman.getState().y;
-  const bx = b.kalman.getState().x;
-  const by = b.kalman.getState().y;
+// ===== CORE: Is this a real collision vs passing by? =====
+// Two objects "pass by" if:
+//   1. They're moving in roughly the same direction (parallel)
+//   2. One overtakes the other
+//   3. They cross paths but at different times
+// Two objects "collide" if:
+//   1. Their paths intersect AND they arrive at the intersection simultaneously
+//   2. OR they are already overlapping/very close with converging velocities
+//   3. OR one suddenly stops after being close to the other (post-impact)
 
-  // Relative position
-  const rx = bx - ax;
-  const ry = by - ay;
-  const dist = Math.sqrt(rx * rx + ry * ry);
-
-  // Relative velocity (closing speed)
-  const avx = a.kalman.getState().vx;
-  const avy = a.kalman.getState().vy;
-  const bvx = b.kalman.getState().vx;
-  const bvy = b.kalman.getState().vy;
-  const rvx = bvx - avx;
-  const rvy = bvy - avy;
-
-  // Closing speed (positive = approaching)
-  const closingSpeed = -(rx * rvx + ry * rvy) / Math.max(dist, 1);
-
-  // Combined "radius" (approximate from bounding boxes)
-  const combinedR = (Math.sqrt(a.w * a.h) + Math.sqrt(b.w * b.h)) / 2;
-
-  // TTC calculation
-  let ttc = NaN;
-  if (closingSpeed > 0.5) { // approaching at > 0.5 px/frame
-    ttc = Math.max(0, (dist - combinedR) / closingSpeed);
-  }
-
-  // Predict overlap at TTC
-  const predictedOverlap = !isNaN(ttc) && dist < combinedR * 2;
-
-  // Determine severity
-  let severity: TTCPair["severity"] = "none";
-  if (!isNaN(ttc)) {
-    if (ttc < 0.3) severity = "impact";
-    else if (ttc < 1.0) severity = "critical";
-    else if (ttc < 2.5) severity = "warning";
-  }
-
-  return { a, b, ttc, distance: dist, closingSpeed, predictedOverlap, severity };
+function areParallel(a: TrackedEntity, b: TrackedEntity): boolean {
+  const angleA = a.heading;
+  const angleB = b.heading;
+  let diff = Math.abs(angleA - angleB);
+  if (diff > Math.PI) diff = 2 * Math.PI - diff;
+  return diff < Math.PI * 0.4; // within ~72 degrees = parallel
 }
 
-// Find all TTC pairs for a set of tracked entities
+function willPathsCrossAtSameTime(a: TrackedEntity, b: TrackedEntity): boolean {
+  // Project both objects forward and check if they'd be at the same spot at the same time
+  const ax = a.kalman.getState().x, ay = a.kalman.getState().y;
+  const bx = b.kalman.getState().x, by = b.kalman.getState().y;
+  const avx = a.kalman.getState().vx, avy = a.kalman.getState().vy;
+  const bvx = b.kalman.getState().vx, bvy = b.kalman.getState().vy;
+
+  // Check multiple future time steps
+  for (let t = 1; t <= 5; t++) {
+    const futAx = ax + avx * t;
+    const futAy = ay + avy * t;
+    const futBx = bx + bvx * t;
+    const futBy = by + bvy * t;
+    const dist = Math.sqrt((futAx - futBx) ** 2 + (futAy - futBy) ** 2);
+    const combinedR = (Math.sqrt(a.w * a.h) + Math.sqrt(b.w * b.h)) / 2;
+    if (dist < combinedR * 0.8) return true; // would overlap at time t
+  }
+  return false;
+}
+
+function hasBoundingBoxOverlap(a: TrackedEntity, b: TrackedEntity): boolean {
+  const ax = a.kalman.getState().x - a.w / 2;
+  const ay = a.kalman.getState().y - a.h / 2;
+  const bx = b.kalman.getState().x - b.w / 2;
+  const by = b.kalman.getState().y - b.h / 2;
+  return !(ax + a.w < bx || bx + b.w < ax || ay + a.h < by || by + b.h < ay);
+}
+
+function areVeryClose(a: TrackedEntity, b: TrackedEntity, threshold: number = 1.2): boolean {
+  const dx = a.kalman.getState().x - b.kalman.getState().x;
+  const dy = a.kalman.getState().y - b.kalman.getState().y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const combinedR = (Math.sqrt(a.w * a.h) + Math.sqrt(b.w * b.h)) / 2;
+  return dist < combinedR * threshold;
+}
+
+// Compute collision likelihood between two entities
+function computeCollisionScore(a: TrackedEntity, b: TrackedEntity): { score: number; ttc: number; reason: string } | null {
+  const ax = a.kalman.getState().x, ay = a.kalman.getState().y;
+  const bx = b.kalman.getState().x, by = b.kalman.getState().y;
+  const dx = bx - ax, dy = by - ay;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const combinedR = (Math.sqrt(a.w * a.h) + Math.sqrt(b.w * b.h)) / 2;
+
+  // Skip if too far apart
+  if (dist > combinedR * 5) return null;
+
+  const avx = a.kalman.getState().vx, avy = a.kalman.getState().vy;
+  const bvx = b.kalman.getState().vx, bvy = b.kalman.getState().vy;
+  const speedA = Math.sqrt(avx * avx + avy * avy);
+  const speedB = Math.sqrt(bvx * bvx + bvy * bvy);
+
+  // At least one must be moving
+  if (speedA < 0.3 && speedB < 0.3) return null;
+
+  let score = 0;
+  let reasons: string[] = [];
+
+  // === SIGNAL 1: Bounding box overlap (strongest signal) ===
+  if (hasBoundingBoxOverlap(a, b)) {
+    score += 0.5;
+    reasons.push("overlap");
+  }
+
+  // === SIGNAL 2: Very close proximity ===
+  if (areVeryClose(a, b, 0.8)) {
+    score += 0.3;
+    reasons.push("very_close");
+  } else if (areVeryClose(a, b, 1.5)) {
+    score += 0.1;
+    reasons.push("close");
+  }
+
+  // === SIGNAL 3: Not parallel (one is cutting across the other's path) ===
+  const parallel = areParallel(a, b);
+  if (!parallel) {
+    score += 0.2;
+    reasons.push("crossing");
+  }
+
+  // === SIGNAL 4: Closing speed (approaching each other) ===
+  const closingSpeed = -(dx * (bvx - avx) + dy * (bvy - avy)) / Math.max(dist, 1);
+  if (closingSpeed > 2) {
+    score += 0.2;
+    reasons.push("closing_fast");
+  } else if (closingSpeed > 0.5) {
+    score += 0.1;
+    reasons.push("closing");
+  }
+
+  // === SIGNAL 5: Will paths cross at same time? ===
+  if (willPathsCrossAtSameTime(a, b)) {
+    score += 0.2;
+    reasons.push("path_cross");
+  }
+
+  // === SIGNAL 6: Sudden deceleration near the other object ===
+  const decelA = a.speedHistory.length >= 3
+    ? a.speedHistory[a.speedHistory.length - 3] - a.speed
+    : 0;
+  const decelB = b.speedHistory.length >= 3
+    ? b.speedHistory[b.speedHistory.length - 3] - b.speed
+    : 0;
+  if ((decelA > 1.5 || decelB > 1.5) && areVeryClose(a, b, 3)) {
+    score += 0.3;
+    reasons.push("hard_brake_nearby");
+  }
+
+  // === PENALTY: Parallel + similar speed = passing by ===
+  if (parallel && Math.abs(speedA - speedB) < 1.5) {
+    score -= 0.4;
+    reasons.push("PASSING");
+  }
+
+  // === PENALTY: One clearly overtaking the other ===
+  if (parallel) {
+    const angleDiff = Math.abs(a.heading - b.heading);
+    const wrapped = angleDiff > Math.PI ? 2 * Math.PI - angleDiff : angleDiff;
+    if (wrapped < Math.PI * 0.2) {
+      // Same direction — check if one is behind and faster (overtaking)
+      const aBehind = (dx * avx + dy * avy) < 0; // a is behind b relative to b's direction
+      const bFaster = speedB > speedA;
+      if ((aBehind && bFaster) || (!aBehind && speedA > speedB)) {
+        score -= 0.3;
+        reasons.push("overtaking");
+      }
+    }
+  }
+
+  // TTC for reference
+  const ttc = closingSpeed > 0.5 ? Math.max(0, (dist - combinedR) / closingSpeed) : NaN;
+
+  // Minimum score threshold
+  if (score < 0.5) return null;
+
+  return { score: Math.min(score, 1), ttc, reason: reasons.join("+") };
+}
+
+// Find all collision pairs
 export function findAllTTCPairs(entities: TrackedEntity[]): TTCPair[] {
   const pairs: TTCPair[] = [];
-  const candidates = entities.filter(e => e.age >= 3); // need tracking history
+  const candidates = entities.filter(e => e.age >= 3);
 
   for (let i = 0; i < candidates.length; i++) {
     for (let j = i + 1; j < candidates.length; j++) {
       const a = candidates[i], b = candidates[j];
-      // Skip person-person
       if (a.class === "person" && b.class === "person") continue;
-      
-      const pair = computeTTC(a, b);
-      if (!isNaN(pair.ttc) && pair.ttc < 5) { // only interested in near-term collisions
-        pairs.push(pair);
-      }
+
+      const result = computeCollisionScore(a, b);
+      if (!result) continue;
+
+      const closingSpeed = -( 
+        (b.kalman.getState().x - a.kalman.getState().x) * (b.kalman.getState().vx - a.kalman.getState().vx) +
+        (b.kalman.getState().y - a.kalman.getState().y) * (b.kalman.getState().vy - a.kalman.getState().vy)
+      ) / Math.max(
+        Math.sqrt(
+          (b.kalman.getState().x - a.kalman.getState().x) ** 2 +
+          (b.kalman.getState().y - a.kalman.getState().y) ** 2
+        ), 1
+      );
+
+      const dist = Math.sqrt(
+        (a.kalman.getState().x - b.kalman.getState().x) ** 2 +
+        (a.kalman.getState().y - b.kalman.getState().y) ** 2
+      );
+
+      let severity: TTCPair["severity"] = "none";
+      if (result.score >= 0.7) severity = "impact";
+      else if (result.score >= 0.55) severity = "critical";
+      else if (result.score >= 0.4) severity = "warning";
+
+      pairs.push({
+        a, b,
+        ttc: result.ttc,
+        distance: dist,
+        closingSpeed,
+        severity,
+      });
     }
   }
 
-  pairs.sort((a, b) => a.ttc - b.ttc);
+  pairs.sort((a, b) => b.distance - a.distance); // closest first
   return pairs;
 }
 
-// Detect trajectory anomaly (object deviating from expected path)
-export function detectTrajectoryAnomaly(entity: TrackedEntity): { anomalous: boolean; deviation: number } {
-  if (entity.positions.length < 5) return { anomalous: false, deviation: 0 };
-
-  const positions = entity.positions.slice(-5);
-  
-  // Fit linear trajectory to first 3 points
-  const p0 = positions[0], p1 = positions[1], p2 = positions[2];
-  const dx = p1.x - p0.x;
-  const dy = p1.y - p0.y;
-  
-  // Predict positions 3 and 4 based on linear trend
-  const pred3 = { x: p0.x + dx * 3, y: p0.y + dy * 3 };
-  const pred4 = { x: p0.x + dx * 4, y: p0.y + dy * 4 };
-  
-  const actual3 = positions[3];
-  const actual4 = positions[4];
-  
-  const dev3 = Math.sqrt((pred3.x - actual3.x) ** 2 + (pred3.y - actual3.y) ** 2);
-  const dev4 = Math.sqrt((pred4.x - actual4.x) ** 2 + (pred4.y - actual4.y) ** 2);
-  const avgDev = (dev3 + dev4) / 2;
-  
-  // Speed-based threshold
-  const speed = entity.speed;
-  const threshold = Math.max(3, speed * 0.5); // at least 3px deviation or 50% of speed
-  
-  return { anomalous: avgDev > threshold, deviation: avgDev };
-}
-
-// Detect post-impact state (both objects stopped after being close)
+// Post-impact: both objects stopped + very close + were recently moving
 export function detectPostImpact(entities: TrackedEntity[], ttcPairs: TTCPair[]): AccidentEvidence | null {
-  // Look for pairs that were recently close (TTC was low) and are now both stopped
   for (const pair of ttcPairs) {
-    if (pair.distance > 200) continue; // too far apart
-    
+    if (pair.distance > 100) continue; // must be very close
+
     const speedA = pair.a.speed;
     const speedB = pair.b.speed;
-    
-    // Both must be nearly stopped
-    if (speedA < 0.5 && speedB < 0.5) {
-      // Check if they were recently moving
-      const wasMovingA = pair.a.speedHistory.some(s => s > 1.5);
-      const wasMovingB = pair.b.speedHistory.some(s => s > 1.5);
-      
-      if (wasMovingA && wasMovingB) {
-        return {
-          type: "post_impact",
-          confidence: 0.85,
-          objects: [pair.a.id, pair.b.id],
-          details: `Both objects stopped after approach (dist: ${pair.distance.toFixed(0)}px)`,
-        };
-      }
-    }
-  }
-  return null;
-}
 
-// Detect shape change (bike falling, vehicle rollover)
-export function detectShapeChange(entity: TrackedEntity): AccidentEvidence | null {
-  if (entity.positions.length < 5) return null;
-  
-  // Check if bounding box aspect ratio changed dramatically
-  const currentAR = entity.w / Math.max(entity.h, 1);
-  
-  // Store aspect ratio history in a simple way
-  // We track via the w/h ratio change
-  const speed = entity.speed;
-  const headingChange = entity.headingHistory.length >= 3 
-    ? Math.abs(entity.headingHistory[entity.headingHistory.length - 1] - entity.headingHistory[entity.headingHistory.length - 3])
-    : 0;
-  
-  // Large heading change at low speed = possible rollover/fall
-  if (headingChange > Math.PI * 0.5 && speed < 1 && entity.age > 5) {
+    // Both must be nearly stopped
+    if (speedA > 0.8 || speedB > 0.8) continue;
+
+    // Must have been moving recently
+    const wasMovingA = pair.a.speedHistory.length >= 3 && pair.a.speedHistory.some(s => s > 2);
+    const wasMovingB = pair.b.speedHistory.length >= 3 && pair.b.speedHistory.some(s => s > 2);
+    if (!wasMovingA || !wasMovingB) continue;
+
+    // Must be overlapping or very close
+    if (!areVeryClose(pair.a, pair.b, 0.8)) continue;
+
     return {
-      type: "shape_change",
-      confidence: 0.7,
-      objects: [entity.id],
-      details: `Sudden heading change (${(headingChange * 180 / Math.PI).toFixed(0)}°) at low speed`,
+      type: "post_impact",
+      confidence: 0.85,
+      objects: [pair.a.id, pair.b.id],
+      details: `Both stopped after moving (dist: ${pair.distance.toFixed(0)}px)`,
     };
   }
-  
   return null;
 }
 
-// Main accident detection — combines all signals
+// Main accident detection — conservative, high-confidence only
 export function detectAccidents(
   entities: TrackedEntity[],
-  ttcPairs: TTCPair[],
-  sceneChangeScore: number
+  ttcPairs: TTCPair[]
 ): AccidentEvidence[] {
   const evidence: AccidentEvidence[] = [];
-  
-  // 1. TTC-based detection (primary)
+
+  // 1. Active collision detection (from TTC pairs with high collision score)
   for (const pair of ttcPairs) {
     if (pair.severity === "impact") {
-      evidence.push({
-        type: "ttc_critical",
-        confidence: Math.min(0.95, 0.6 + (1 / Math.max(pair.ttc, 0.1)) * 0.1),
-        objects: [pair.a.id, pair.b.id],
-        details: `TTC: ${pair.ttc.toFixed(2)}s, closing: ${pair.closingSpeed.toFixed(1)}px/f, dist: ${pair.distance.toFixed(0)}px`,
-      });
-    } else if (pair.severity === "critical") {
-      evidence.push({
-        type: "ttc_critical",
-        confidence: Math.min(0.85, 0.4 + (1 / Math.max(pair.ttc, 0.1)) * 0.05),
-        objects: [pair.a.id, pair.b.id],
-        details: `TTC: ${pair.ttc.toFixed(2)}s (critical range)`,
-      });
-    }
-  }
-  
-  // 2. Post-impact detection
-  const postImpact = detectPostImpact(entities, ttcPairs);
-  if (postImpact) evidence.push(postImpact);
-  
-  // 3. Trajectory anomalies
-  for (const entity of entities) {
-    const anomaly = detectTrajectoryAnomaly(entity);
-    if (anomaly.anomalous) {
-      evidence.push({
-        type: "trajectory_anomaly",
-        confidence: Math.min(0.8, 0.3 + anomaly.deviation * 0.02),
-        objects: [entity.id],
-        details: `Trajectory deviation: ${anomaly.deviation.toFixed(1)}px`,
-      });
-    }
-    
-    // 4. Shape change (bike fall)
-    const shapeChange = detectShapeChange(entity);
-    if (shapeChange) evidence.push(shapeChange);
-  }
-  
-  // 5. Scene-level: sudden stop detection
-  for (const entity of entities) {
-    if (entity.speedHistory.length >= 4) {
-      const recentAvg = (entity.speedHistory[entity.speedHistory.length - 1] + entity.speedHistory[entity.speedHistory.length - 2]) / 2;
-      const prevAvg = (entity.speedHistory[0] + entity.speedHistory[1]) / 2;
-      if (prevAvg > 2 && recentAvg < 0.3) {
+      const result = computeCollisionScore(pair.a, pair.b);
+      if (result && result.score >= 0.6) {
         evidence.push({
-          type: "sudden_stop",
-          confidence: 0.6,
-          objects: [entity.id],
-          details: `Speed dropped from ${prevAvg.toFixed(1)} to ${recentAvg.toFixed(1)} px/frame`,
+          type: "collision",
+          confidence: Math.min(0.95, result.score),
+          objects: [pair.a.id, pair.b.id],
+          details: `score: ${result.score.toFixed(2)} | ${result.reason} | dist: ${pair.distance.toFixed(0)}px`,
         });
       }
     }
   }
-  
-  // Sort by confidence
+
+  // 2. Post-impact detection (most reliable — objects stopped after moving)
+  const postImpact = detectPostImpact(entities, ttcPairs);
+  if (postImpact) evidence.push(postImpact);
+
+  // 3. Perpendicular impact: one object stopped suddenly near another moving object
+  for (const entity of entities) {
+    if (entity.speedHistory.length < 4) continue;
+    const prevSpeed = (entity.speedHistory[0] + entity.speedHistory[1]) / 2;
+    const currSpeed = entity.speed;
+    
+    // Object was moving fast and suddenly stopped
+    if (prevSpeed < 2 || currSpeed > 0.8) continue;
+    
+    // Check if another moving object is very close
+    for (const other of entities) {
+      if (other.id === entity.id) continue;
+      if (other.speed < 1) continue; // other must be moving
+      if (!areVeryClose(entity, other, 1.5)) continue;
+      
+      // The stopped object + moving nearby object = possible perpendicular impact
+      evidence.push({
+        type: "perpendicular_impact",
+        confidence: 0.7,
+        objects: [entity.id, other.id],
+        details: `Object #${entity.id} stopped suddenly near moving #${other.id}`,
+      });
+      break;
+    }
+  }
+
+  // Sort by confidence, deduplicate
   evidence.sort((a, b) => b.confidence - a.confidence);
-  
-  // Remove duplicate object references
   const seen = new Set<string>();
   return evidence.filter(e => {
     const key = e.objects.sort().join(",");

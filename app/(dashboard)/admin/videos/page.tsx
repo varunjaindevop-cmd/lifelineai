@@ -319,35 +319,34 @@ export default function VideoAnalysisPage() {
         ttcPairsRef.current = ttcPairs;
 
         // Accident detection
-        const avgChange = accumRef.current.reduce((a, b) => a + b, 0) / (GRID_COLS * GRID_ROWS);
-        const evidence = detectAccidents(validEntities, ttcPairs, avgChange);
+        const evidence = detectAccidents(validEntities, ttcPairs);
         evidenceRef.current = evidence;
 
         // Draw
         drawFrame(validEntities, ttcPairs, evidence, changeGrid, video.videoWidth || 640, video.videoHeight || 480);
 
-        // ========== STATE MACHINE (TTC-based) ==========
-        const hasCriticalEvidence = evidence.some(e =>
-          e.type === "ttc_critical" && e.confidence > 0.5
+        // ========== STATE MACHINE (Conservative) ==========
+        // Only advance with ACTUAL collision evidence, not just proximity
+        const hasCollision = evidence.some(e =>
+          (e.type === "collision" || e.type === "post_impact" || e.type === "perpendicular_impact") &&
+          e.confidence > 0.6
         );
-        const hasAnyEvidence = evidence.length > 0;
+        const hasHighConfidenceCollision = evidence.some(e =>
+          (e.type === "collision" || e.type === "post_impact") &&
+          e.confidence > 0.75
+        );
 
-        if (hasCriticalEvidence) consecutiveAnomalyRef.current++;
-        else if (hasAnyEvidence) consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 0.5);
+        if (hasCollision) consecutiveAnomalyRef.current++;
         else consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 1);
 
         stateFrameRef.current++;
         let st = stateRef.current;
 
-        // TTC-based state transitions
-        const topTTC = ttcPairs.length > 0 ? ttcPairs[0].ttc : Infinity;
-
-        if (hasCriticalEvidence && consecutiveAnomalyRef.current >= 3) {
+        // Strict state machine: need sustained collision evidence
+        if (hasCollision && consecutiveAnomalyRef.current >= 5) {
           if (st === "monitoring") st = "watching";
-          else if (st === "watching" && topTTC < 1.5) st = "confirming";
-          else if (st === "confirming" && topTTC < 0.5) st = "alert";
-        } else if (hasAnyEvidence && consecutiveAnomalyRef.current >= 5) {
-          if (st === "monitoring") st = "watching";
+          else if (st === "watching" && hasHighConfidenceCollision && consecutiveAnomalyRef.current >= 8) st = "confirming";
+          else if (st === "confirming" && hasHighConfidenceCollision && consecutiveAnomalyRef.current >= 12) st = "alert";
         } else if (!demoMode && frameRef.current % 5 === 0) {
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
@@ -369,12 +368,13 @@ export default function VideoAnalysisPage() {
           let severity = "major";
 
           if (topEv) {
-            if (topEv.type === "ttc_critical") {
-              incidentType = evidence.some(e => e.objects.some(id => {
+            if (topEv.type === "collision" || topEv.type === "perpendicular_impact") {
+              const hasPerson = topEv.objects.some(id => {
                 const ent = validEntities.find(v => v.id === id);
                 return ent?.class === "person";
-              })) ? "pedestrian_collision" : "vehicle_collision";
-              severity = topEv.confidence > 0.7 ? "critical" : "major";
+              });
+              incidentType = hasPerson ? "pedestrian_collision" : "vehicle_collision";
+              severity = topEv.confidence > 0.8 ? "critical" : "major";
             } else if (topEv.type === "post_impact") {
               incidentType = "vehicle_collision";
               severity = "critical";
