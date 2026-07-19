@@ -66,17 +66,11 @@ function CameraCard({ camera, clipIndex }: { camera: Camera; clipIndex: number }
           muted
           loop
           playsInline
-          preload="metadata"
-          onMouseEnter={() => {
-            if (videoRef.current) videoRef.current.play();
-            setIsPlaying(true);
-          }}
-          onMouseLeave={() => {
+          autoPlay
+          onLoadedData={() => {
             if (videoRef.current) {
-              videoRef.current.pause();
-              videoRef.current.currentTime = 0;
+              videoRef.current.play().catch(() => {});
             }
-            setIsPlaying(false);
           }}
         />
         {/* Play/Pause overlay */}
