@@ -11,7 +11,7 @@ import { toast } from "sonner";
 
 interface VideoClip { name: string; src: string; description: string }
 interface IncidentAlert { type: string; severity: string; confidence: number; timestamp: string; latitude: number; longitude: number }
-interface Blob { id: number; cx: number; cy: number; w: number; h: number; vx: number; vy: number; frames: number; lastSeen: number; class: string; positions: {x:number;y:number}[]; _near?: number }
+interface Blob { id: number; cx: number; cy: number; w: number; h: number; vx: number; vy: number; frames: number; lastSeen: number; class: string; positions: {x:number;y:number}[]; _near?: number; area: number; speedHist: number[] }
 
 const VIDEO_CLIPS: VideoClip[] = [
   { name: "accident_sample.mp4", src: "/videos/accident_sample.mp4", description: "Vehicle collision" },
@@ -139,6 +139,38 @@ export default function VideoAnalysisPage() {
     return merged;
   };
 
+  // ========== OBJECT CLASSIFICATION ==========
+  // Uses area, aspect ratio, and Y-position (lower = closer to camera = likely vehicle)
+  // Bikes/motorcycles: tall + narrow, medium area
+  // Cars/vehicles: wide, large area
+  // People: tall + narrow, smaller area, often at edges
+  const classifyBlob = (w: number, h: number, cy: number): string => {
+    const area = w * h;
+    const aspect = w / Math.max(h, 1); // >1 = wide, <1 = tall
+
+    // Very small blobs are likely noise/person fragments
+    if (area < 400) return "person";
+
+    // Large blobs: almost certainly vehicles (cars, trucks, buses)
+    if (area > 2500) return "car";
+
+    // Medium-large + wide: vehicle
+    if (area > 1200 && aspect > 0.8) return "car";
+
+    // Medium area + tall (aspect < 0.7): could be bike or person
+    // Bikes are typically lower on screen (closer to road)
+    if (area > 600 && aspect < 0.7) {
+      // Lower half of frame = road level = more likely bike
+      return cy > H * 0.4 ? "bike" : "person";
+    }
+
+    // Medium + square-ish: likely vehicle viewed from front
+    if (area > 800 && aspect > 0.6 && aspect < 1.4) return "car";
+
+    // Default: small + tall = person
+    return "person";
+  };
+
   // Track blobs across frames
   const trackBlobs = (detections: { cx: number; cy: number; w: number; h: number; mass: number }[], frame: number): Blob[] => {
     const tracked = blobsRef.current;
@@ -157,10 +189,19 @@ export default function VideoAnalysisPage() {
         blob.vy = det.cy - blob.cy;
         blob.cx = det.cx; blob.cy = det.cy;
         blob.w = det.w; blob.h = det.h;
+        blob.area = det.w * det.h;
         blob.frames++;
         blob.lastSeen = frame;
         blob.positions.push({ x: det.cx, y: det.cy });
         if (blob.positions.length > 10) blob.positions.shift();
+        // Track speed history for deceleration detection
+        const spd = Math.sqrt(blob.vx ** 2 + blob.vy ** 2);
+        blob.speedHist.push(spd);
+        if (blob.speedHist.length > 8) blob.speedHist.shift();
+        // Re-classify with more data as blob matures
+        if (blob.frames >= 3) {
+          blob.class = classifyBlob(det.w, det.h, det.cy);
+        }
         matched.add(best);
       }
     }
@@ -172,8 +213,10 @@ export default function VideoAnalysisPage() {
       tracked.push({
         id: nextId++, cx: d.cx, cy: d.cy, w: d.w, h: d.h,
         vx: 0, vy: 0, frames: 1, lastSeen: frame,
-        class: d.w / Math.max(d.h, 1) > 1.2 ? "car" : "person",
+        class: classifyBlob(d.w, d.h, d.cy),
         positions: [{ x: d.cx, y: d.cy }],
+        area: d.w * d.h,
+        speedHist: [0],
       });
     }
 
@@ -182,45 +225,63 @@ export default function VideoAnalysisPage() {
   };
 
   // ========== COLLISION DETECTION ==========
-  // Runs in BOTH normal and traffic modes. A collision is a collision regardless of mode.
-  // False positive suppression: parallel-moving vehicles in same direction = traffic, not collision
+  // CLASS-AGNOSTIC: checks all object pairs (car-car, car-person, car-bike, bike-person, etc.)
+  // Works in both normal and traffic modes.
+  // Detects: proximity + convergence + deceleration (sudden stop = impact)
   const detectCollision = (blobs: Blob[]): { detected: boolean; confidence: number; a: Blob; b: Blob } | null => {
-    // In traffic mode, lower the frame requirement — accidents happen fast
-    const minFrames = analysisMode === "traffic" ? 3 : 5;
-    const vehicles = blobs.filter(b => b.class === "car" && b.frames >= minFrames);
-    const pedestrians = blobs.filter(b => b.class === "person" && b.frames >= minFrames);
-    const all = [...vehicles, ...pedestrians];
+    const minFrames = analysisMode === "traffic" ? 2 : 3;
+    // Use ALL tracked objects, not filtered by class
+    const candidates = blobs.filter(b => b.frames >= minFrames);
+    if (candidates.length < 2) return null;
 
-    for (let i = 0; i < all.length; i++) {
-      for (let j = i + 1; j < all.length; j++) {
-        const a = all[i], b = all[j];
-        // Skip person-person pairs
+    let bestResult: { detected: boolean; confidence: number; a: Blob; b: Blob } | null = null;
+
+    for (let i = 0; i < candidates.length; i++) {
+      for (let j = i + 1; j < candidates.length; j++) {
+        const a = candidates[i], b = candidates[j];
+
+        // Skip person-person (normal interaction)
         if (a.class === "person" && b.class === "person") continue;
 
-        // Both objects must be moving
-        const speedA = Math.sqrt(a.vx**2 + a.vy**2);
-        const speedB = Math.sqrt(b.vx**2 + b.vy**2);
-        if (speedA < 0.5 && speedB < 0.5) continue;
+        const dist = Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2);
+        const combinedR = Math.sqrt(a.area) + Math.sqrt(b.area);
 
-        const dist = Math.sqrt((a.cx-b.cx)**2 + (a.cy-b.cy)**2);
-        const combinedR = (a.w + b.w) / 2;
-
-        // Must be reasonably close
+        // Must be close — within 1.5x combined "radius"
         if (dist > combinedR * 1.5) continue;
 
-        // Converging? Check if heading toward each other
+        // Speeds
+        const speedA = Math.sqrt(a.vx ** 2 + a.vy ** 2);
+        const speedB = Math.sqrt(b.vx ** 2 + b.vy ** 2);
+        const eitherMoving = speedA > 0.3 || speedB > 0.3;
+
+        // Direction analysis
         const dx = b.cx - a.cx, dy = b.cy - a.cy;
         const dotA = a.vx * dx + a.vy * dy;
         const dotB = b.vx * (-dx) + b.vy * (-dy);
         const converging = dotA > 0 || dotB > 0;
 
-        // Direction analysis — skip parallel movers (normal traffic)
+        // Parallel detection (same direction = normal traffic, not collision)
         const angleA = Math.atan2(a.vy, a.vx);
         const angleB = Math.atan2(b.vy, b.vx);
         const angleDiff = Math.abs(angleA - angleB);
-        const parallel = angleDiff < Math.PI * 0.25 || angleDiff > Math.PI * 1.75;
-        // Parallel + not very close = normal traffic behavior, skip
-        if (parallel && dist > combinedR * 0.5) continue;
+        const parallel = angleDiff < Math.PI * 0.3 || angleDiff > Math.PI * 1.7;
+
+        // Deceleration detection: sudden speed drop = impact
+        let decelScore = 0;
+        if (a.speedHist.length >= 3) {
+          const recent = a.speedHist.slice(-3);
+          const prevAvg = recent.slice(0, 2).reduce((s, v) => s + v, 0) / 2;
+          const curr = recent[recent.length - 1];
+          if (prevAvg > 1 && curr < prevAvg * 0.4) decelScore = 1;
+          else if (prevAvg > 1 && curr < prevAvg * 0.6) decelScore = 0.5;
+        }
+        if (b.speedHist.length >= 3) {
+          const recent = b.speedHist.slice(-3);
+          const prevAvg = recent.slice(0, 2).reduce((s, v) => s + v, 0) / 2;
+          const curr = recent[recent.length - 1];
+          if (prevAvg > 1 && curr < prevAvg * 0.4) decelScore = Math.max(decelScore, 1);
+          else if (prevAvg > 1 && curr < prevAvg * 0.6) decelScore = Math.max(decelScore, 0.5);
+        }
 
         // Track sustained closeness
         const closeThresh = combinedR * 1.2;
@@ -233,22 +294,33 @@ export default function VideoAnalysisPage() {
         }
         const near = Math.min(a._near || 0, b._near || 0);
 
-        // Very close OR close+converging+sustained
+        // Scoring
+        const proximity = 1 - Math.min(dist / (combinedR * 1.5), 1);
         const veryClose = dist < combinedR * 0.5;
-        const closeConverging = dist < closeThresh && converging && near >= 3;
+        const closeConverging = dist < closeThresh && converging && near >= 2;
 
-        if (veryClose || closeConverging) {
-          const conf = Math.min(0.95,
-            0.35 * (1 - dist / (combinedR * 1.5)) +
-            0.25 * (converging ? 1 : 0.2) +
-            0.2 * Math.min(near / 4, 1) +
-            0.2 * (!parallel ? 1 : 0.3)
-          );
-          if (conf > 0.45) return { detected: true, confidence: conf, a, b };
+        if (!veryClose && !closeConverging && decelScore === 0) continue;
+        if (!eitherMoving && decelScore === 0) continue;
+
+        const conf = Math.min(0.95,
+          0.30 * proximity +
+          0.25 * (converging ? 1 : 0.1) +
+          0.20 * Math.min(near / 3, 1) +
+          0.15 * (parallel ? 0.1 : 1) +
+          0.10 * decelScore
+        );
+
+        // Require either: very close, or close+converging+sustained, or deceleration+proximity
+        const validSignal = veryClose || closeConverging || (decelScore > 0 && proximity > 0.3);
+
+        if (validSignal && conf > 0.35) {
+          if (!bestResult || conf > bestResult.confidence) {
+            bestResult = { detected: true, confidence: conf, a, b };
+          }
         }
       }
     }
-    return null;
+    return bestResult;
   };
 
   // ========== TRAFFIC FLOW ANALYSIS ==========
@@ -458,7 +530,10 @@ export default function VideoAnalysisPage() {
       const h = blob.h * sy;
 
       const isCollision = collision && (collision.a.id === blob.id || collision.b.id === blob.id);
-      const color = isCollision ? "#ef4444" : blob.class === "car" ? "#22c55e" : "#3b82f6";
+      const color = isCollision ? "#ef4444"
+        : blob.class === "car" ? "#22c55e"
+        : blob.class === "bike" ? "#f59e0b"
+        : "#3b82f6";
 
       ctx.strokeStyle = color;
       ctx.lineWidth = isCollision ? 3 : 2;
@@ -585,58 +660,71 @@ export default function VideoAnalysisPage() {
         const collision = detectCollision(tracked);
         const trafficAnomaly = analysisMode === "traffic" ? analyzeTrafficFlow(tracked) : null;
 
-        // Also check accumulated change anomaly — but suppress in marketplace-like scenes
+        // Also check accumulated change
         const avgChange = gridChange / 48;
         const validTracked = tracked.filter(b => b.frames >= 3);
-        const vehicleCount = validTracked.filter(b => b.class === "car").length;
-        const personCount = validTracked.filter(b => b.class === "person").length;
-        const isMarketplaceScene = personCount >= 3 && vehicleCount < 2;
 
-        // Accumulated change in marketplace is normal (people walking) — require higher threshold
-        const accumThreshold = isMarketplaceScene ? 0.08 : 0.04;
+        // Accumulated change is a valid signal in normal mode
+        // In traffic mode, motion is expected — only use it if very high
+        const accumThreshold = analysisMode === "traffic" ? 0.10 : 0.04;
         const accumAnomaly = avgChange > accumThreshold;
 
-        // In traffic mode, motion is EXPECTED. Only real anomaly evidence counts:
-        // - collision (direct impact detected) — highest priority, always valid
-        // - trafficAnomaly.disrupted (sustained flow disruption) — secondary signal
-        // accumulated change alone should NOT trigger alerts in traffic mode
-        const hasRealAnomaly = analysisMode === "traffic"
-          ? !!(collision || trafficAnomaly?.disrupted)
-          : !!(collision || trafficAnomaly?.disrupted || accumAnomaly);
+        // Determine anomaly evidence based on mode
+        const hasCollision = !!collision;
+        const hasTrafficDisruption = !!trafficAnomaly?.disrupted;
+        const hasChangeAnomaly = accumAnomaly;
 
-        // Direct collision is high-confidence evidence — state machine advances faster
-        const isDirectCollision = !!collision && collision.confidence > 0.45;
+        // Different thresholds per mode
+        let hasRealAnomaly: boolean;
+        let isHighConfidence: boolean;
+
+        if (analysisMode === "traffic") {
+          // Traffic: require collision OR sustained flow disruption
+          // Accumulated change alone is NOT enough (too much normal motion)
+          hasRealAnomaly = hasCollision || hasTrafficDisruption;
+          isHighConfidence = hasCollision && (collision?.confidence || 0) > 0.5;
+        } else {
+          // Normal: collision OR accumulated change anomaly
+          // Accumulated change is valid here since isolated roads have less motion
+          hasRealAnomaly = hasCollision || hasChangeAnomaly;
+          isHighConfidence = hasCollision && (collision?.confidence || 0) > 0.4;
+        }
 
         // Draw
         drawBoxes(tracked, collision);
         setObjectCount(validTracked.length);
 
-        // Track consecutive anomaly frames — must be truly sustained
+        // Track consecutive frames with real anomaly evidence
         if (hasRealAnomaly) {
           consecutiveAnomalyRef.current++;
         } else {
-          consecutiveAnomalyRef.current = 0;
+          // In normal mode, decay slowly (accum anomaly flickers)
+          // In traffic mode, decay faster (strict signal needed)
+          consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - (analysisMode === "traffic" ? 2 : 1));
         }
 
-        // State machine — require sustained anomaly, but respond faster to direct collisions
+        // ========== STATE MACHINE ==========
         stateFrameRef.current++;
         let st = stateRef.current;
 
-        if (hasRealAnomaly && consecutiveAnomalyRef.current >= 3) {
-          if (st === "monitoring") st = "watching";
-          else if (st === "watching") {
-            // Direct collision: advance to confirming faster (3 frames vs 8)
-            const confirmThreshold = isDirectCollision ? 3 : 8;
-            if (consecutiveAnomalyRef.current >= confirmThreshold) st = "confirming";
+        if (analysisMode === "traffic") {
+          // Traffic mode: strict — require sustained consecutive evidence
+          if (hasRealAnomaly && consecutiveAnomalyRef.current >= 3) {
+            if (st === "monitoring") st = "watching";
+            else if (st === "watching" && consecutiveAnomalyRef.current >= (isHighConfidence ? 3 : 8)) st = "confirming";
+            else if (st === "confirming" && consecutiveAnomalyRef.current >= (isHighConfidence ? 8 : STATE_ADVANCE_THRESHOLD)) st = "alert";
+          } else if (!demoMode && frameRef.current % 6 === 0) {
+            st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
           }
-          else if (st === "confirming") {
-            // Direct collision: advance to alert faster (8 frames vs 25)
-            const alertThreshold = isDirectCollision ? 8 : STATE_ADVANCE_THRESHOLD;
-            if (consecutiveAnomalyRef.current >= alertThreshold) st = "alert";
+        } else {
+          // Normal mode: simpler — any anomaly evidence advances, decay every few frames
+          if (hasRealAnomaly) {
+            if (st === "monitoring") st = "watching";
+            else if (st === "watching" && consecutiveAnomalyRef.current >= 3) st = "confirming";
+            else if (st === "confirming" && consecutiveAnomalyRef.current >= (isHighConfidence ? 4 : 10)) st = "alert";
+          } else if (!demoMode && frameRef.current % 5 === 0) {
+            st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
           }
-        } else if (!demoMode && frameRef.current % 6 === 0) {
-          // Decay: only step down every 6 frames to avoid oscillation
-          st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
 
         if (demoMode) {
@@ -647,7 +735,7 @@ export default function VideoAnalysisPage() {
         }
 
         if (st === "alert" && stateRef.current !== "alert" && cooldownRef.current <= 0) {
-          cooldownRef.current = 90; // 18 seconds at 5fps — long cooldown for traffic
+          cooldownRef.current = analysisMode === "traffic" ? 90 : 40; // 18s traffic, 8s normal
           consecutiveAnomalyRef.current = 0; // reset after alert
 
           // Determine correct incident type — collision takes priority (direct evidence)
