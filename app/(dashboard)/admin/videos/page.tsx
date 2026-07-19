@@ -345,29 +345,19 @@ export default function VideoAnalysisPage() {
 
         drawFrame(validEntities, ttcPairs, evidence, video.videoWidth || 640, video.videoHeight || 480);
 
-        // State machine — conservative, requires sustained evidence
-        const hasCollision = evidence.some(e => e.type === "collision" && e.confidence > 0.5);
-        const hasPostImpact = evidence.some(e => e.type === "post_impact");
-        const hasBikeFall = evidence.some(e => e.type === "bike_fall");
-        const hasStrongEvidence = hasCollision || hasPostImpact || hasBikeFall;
+        // State machine — simple: overlap for N frames = alert
+        const hasCollision = evidence.some(e => e.type === "collision");
 
-        if (hasStrongEvidence) consecutiveAnomalyRef.current++;
-        else consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 2); // decay fast
+        if (hasCollision) consecutiveAnomalyRef.current++;
+        else consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 1);
 
         let st = stateRef.current;
 
-        // Post-impact or bike fall = immediate alert (these are definitive)
-        if (hasPostImpact || hasBikeFall) {
-          st = "alert";
-        }
-        // Active collision needs sustained evidence
-        else if (hasStrongEvidence && consecutiveAnomalyRef.current >= 5) {
+        if (consecutiveAnomalyRef.current >= 3) {
           if (st === "monitoring") st = "watching";
-          else if (st === "watching" && consecutiveAnomalyRef.current >= 8) st = "confirming";
-          else if (st === "confirming" && consecutiveAnomalyRef.current >= 12) st = "alert";
-        }
-        // Decay every 1.5 seconds
-        else if (now % 1500 < 20) {
+          else if (st === "watching" && consecutiveAnomalyRef.current >= 5) st = "confirming";
+          else if (st === "confirming" && consecutiveAnomalyRef.current >= 8) st = "alert";
+        } else if (now % 1500 < 20) {
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
 
@@ -378,19 +368,7 @@ export default function VideoAnalysisPage() {
 
           const topEv = evidence[0];
           let incidentType = "vehicle_collision";
-          let severity = "major";
-
-          if (topEv?.type === "post_impact") {
-            severity = "critical";
-          } else if (topEv?.type === "bike_fall") {
-            incidentType = "vehicle_collision";
-            severity = "major";
-          } else if (topEv?.type === "collision") {
-            const hasPerson = topEv.objects.some(id => validEntities.find(v => v.id === id)?.class === "person");
-            incidentType = hasPerson ? "pedestrian_collision" : "vehicle_collision";
-          } else {
-            incidentType = "";
-          }
+          let severity = topEv?.confidence === 0.9 ? "critical" : "major";
 
           if (incidentType) {
             createIncident({
