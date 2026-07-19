@@ -325,28 +325,29 @@ export default function VideoAnalysisPage() {
         // Draw
         drawFrame(validEntities, ttcPairs, evidence, changeGrid, video.videoWidth || 640, video.videoHeight || 480);
 
-        // ========== STATE MACHINE (Conservative) ==========
-        // Only advance with ACTUAL collision evidence, not just proximity
+        // ========== STATE MACHINE (Very Conservative) ==========
+        // ONLY advance with strong collision evidence (speed change + proximity)
         const hasCollision = evidence.some(e =>
-          (e.type === "collision" || e.type === "post_impact" || e.type === "perpendicular_impact") &&
-          e.confidence > 0.6
+          e.type === "collision" && e.confidence > 0.7
         );
-        const hasHighConfidenceCollision = evidence.some(e =>
-          (e.type === "collision" || e.type === "post_impact") &&
-          e.confidence > 0.75
-        );
+        const hasPostImpact = evidence.some(e => e.type === "post_impact");
+        // Post-impact is the strongest signal — both objects stopped after moving
+        const hasStrongEvidence = hasCollision || hasPostImpact;
 
-        if (hasCollision) consecutiveAnomalyRef.current++;
+        if (hasStrongEvidence) consecutiveAnomalyRef.current++;
         else consecutiveAnomalyRef.current = Math.max(0, consecutiveAnomalyRef.current - 1);
 
         stateFrameRef.current++;
         let st = stateRef.current;
 
-        // Strict state machine: need sustained collision evidence
-        if (hasCollision && consecutiveAnomalyRef.current >= 5) {
+        // Very strict: need sustained strong evidence
+        if (hasPostImpact) {
+          // Post-impact = immediate alert (both stopped, was moving)
+          st = "alert";
+        } else if (hasStrongEvidence && consecutiveAnomalyRef.current >= 8) {
           if (st === "monitoring") st = "watching";
-          else if (st === "watching" && hasHighConfidenceCollision && consecutiveAnomalyRef.current >= 8) st = "confirming";
-          else if (st === "confirming" && hasHighConfidenceCollision && consecutiveAnomalyRef.current >= 12) st = "alert";
+          else if (st === "watching" && consecutiveAnomalyRef.current >= 12) st = "confirming";
+          else if (st === "confirming" && consecutiveAnomalyRef.current >= 16) st = "alert";
         } else if (!demoMode && frameRef.current % 5 === 0) {
           st = st === "alert" ? "confirming" : st === "confirming" ? "watching" : "monitoring";
         }
