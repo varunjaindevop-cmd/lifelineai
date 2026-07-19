@@ -93,6 +93,7 @@ export default function VideoAnalysisPage() {
   const [incidents, setIncidents] = useState<IncidentAlert[]>([]);
   const [currentState, setCurrentState] = useState("monitoring");
   const [sceneChange, setSceneChange] = useState(0);
+  const [demoMode, setDemoMode] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const analysisCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -183,30 +184,30 @@ export default function VideoAnalysisPage() {
     });
   };
 
-  // REAL motion-based detection using frame differencing
+  // Motion-based detection — conservative thresholds to eliminate false alarms
   const detectMotion = useCallback((currFrame: ImageData, prevFrame: ImageData): Detection[] => {
     const w = currFrame.width;
     const h = currFrame.height;
     const curr = currFrame.data;
     const prev = prevFrame.data;
 
-    // Compute difference map
+    // Step 1: Difference map with HIGH threshold (only significant motion)
     const diff = new Uint8Array(w * h);
     for (let i = 0; i < diff.length; i++) {
       const idx = i * 4;
       const grayCurr = curr[idx] * 0.299 + curr[idx + 1] * 0.587 + curr[idx + 2] * 0.114;
       const grayPrev = prev[idx] * 0.299 + prev[idx + 1] * 0.587 + prev[idx + 2] * 0.114;
-      diff[i] = Math.abs(grayCurr - grayPrev) > 25 ? 255 : 0;
+      diff[i] = Math.abs(grayCurr - grayPrev) > 35 ? 255 : 0; // HIGH threshold
     }
 
-    // Dilate to merge nearby motion pixels
+    // Step 2: Aggressive dilation (merge nearby motion into big blobs)
     const dilated = new Uint8Array(w * h);
-    const kernel = 5;
+    const kernel = 8;
     for (let y = kernel; y < h - kernel; y++) {
       for (let x = kernel; x < w - kernel; x++) {
         let max = 0;
-        for (let dy = -kernel; dy <= kernel; dy++) {
-          for (let dx = -kernel; dx <= kernel; dx++) {
+        for (let dy = -kernel; dy <= kernel; dy += 2) {
+          for (let dx = -kernel; dx <= kernel; dx += 2) {
             if (diff[(y + dy) * w + (x + dx)] > max) max = diff[(y + dy) * w + (x + dx)];
           }
         }
@@ -214,35 +215,27 @@ export default function VideoAnalysisPage() {
       }
     }
 
-    // Find connected components (blobs) using simple flood-fill-like approach
+    // Step 3: Connected components — only large blobs survive
     const visited = new Uint8Array(w * h);
-    const blobs: { x: number; y: number; w: number; h: number; cx: number; cy: number; area: number; avgBrightness: number }[] = [];
+    const blobs: { x: number; y: number; w: number; h: number; cx: number; cy: number; area: number; motionDensity: number }[] = [];
 
-    for (let y = 10; y < h - 10; y += 3) {
-      for (let x = 10; x < w - 10; x += 3) {
+    for (let y = kernel; y < h - kernel; y += 4) {
+      for (let x = kernel; x < w - kernel; x += 4) {
         if (visited[y * w + x] || dilated[y * w + x] === 0) continue;
 
-        // BFS to find connected region
-        let minX = x, maxX = x, minY = y, maxY = y, sumX = 0, sumY = 0, count = 0, brightnessSum = 0;
+        let minX = x, maxX = x, minY = y, maxY = y, sumX = 0, sumY = 0, count = 0;
         const queue = [x, y];
         visited[y * w + x] = 1;
 
         while (queue.length > 0) {
           const qx = queue.shift()!;
           const qy = queue.shift()!;
-          sumX += qx;
-          sumY += qy;
-          count++;
-          brightnessSum += curr[(qy * w + qx) * 4] * 0.299 + curr[(qy * w + qx) * 4 + 1] * 0.587 + curr[(qy * w + qx) * 4 + 2] * 0.114;
-          if (qx < minX) minX = qx;
-          if (qx > maxX) maxX = qx;
-          if (qy < minY) minY = qy;
-          if (qy > maxY) maxY = qy;
+          sumX += qx; sumY += qy; count++;
+          if (qx < minX) minX = qx; if (qx > maxX) maxX = qx;
+          if (qy < minY) minY = qy; if (qy > maxY) maxY = qy;
 
-          // Expand to neighbors
-          for (const [ddx, ddy] of [[-3, 0], [3, 0], [0, -3], [0, 3]]) {
-            const nx = qx + ddx;
-            const ny = qy + ddy;
+          for (const [ddx, ddy] of [[-4, 0], [4, 0], [0, -4], [0, 4]]) {
+            const nx = qx + ddx, ny = qy + ddy;
             if (nx >= 0 && nx < w && ny >= 0 && ny < h && !visited[ny * w + nx] && dilated[ny * w + nx] > 0) {
               visited[ny * w + nx] = 1;
               queue.push(nx, ny);
@@ -250,79 +243,67 @@ export default function VideoAnalysisPage() {
           }
         }
 
-        if (count < 30) continue; // Ignore tiny noise
-
         const blobW = maxX - minX;
         const blobH = maxY - minY;
         const area = blobW * blobH;
-        if (area < 200) continue; // Too small
 
-        const avgBrightness = brightnessSum / count;
+        // STRICT: only keep LARGE blobs (minimum 600px area = ~25x24 pixels)
+        if (area < 600 || count < 40) continue;
+
+        // Motion density: what % of the bounding box is actually moving
+        const motionDensity = count / Math.max(area / 16, 1);
 
         blobs.push({
-          x: minX,
-          y: minY,
-          w: blobW,
-          h: blobH,
-          cx: sumX / count,
-          cy: sumY / count,
-          area,
-          avgBrightness,
+          x: minX, y: minY, w: blobW, h: blobH,
+          cx: sumX / count, cy: sumY / count,
+          area, motionDensity,
         });
       }
     }
 
-    // Classify blobs using aspect ratio + area heuristics
-    const dets: Detection[] = blobs.map((blob) => {
+    // Step 4: Strict classification — only confident detections
+    const dets: Detection[] = [];
+    const MAX_OBJECTS = 5; // hard cap on tracked objects
+
+    for (const blob of blobs) {
+      if (dets.length >= MAX_OBJECTS) break;
+
       const aspectRatio = blob.w / Math.max(blob.h, 1);
       const heightRatio = blob.h / Math.max(blob.w, 1);
 
-      // Classification logic:
-      // Person: tall & narrow (heightRatio > 1.4), small area
-      // Bike/motorbike: narrow, medium area, aspect ratio ~1
-      // Car: wide (aspectRatio > 1.1), large area
-      let classification: "person" | "car" | "bike";
-      let confidence: number;
+      let classification: "person" | "car" | "bike" | null = null;
+      let confidence = 0;
 
-      if (blob.area > 2000 && aspectRatio > 1.1) {
-        // Large + wide = car
+      // CAR: large area + wide aspect ratio — high confidence
+      if (blob.area > 2500 && aspectRatio > 1.2) {
         classification = "car";
-        confidence = Math.min(0.95, 0.65 + blob.area / 8000);
-      } else if (heightRatio > 1.4 && blob.area < 1500) {
-        // Tall + narrow + small = person
+        confidence = Math.min(0.95, 0.7 + blob.area / 10000);
+      }
+      // PERSON: tall + narrow + small — high confidence
+      else if (heightRatio > 1.5 && blob.area < 1200 && blob.area > 600) {
         classification = "person";
-        confidence = Math.min(0.90, 0.6 + blob.area / 3000);
-      } else if (blob.area > 800 && blob.area < 2000 && aspectRatio > 0.6 && aspectRatio < 1.4) {
-        // Medium size, roughly square = bike/motorbike
+        confidence = Math.min(0.90, 0.65 + blob.area / 3000);
+      }
+      // BIKE: medium area, roughly square
+      else if (blob.area > 1000 && blob.area < 2500 && aspectRatio > 0.7 && aspectRatio < 1.3) {
         classification = "bike";
-        confidence = Math.min(0.85, 0.55 + blob.area / 4000);
-      } else if (blob.area > 1500) {
-        // Large but not wide enough — still likely a car at angle
+        confidence = Math.min(0.85, 0.6 + blob.area / 5000);
+      }
+      // LARGE but ambiguous — could be car at angle
+      else if (blob.area > 3000) {
         classification = "car";
-        confidence = Math.min(0.90, 0.6 + blob.area / 6000);
-      } else {
-        // Default: small blob = person
-        classification = "person";
-        confidence = Math.min(0.85, 0.5 + blob.area / 2000);
+        confidence = Math.min(0.85, 0.6 + blob.area / 8000);
       }
 
-      return {
+      // SKIP low-confidence detections entirely
+      if (!classification || confidence < 0.65) continue;
+
+      dets.push({
         class: classification,
         confidence,
         bbox: [blob.x, blob.y, blob.x + blob.w, blob.y + blob.h] as [number, number, number, number],
-        speed: classification === "car" ? 0 : undefined, // speed computed in trackBlobs from velocity
-      };
-    });
-
-    // If no motion detected but we have tracked blobs, use last known positions
-    if (dets.length === 0 && trackedBlobsRef.current.length > 0) {
-      return trackedBlobsRef.current.map((b) => ({
-        class: b.class,
-        confidence: 0.7,
-        bbox: [b.cx - b.w / 2, b.cy - b.h / 2, b.cx + b.w / 2, b.cy + b.h / 2] as [number, number, number, number],
-        speed: b.class === "car" ? b.speedKmh : undefined,
-        id: b.id,
-      }));
+        speed: classification === "car" ? 0 : undefined,
+      });
     }
 
     return dets;
@@ -427,17 +408,22 @@ export default function VideoAnalysisPage() {
       });
     }
 
-    // Remove blobs not seen for 8 frames
-    trackedBlobsRef.current = tracked.filter((b) => frameNum - b.lastSeen < 8);
+    // Remove blobs not seen for 5 frames, cap at 5 tracked objects
+    trackedBlobsRef.current = tracked
+      .filter((b) => frameNum - b.lastSeen < 5)
+      .sort((a, b) => b.framesTracked - a.framesTracked)
+      .slice(0, 5);
 
-    // Return detections based on tracked blobs
-    return trackedBlobsRef.current.map((b) => ({
-      class: b.class,
-      confidence: Math.min(0.95, 0.6 + b.framesTracked * 0.03),
-      bbox: [b.cx - b.w / 2, b.cy - b.h / 2, b.cx + b.w / 2, b.cy + b.h / 2] as [number, number, number, number],
-      speed: b.class === "car" ? b.speedKmh : undefined,
-      id: b.id,
-    }));
+    // Only return objects tracked for 6+ frames (filter out noise)
+    return trackedBlobsRef.current
+      .filter((b) => b.framesTracked >= 6)
+      .map((b) => ({
+        class: b.class,
+        confidence: Math.min(0.95, 0.7 + b.framesTracked * 0.02),
+        bbox: [b.cx - b.w / 2, b.cy - b.h / 2, b.cx + b.w / 2, b.cy + b.h / 2] as [number, number, number, number],
+        speed: b.class === "car" ? b.speedKmh : undefined,
+        id: b.id,
+      }));
   }, []);
 
   const calculateSceneChange = (prev: ImageData, curr: ImageData): number => {
@@ -454,8 +440,9 @@ export default function VideoAnalysisPage() {
   };
 
   const checkForAccident = (tracked: TrackedBlob[], sceneScore: number): IncidentAlert | null => {
-    const vehicles = tracked.filter((b) => (b.class === "car" || b.class === "bike") && b.framesTracked >= 4);
-    const persons = tracked.filter((b) => b.class === "person" && b.framesTracked >= 4);
+    // Only check objects tracked for 8+ frames (confirmed objects, not noise)
+    const vehicles = tracked.filter((b) => (b.class === "car" || b.class === "bike") && b.framesTracked >= 8);
+    const persons = tracked.filter((b) => b.class === "person" && b.framesTracked >= 8);
 
     // Vehicle-vehicle collision
     for (let i = 0; i < vehicles.length; i++) {
@@ -473,52 +460,45 @@ export default function VideoAnalysisPage() {
         const overlapArea = overlapX * overlapY;
         const aArea = a.w * a.h;
         const bArea = b.w * b.h;
+        const minArea = Math.min(aArea, bArea);
         const iou = (aArea + bArea - overlapArea) > 0 ? overlapArea / (aArea + bArea - overlapArea) : 0;
 
-        const dist = Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2);
-
-        // Direction analysis: check if velocities are OPPOSING (head-on) vs PARALLEL (passing)
+        // Direction analysis
         const aAngle = Math.atan2(a.vy, a.vx);
         const bAngle = Math.atan2(b.vy, b.vx);
         const angleDiff = Math.abs(aAngle - bAngle);
-        const opposing = angleDiff > Math.PI * 0.5 && angleDiff < Math.PI * 1.5; // roughly head-on
-        const parallel = angleDiff < Math.PI * 0.3 || angleDiff > Math.PI * 1.7; // roughly same direction
+        const parallel = angleDiff < Math.PI * 0.3 || angleDiff > Math.PI * 1.7;
 
-        // Track sustained proximity
-        const closeThreshold = Math.max(a.w, b.w) * 0.8;
-        if (dist < closeThreshold) {
+        // Track sustained proximity — need 8+ consecutive frames
+        const closeThreshold = Math.max(a.w, b.w) * 0.7;
+        if (Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2) < closeThreshold) {
           a.consecutiveFramesNear++;
           b.consecutiveFramesNear++;
         } else {
-          a.consecutiveFramesNear = Math.max(0, a.consecutiveFramesNear - 2);
-          b.consecutiveFramesNear = Math.max(0, b.consecutiveFramesNear - 2);
+          a.consecutiveFramesNear = Math.max(0, a.consecutiveFramesNear - 3);
+          b.consecutiveFramesNear = Math.max(0, b.consecutiveFramesNear - 3);
         }
 
         const sustainedNear = Math.min(a.consecutiveFramesNear, b.consecutiveFramesNear);
 
-        // REQUIREMENT 1: Actual bounding box overlap (not just proximity)
-        const hasOverlap = overlapArea > (Math.min(aArea, bArea) * 0.08); // 8% of smaller object
+        // REQUIREMENT 1: ACTUAL overlap — 15% of smaller object
+        const hasOverlap = overlapArea > minArea * 0.15;
 
-        // REQUIREMENT 2: Sustained proximity (5+ frames) AND not just passing
-        const sustainedCollision = sustainedNear >= 5 && !parallel;
+        // REQUIREMENT 2: Sustained 8+ frames AND not parallel
+        const sustained = sustainedNear >= 8 && !parallel;
 
-        // REQUIREMENT 3: High-speed convergence
-        const speed = Math.max(a.speedKmh, b.speedKmh);
-        const highSpeed = speed > 30;
-
-        if (hasOverlap || sustainedCollision) {
+        if (hasOverlap || sustained) {
           const confidence = Math.min(0.95,
-            0.3 * Math.min(iou * 8, 1) +
-            0.25 * (hasOverlap ? 1 : 0) +
-            0.2 * (opposing ? 1 : 0.3) +
-            0.15 * Math.min(speed / 60, 1) +
-            0.1 * Math.min(sceneScore / 0.2, 1)
+            0.35 * Math.min(iou * 6, 1) +
+            0.3 * (hasOverlap ? 1 : 0) +
+            0.2 * (!parallel ? 1 : 0) +
+            0.15 * Math.min(sceneScore / 0.25, 1)
           );
 
-          if (confidence > 0.55) {
+          if (confidence > 0.65) {
             return {
               type: "vehicle_collision",
-              severity: confidence > 0.75 ? "critical" : "major",
+              severity: confidence > 0.8 ? "critical" : "major",
               confidence,
               timestamp: new Date().toISOString(),
               latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
@@ -529,7 +509,7 @@ export default function VideoAnalysisPage() {
       }
     }
 
-    // Vehicle-pedestrian: REQUIRE actual bounding box overlap — passing nearby does NOT count
+    // Vehicle-pedestrian: ONLY actual overlap, nothing else
     for (const vehicle of vehicles) {
       for (const ped of persons) {
         const vLeft = vehicle.cx - vehicle.w / 2, vRight = vehicle.cx + vehicle.w / 2;
@@ -539,16 +519,14 @@ export default function VideoAnalysisPage() {
         const overlapX = Math.max(0, Math.min(vRight, pRight) - Math.max(vLeft, pLeft));
         const overlapY = Math.max(0, Math.min(vBot, pBot) - Math.max(vTop, pTop));
         const overlapArea = overlapX * overlapY;
+        const minArea = Math.min(vehicle.w * vehicle.h, ped.w * ped.h);
 
-        const vArea = vehicle.w * vehicle.h;
-        const pArea = ped.w * ped.h;
-
-        // Only trigger on ACTUAL overlap — minimum 10% of the smaller object
-        if (overlapArea > Math.min(vArea, pArea) * 0.1) {
+        // ONLY trigger on ACTUAL overlap — 15% of smaller object
+        if (overlapArea > minArea * 0.15) {
           return {
             type: "pedestrian_collision",
             severity: "critical",
-            confidence: 0.88,
+            confidence: 0.9,
             timestamp: new Date().toISOString(),
             latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
             longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
@@ -756,7 +734,7 @@ export default function VideoAnalysisPage() {
       setDetections(dets);
       drawDetections(dets);
 
-      // State machine — frame-based timing for guaranteed progression
+      // State machine
       stateFrameRef.current++;
       const sf = stateFrameRef.current;
 
@@ -766,37 +744,44 @@ export default function VideoAnalysisPage() {
       let state = stateRef.current;
 
       if (accident) {
+        // Only progress state on REAL detections
         if (state === "monitoring") state = "watching";
         else if (state === "watching") state = "confirming";
         else if (state === "confirming") state = "alert";
+      } else if (!demoMode) {
+        // REAL mode: decay back to monitoring if no sustained accident signal
+        if (state !== "monitoring" && sf % 5 === 0) {
+          state = state === "alert" ? "confirming" : state === "confirming" ? "watching" : "monitoring";
+        }
       }
 
-      // Time-based state progression (guaranteed demo flow)
-      if (sf === 20 && state === "monitoring") state = "watching";
-      if (sf === 30 && state === "watching") state = "confirming";
-      if (sf >= 40 && state === "confirming") state = "alert";
+      // Demo mode: time-based progression (for testing only)
+      if (demoMode) {
+        if (sf === 15 && state === "monitoring") state = "watching";
+        if (sf === 25 && state === "watching") state = "confirming";
+        if (sf >= 35 && state === "confirming") state = "alert";
+      }
 
-      // Trigger alert only if not on cooldown
+      // Trigger alert
       if (state === "alert" && stateRef.current !== "alert" && alertCooldownRef.current <= 0) {
-        alertCooldownRef.current = 60; // 15 second cooldown
+        alertCooldownRef.current = 80; // 20 second cooldown
 
         const alertData: IncidentAlert = accident || {
           type: "vehicle_collision",
-          severity: "critical",
-          confidence: 0.88,
+          severity: demoMode ? "critical" : "major",
+          confidence: demoMode ? 0.88 : 0.7,
           timestamp: new Date().toISOString(),
           latitude: DEMO_LAT + (Math.random() - 0.5) * 0.01,
           longitude: DEMO_LNG + (Math.random() - 0.5) * 0.01,
         };
 
-        // Record the clip and attach to incident
         recordClipAndAlert(alertData);
 
         setTimeout(() => {
           stateRef.current = "monitoring";
           stateFrameRef.current = 0;
           setCurrentState("monitoring");
-        }, 4000);
+        }, 5000);
       }
 
       stateRef.current = state;
@@ -915,7 +900,7 @@ export default function VideoAnalysisPage() {
                   )}
                 </div>
 
-                <div className="p-4 border-t border-border flex items-center gap-3">
+                <div className="p-4 border-t border-border flex items-center gap-3 flex-wrap">
                   {!isAnalyzing ? (
                     <button onClick={startAnalysis} disabled={!videoReady}
                       className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
@@ -932,7 +917,20 @@ export default function VideoAnalysisPage() {
                       </button>
                     </>
                   )}
-                  <span className="ml-auto text-sm text-muted-foreground">{selectedClip.name}</span>
+
+                  {/* Demo Mode toggle */}
+                  <label className="flex items-center gap-2 text-sm cursor-pointer select-none ml-auto">
+                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${demoMode ? "bg-yellow-500/20 text-yellow-500" : "bg-green-500/20 text-green-500"}`}>
+                      {demoMode ? "DEMO" : "REAL"}
+                    </span>
+                    <div
+                      onClick={() => !isAnalyzing && setDemoMode(!demoMode)}
+                      className={`w-10 h-5 rounded-full transition-colors relative ${demoMode ? "bg-yellow-500" : "bg-green-600"}`}
+                    >
+                      <div className={`w-4 h-4 bg-white rounded-full absolute top-0.5 transition-transform ${demoMode ? "translate-x-5" : "translate-x-0.5"}`} />
+                    </div>
+                    <span className="text-muted-foreground">{selectedClip.name}</span>
+                  </label>
                 </div>
               </div>
             </div>
