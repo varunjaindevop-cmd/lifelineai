@@ -12,20 +12,24 @@ export function autoCalibrate(
 ): number {
   // Default assumptions based on environment
   const assumptions = {
-    isolated: { lanes: 2, laneWidth: 3.5 },   // 2-lane road
-    traffic: { lanes: 3, laneWidth: 3.5 },     // 3-lane road
-    marketplace: { lanes: 1, laneWidth: 3.0 }, // narrow pedestrian road
+    isolated: { lanes: 2, laneWidth: 3.5 },
+    traffic: { lanes: 3, laneWidth: 3.5 },
+    marketplace: { lanes: 1, laneWidth: 3.0 },
   };
-  
+
   const { lanes, laneWidth } = assumptions[envMode];
   const totalRoadWidthMeters = lanes * laneWidth;
-  
-  // Estimate road width in pixels
-  // Typical road occupies 40-60% of frame width in traffic cameras
-  const roadWidthFraction = envMode === "marketplace" ? 0.4 : 0.5;
-  const roadWidthPixels = videoWidth * roadWidthFraction;
-  
-  return roadWidthPixels / totalRoadWidthMeters;
+
+  // Use the SMALLER dimension as reference (most CCTV cameras are landscape)
+  // Road typically occupies 30-40% of the shorter dimension
+  const refDimension = Math.min(videoWidth, videoHeight);
+  const roadWidthFraction = 0.35;
+  const roadWidthPixels = refDimension * roadWidthFraction;
+
+  const ppm = roadWidthPixels / totalRoadWidthMeters;
+
+  // Clamp to reasonable range (10-40 PPM for most cameras)
+  return Math.max(10, Math.min(40, ppm));
 }
 
 // Convert Kalman speed (pixels/frame) to real km/h

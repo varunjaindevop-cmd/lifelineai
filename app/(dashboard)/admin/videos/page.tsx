@@ -301,17 +301,23 @@ export default function VideoAnalysisPage() {
     const scheduleDetection = (video: HTMLVideoElement) => {
       if (isDetecting || !modelRef.current || video.paused || video.ended) return;
       const now = Date.now();
-      if (now - lastDetectTime < 300) return;
+      if (now - lastDetectTime < 500) return; // 2 FPS detection
       isDetecting = true;
       lastDetectTime = now;
       modelRef.current.detect(video).then((predictions: any[]) => {
-        latestDetections = predictions
-          .filter((p: any) => p.class in COCO_MAP && p.score > 0.4)
+        const filtered = predictions
+          .filter((p: any) => p.class in COCO_MAP && p.score > 0.3)
           .map((p: any) => {
             const [x, y, w, h] = p.bbox;
             return { class: COCO_MAP[p.class], cx: x + w / 2, cy: y + h / 2, w, h, confidence: p.score };
           });
-      }).catch(() => {}).finally(() => { isDetecting = false; });
+        latestDetections = filtered;
+        if (frameRef.current % 30 === 0) {
+          console.log(`[SAGE] COCO-SSD: ${predictions.length} raw, ${filtered.length} filtered`, predictions.map((p: any) => `${p.class}(${(p.score*100).toFixed(0)}%)`));
+        }
+      }).catch((e: any) => {
+        console.error("[SAGE] COCO-SSD detect failed:", e);
+      }).finally(() => { isDetecting = false; });
     };
 
     const loop = () => {
@@ -463,7 +469,7 @@ export default function VideoAnalysisPage() {
       } catch (e) { console.error(e); }
 
       // Stop loop if video ended or analysis stopped
-      if (videoRef.current && !videoRef.current.paused && !videoRef.current.ended && isAnalyzing) {
+      if (videoRef.current && !videoRef.current.paused && !videoRef.current.ended && analyzingRef.current) {
         rafRef.current = requestAnimationFrame(loop);
       }
     };
@@ -518,7 +524,7 @@ export default function VideoAnalysisPage() {
       {!selectedClip ? (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {VIDEO_CLIPS.map(clip => (
-            <button key={clip.name} onClick={() => setSelectedClip(clip)}
+            <button key={clip.name} onClick={() => { if (isAnalyzing) stopAnalysis(); resetClip(); setSelectedClip(clip); }}
               className="bg-card p-5 rounded-xl border border-border hover:border-primary/50 transition-colors text-left">
               <div className="flex items-start gap-4">
                 <div className="w-16 h-16 bg-background rounded-lg flex items-center justify-center shrink-0">
