@@ -138,14 +138,45 @@ export default function VideoAnalysisPage() {
   };
 
   // ========== OBJECT CLASSIFICATION ==========
-  const classifyBlob = (w: number, h: number, cy: number): string => {
+  // Uses area + aspect ratio + Y-position + SPEED (fast objects on road = vehicle)
+  // Blob area alone is unreliable (faster = bigger motion trail)
+  const classifyBlob = (w: number, h: number, cy: number, speed: number): string => {
     const area = w * h;
     const aspect = w / Math.max(h, 1);
-    if (area < 400) return "person";
-    if (area > 2500) return "car";
-    if (area > 1200 && aspect > 0.8) return "car";
-    if (area > 600 && aspect < 0.7) return cy > H * 0.4 ? "bike" : "person";
-    if (area > 800 && aspect > 0.6 && aspect < 1.4) return "car";
+    const onRoad = cy > H * 0.35; // lower 65% of frame = road level
+
+    // Very small blobs = noise or distant person
+    if (area < 300) return "person";
+
+    // Large blob = vehicle (cars, trucks, auto-rickshaws)
+    if (area > 2000) return "car";
+
+    // Fast + on road = almost certainly a vehicle (bike or car)
+    if (speed > 2.5 && onRoad) {
+      // Wide blob = car, narrow = bike
+      return aspect > 0.9 ? "car" : "bike";
+    }
+
+    // Medium blob + on road + moving = vehicle
+    if (area > 800 && onRoad && speed > 1) {
+      return aspect > 0.8 ? "car" : "bike";
+    }
+
+    // Wide + medium area = car (even if slow)
+    if (area > 600 && aspect > 1.0) return "car";
+
+    // Tall + narrow + on road = bike or person walking
+    if (aspect < 0.6 && onRoad) {
+      // Larger = bike, smaller = person
+      return area > 500 ? "bike" : "person";
+    }
+
+    // Tall + narrow + off road = person
+    if (aspect < 0.6 && !onRoad) return "person";
+
+    // Default: use area + speed heuristic
+    if (area > 1000 && speed > 1) return "car";
+    if (area > 500) return "bike";
     return "person";
   };
 
@@ -191,7 +222,7 @@ export default function VideoAnalysisPage() {
         blob.lastSeen = frame;
         blob.positions.push({ x: det.cx, y: det.cy });
         if (blob.positions.length > 10) blob.positions.shift();
-        if (blob.frames >= 3) blob.class = classifyBlob(det.w, det.h, det.cy);
+        if (blob.frames >= 3) blob.class = classifyBlob(det.w, det.h, det.cy, blob.speed);
         matched.add(best);
       }
     }
@@ -201,7 +232,7 @@ export default function VideoAnalysisPage() {
       tracked.push({
         id: nextId++, cx: d.cx, cy: d.cy, w: d.w, h: d.h,
         vx: 0, vy: 0, frames: 1, lastSeen: frame,
-        class: classifyBlob(d.w, d.h, d.cy),
+        class: classifyBlob(d.w, d.h, d.cy, 0),
         positions: [{ x: d.cx, y: d.cy }],
         area: d.w * d.h,
         speed: 0, acceleration: 0, heading: 0, headingChange: 0,
@@ -215,7 +246,8 @@ export default function VideoAnalysisPage() {
   };
 
   // ========== PHYSICS-BASED COLLISION DETECTION ==========
-  // Analyzes individual object physics: proximity + convergence + deceleration + shape change
+  // REQUIRES STRONG EVIDENCE — proximity alone is NOT enough (traffic is always close)
+  // Must have: (hard deceleration OR sudden stop OR shape change) + convergence + proximity
   const detectPhysicsCollision = (blobs: TrackedBlob[]): { confidence: number; a: TrackedBlob; b: TrackedBlob; evidence: string } | null => {
     const minFrames = 3;
     const candidates = blobs.filter(b => b.frames >= minFrames);
@@ -230,52 +262,69 @@ export default function VideoAnalysisPage() {
 
         const dist = Math.sqrt((a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2);
         const combinedR = Math.sqrt(a.area) + Math.sqrt(b.area);
-        if (dist > combinedR * 2) continue;
+        // Hard distance gate: must be VERY close to even consider
+        if (dist > combinedR * 0.8) continue;
 
-        // Proximity score
-        const proximity = 1 - Math.min(dist / (combinedR * 2), 1);
+        // ===== STRONG EVIDENCE REQUIRED =====
+        // At least ONE of these must be true:
+        let strongSignals = 0;
+        const evidenceParts: string[] = [];
 
-        // Convergence: heading toward each other
-        const dx = b.cx - a.cx, dy = b.cy - a.cy;
-        const dotA = a.vx * dx + a.vy * dy;
-        const dotB = b.vx * (-dx) + b.vy * (-dy);
-        const converging = dotA > 0 || dotB > 0;
+        // Signal 1: HARD DECELERATION (either object braking for 3+ frames)
+        const decelA = a.decelFrames >= 3;
+        const decelB = b.decelFrames >= 3;
+        if (decelA || decelB) { strongSignals++; evidenceParts.push("hard_brake"); }
 
-        // Parallel check (same direction = not collision)
-        const angleDiff = Math.abs(a.heading - b.heading);
-        const wrapped = angleDiff > Math.PI ? 2 * Math.PI - angleDiff : angleDiff;
-        const parallel = wrapped < Math.PI * 0.3;
-
-        // Deceleration: either object braking hard
-        const decelA = a.decelFrames >= 2 ? 1 : a.decelFrames >= 1 ? 0.5 : 0;
-        const decelB = b.decelFrames >= 2 ? 1 : b.decelFrames >= 1 ? 0.5 : 0;
-        const decel = Math.max(decelA, decelB);
-
-        // Sudden speed drop (impact signature)
-        let suddenDrop = 0;
+        // Signal 2: SUDDEN SPEED DROP (impact signature)
+        let suddenDrop = false;
         for (const obj of [a, b]) {
           if (obj.speedHistory.length >= 4) {
             const prevAvg = (obj.speedHistory[0] + obj.speedHistory[1]) / 2;
             const curr = obj.speedHistory[obj.speedHistory.length - 1];
-            if (prevAvg > 1.5 && curr < prevAvg * 0.3) suddenDrop = Math.max(suddenDrop, 1);
-            else if (prevAvg > 1.5 && curr < prevAvg * 0.5) suddenDrop = Math.max(suddenDrop, 0.5);
+            if (prevAvg > 2 && curr < prevAvg * 0.25) { suddenDrop = true; break; }
           }
         }
+        if (suddenDrop) { strongSignals++; evidenceParts.push("sudden_stop"); }
 
-        // Aspect ratio change (bike falling, vehicle rollover)
-        let shapeChange = 0;
+        // Signal 3: SHAPE CHANGE (bike falling, vehicle rollover)
+        let shapeChange = false;
         for (const obj of [a, b]) {
           if (obj.aspectHistory.length >= 4) {
             const prevAR = (obj.aspectHistory[0] + obj.aspectHistory[1]) / 2;
             const currAR = obj.aspectHistory[obj.aspectHistory.length - 1];
-            const arChange = Math.abs(currAR - prevAR) / Math.max(prevAR, 0.1);
-            if (arChange > 0.4) shapeChange = Math.max(shapeChange, 1);
-            else if (arChange > 0.2) shapeChange = Math.max(shapeChange, 0.5);
+            if (Math.abs(currAR - prevAR) / Math.max(prevAR, 0.1) > 0.5) { shapeChange = true; break; }
           }
         }
+        if (shapeChange) { strongSignals++; evidenceParts.push("shape_change"); }
+
+        // Signal 4: BOTH objects heading toward each other (not just one)
+        const dx = b.cx - a.cx, dy = b.cy - a.cy;
+        const dotA = a.vx * dx + a.vy * dy;
+        const dotB = b.vx * (-dx) + b.vy * (-dy);
+        const bothConverging = dotA > 0 && dotB > 0;
+        if (bothConverging) { strongSignals++; evidenceParts.push("mutual_converge"); }
+
+        // Signal 5: Speed differential (one fast, one slow/stopped = potential impact)
+        const speedA = a.speed;
+        const speedB = b.speed;
+        const speedDiff = Math.abs(speedA - speedB);
+        if (speedDiff > 2 && Math.max(speedA, speedB) > 2) {
+          strongSignals++; evidenceParts.push("speed_diff");
+        }
+
+        // REJECT if no strong signals — this is just traffic being close
+        if (strongSignals < 2) continue;
+
+        // Parallel check (same direction = normal traffic)
+        const angleDiff = Math.abs(a.heading - b.heading);
+        const wrapped = angleDiff > Math.PI ? 2 * Math.PI - angleDiff : angleDiff;
+        if (wrapped < Math.PI * 0.3 && speedDiff < 1.5) continue; // parallel + similar speed = traffic
+
+        // Proximity within hard gate
+        const proximity = 1 - Math.min(dist / (combinedR * 0.8), 1);
 
         // Sustained closeness
-        const closeThresh = combinedR * 1.5;
+        const closeThresh = combinedR * 0.8;
         if (dist < closeThresh) {
           a._near = (a._near || 0) + 1;
           b._near = (b._near || 0) + 1;
@@ -285,33 +334,15 @@ export default function VideoAnalysisPage() {
         }
         const near = Math.min(a._near || 0, b._near || 0);
 
-        // Very close OR close+converging OR deceleration+proximity OR shape change
-        const veryClose = dist < combinedR * 0.5;
-        const closeConverging = dist < closeThresh && converging && near >= 2;
-        const decelProximity = decel > 0 && proximity > 0.3;
-        const validSignal = veryClose || closeConverging || decelProximity || shapeChange > 0;
-
-        if (!validSignal) continue;
-        if (parallel && !veryClose && !decelProximity && shapeChange === 0) continue;
-
         const conf = Math.min(0.95,
-          0.25 * proximity +
-          0.20 * (converging ? 1 : 0.1) +
-          0.20 * Math.min(near / 3, 1) +
-          0.15 * decel +
-          0.10 * suddenDrop +
-          0.10 * shapeChange
+          0.30 * proximity +
+          0.25 * Math.min(near / 3, 1) +
+          0.25 * (strongSignals / 5) +
+          0.20 * (bothConverging ? 1 : 0.2)
         );
 
-        if (conf > 0.35 && (!best || conf > best.confidence)) {
-          const evidence = [
-            proximity > 0.5 ? "close" : "",
-            converging ? "converging" : "",
-            decel > 0 ? "decelerating" : "",
-            suddenDrop > 0 ? "sudden_stop" : "",
-            shapeChange > 0 ? "shape_change" : "",
-          ].filter(Boolean).join("+");
-          best = { confidence: conf, a, b, evidence };
+        if (conf > 0.4 && (!best || conf > best.confidence)) {
+          best = { confidence: conf, a, b, evidence: evidenceParts.join("+") };
         }
       }
     }
@@ -364,21 +395,21 @@ export default function VideoAnalysisPage() {
       if (cellAnomaly) anomalousCells.add(idx);
     }
 
-    // Update heatmap
+    // Update heatmap — require HARD deceleration (3+ frames) to increment
     for (let i = 0; i < totalCells; i++) {
       if (anomalousCells.has(i)) {
         heatmap[i] = Math.min(heatmap[i] + 1, 30);
       } else {
-        heatmap[i] = Math.max(0, heatmap[i] - 0.3);
+        heatmap[i] = Math.max(0, heatmap[i] - 0.5); // faster decay
       }
     }
 
-    // Check for persistent clusters
+    // Check for persistent clusters — need higher threshold
     let maxClusterHeat = 0;
     let clusterCount = 0;
     const visited = new Uint8Array(totalCells);
     for (let i = 0; i < totalCells; i++) {
-      if (visited[i] || heatmap[i] < 4) continue;
+      if (visited[i] || heatmap[i] < 6) continue; // raised from 4 to 6
       // BFS cluster
       let cells = 0, totalHeat = 0;
       const queue = [i];
@@ -392,17 +423,17 @@ export default function VideoAnalysisPage() {
           const nr = cr + dr, nc = cc + dc;
           if (nr < 0 || nr >= GRID_ROWS || nc < 0 || nc >= GRID_COLS) continue;
           const ni = nr * GRID_COLS + nc;
-          if (!visited[ni] && heatmap[ni] >= 3) { visited[ni] = 1; queue.push(ni); }
+          if (!visited[ni] && heatmap[ni] >= 4) { visited[ni] = 1; queue.push(ni); }
         }
       }
-      if (cells >= 2) {
+      if (cells >= 3) {
         clusterCount++;
         const avgHeat = totalHeat / cells;
         if (avgHeat > maxClusterHeat) maxClusterHeat = avgHeat;
       }
     }
 
-    return maxClusterHeat >= 8 && clusterCount >= 1;
+    return maxClusterHeat >= 12 && clusterCount >= 1;
   };
 
   // ========== DRAW ==========
