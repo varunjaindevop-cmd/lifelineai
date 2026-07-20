@@ -61,7 +61,7 @@ export default function VideoAnalysisPage() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const supabase = createClient();
   const detection: UseDetectionWorkerReturn = useDetectionWorker(envMode);
-  const { isReady, isAnalyzing, state, entities, evidence, skeletons, changeGrid, fps, incidents, backend } = detection;
+  const { isReady, isAnalyzing, state, entities, evidence, changeGrid, fps, incidents, backend } = detection;
   const speedHistoryRef = useRef<Record<number, number[]>>({});
   const confHistoryRef = useRef<number[]>([]);
 
@@ -260,47 +260,6 @@ export default function VideoAnalysisPage() {
       ctx.fillText(label, bx + 4, by - 6);
     }
 
-    // Draw skeleton overlays (2D pose)
-    const currentSkeletons = skeletonsRef.current;
-    const SKELETON_CONNECTIONS: [number, number][] = [
-      [0, 1], [0, 2], [1, 3], [2, 4], // face
-      [5, 6], // shoulders
-      [5, 7], [7, 9], [6, 8], [8, 10], // arms
-      [5, 11], [6, 12], [11, 12], // torso
-      [11, 13], [13, 15], [12, 14], [14, 16], // legs
-    ];
-    for (const sk of currentSkeletons) {
-      if (sk.confidence < 0.3) continue;
-      const skColor = sk.isFallen ? "#ef4444" : sk.isSitting ? "#f59e0b" : "#06b6d4";
-      // Draw connections
-      ctx.strokeStyle = skColor;
-      ctx.lineWidth = 2;
-      for (const [i, j] of SKELETON_CONNECTIONS) {
-        const kpA = sk.keypoints[i], kpB = sk.keypoints[j];
-        if (!kpA || !kpB || kpA.score < 0.3 || kpB.score < 0.3) continue;
-        ctx.beginPath();
-        ctx.moveTo(offsetX + kpA.x * scaleX, offsetY + kpA.y * scaleY);
-        ctx.lineTo(offsetX + kpB.x * scaleX, offsetY + kpB.y * scaleY);
-        ctx.stroke();
-      }
-      // Draw keypoints as dots
-      for (const kp of sk.keypoints) {
-        if (kp.score < 0.3) continue;
-        ctx.fillStyle = skColor;
-        ctx.beginPath();
-        ctx.arc(offsetX + kp.x * scaleX, offsetY + kp.y * scaleY, 3, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      // Draw body angle label
-      const cx = offsetX + ((sk.bbox[0] + sk.bbox[2]) / 2) * scaleX;
-      const cy = offsetY + ((sk.bbox[1] + sk.bbox[3]) / 2) * scaleY;
-      ctx.fillStyle = "rgba(0,0,0,0.7)";
-      ctx.fillRect(cx - 28, cy - 40, 56, 16);
-      ctx.fillStyle = skColor;
-      ctx.font = "10px monospace";
-      ctx.fillText(`${Math.round(sk.bodyAngle)}° ${sk.isFallen ? "FALL" : sk.isSitting ? "SIT" : "UP"}`, cx - 26, cy - 28);
-    }
-
     // Bottom bar
     const barY = displayH - 20;
     ctx.fillStyle = "rgba(0,0,0,0.7)";
@@ -314,12 +273,10 @@ export default function VideoAnalysisPage() {
 
   const entitiesRef = useRef(entities);
   const evidenceRef = useRef(evidence);
-  const skeletonsRef = useRef(skeletons);
   const currentFpsRef = useRef(fps);
   const currentBackendRef = useRef(backend);
   entitiesRef.current = entities;
   evidenceRef.current = evidence;
-  skeletonsRef.current = skeletons;
   currentFpsRef.current = fps;
   currentBackendRef.current = backend;
 

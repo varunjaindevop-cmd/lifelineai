@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import type { EnvMode, WorkerOutput, SerializedEntity, SerializedEvidence, SerializedSkeleton } from "@/lib/worker/message-types";
+import type { EnvMode, WorkerOutput, SerializedEntity, SerializedEvidence } from "@/lib/worker/message-types";
 
 export interface DetectionState {
   isReady: boolean;
@@ -10,7 +10,6 @@ export interface DetectionState {
   backend: string;
   entities: SerializedEntity[];
   evidence: SerializedEvidence[];
-  skeletons: SerializedSkeleton[];
   changeGrid: number[];
   fps: number;
   detectionCount: number;
@@ -36,7 +35,7 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
 
   const [state, setState] = useState<DetectionState>({
     isReady: false, isAnalyzing: false, state: "monitoring", backend: "unknown",
-    entities: [], evidence: [], skeletons: [], changeGrid: new Array(80).fill(0),
+    entities: [], evidence: [], changeGrid: new Array(80).fill(0),
     fps: 0, detectionCount: 0, error: null, mode: initialMode,
   });
   const [incidents, setIncidents] = useState<Array<{ type: string; severity: string; confidence: number; timestamp: string; signals: { name: string; value: number; weight: number; passed: boolean }[] }>>([]);
@@ -81,7 +80,6 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
             ...prev,
             entities: msg.entities,
             evidence: msg.evidence,
-            skeletons: msg.skeletons || [],
             changeGrid: msg.changeGrid,
             state: msg.state,
             detectionCount: msg.detectionCount,
