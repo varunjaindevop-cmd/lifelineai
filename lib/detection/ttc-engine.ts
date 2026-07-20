@@ -561,23 +561,154 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
 
 // ========== MAIN EXPORT ==========
 
+/**
+ * Isolated-mode only: detect thrown vehicles and person recovery.
+ * Traffic mode is NOT affected — this function only runs when envMode === "isolated".
+ */
+function detectIsolatedAnomalies(entities: TrackedEntity[]): AccidentEvidence[] {
+  const evidence: AccidentEvidence[] = [];
+
+  // 1. Sudden heading change = vehicle was hit and thrown
+  const vehicles = entities.filter(e => e.age >= 2 && ["car", "truck", "bus", "motorcycle"].includes(e.class));
+  for (const v of vehicles) {
+    if (!isNearCamera(v)) continue;
+    if (v.headingHistory.length < 4) continue;
+
+    const recentH = v.headingHistory[v.headingHistory.length - 1];
+    const prevH = v.headingHistory[v.headingHistory.length - 3];
+    let headingChange = Math.abs(recentH - prevH);
+    if (headingChange > Math.PI) headingChange = 2 * Math.PI - headingChange;
+
+    const wasMoving = wasFast(v);
+    const significantTurn = headingChange > Math.PI * 0.25; // > 45 degrees
+
+    if (wasMoving && significantTurn) {
+      // Also check: speed dropped (impact absorbed energy)
+      const speedDrop = v.speedHistory.length >= 3
+        ? v.speedHistory[2] - v.speed > 0.3
+        : false;
+
+      let confidence = 0.55;
+      if (speedDrop) confidence += 0.15;
+      confidence *= (0.7 + 0.3 * distancePriority(v));
+
+      const signals: EvidenceSignal[] = [
+        { name: "heading_change", value: headingChange / Math.PI, weight: 0.4, passed: significantTurn },
+        { name: "was_moving", value: 1, weight: 0.3, passed: true },
+        { name: "speed_drop", value: speedDrop ? 1 : 0, weight: 0.3, passed: speedDrop },
+      ];
+
+      if (confidence >= 0.45) {
+        console.log(`[TTC] ISOLATED: ${v.class}#${v.id} heading change ${(headingChange * 180 / Math.PI).toFixed(0)}° conf=${confidence.toFixed(3)}`);
+        evidence.push({
+          type: "collision",
+          confidence: Math.min(0.9, confidence),
+          objects: [v.id],
+          details: `${v.class} thrown: heading ${(headingChange * 180 / Math.PI).toFixed(0)}° speed ${v.speedHistory[2]?.toFixed(1) || "?"}->${v.speed.toFixed(1)}`,
+          signals,
+          sceneContext: "isolated",
+        });
+      }
+    }
+  }
+
+  // 2. Person recovery: was lying down (high AR), now standing up (low AR) = post-accident
+  const persons = entities.filter(e => e.age >= 2 && e.class === "person");
+  for (const p of persons) {
+    if (!isNearCamera(p)) continue;
+    if (p.aspectHistory.length < 3) continue;
+
+    const currentAR = p.aspectHistory[p.aspectHistory.length - 1];
+    const prevAR = (p.aspectHistory[0] + p.aspectHistory[1]) / 2;
+
+    // Was lying (AR > 0.9), now standing (AR < 0.7)
+    const wasLying = prevAR > 0.9;
+    const nowStanding = currentAR < 0.7;
+
+    if (wasLying && nowStanding) {
+      let confidence = 0.70;
+
+      // Boost if person was stationary before (lying on ground)
+      const wasStationary = p.speedHistory.slice(0, 3).every(s => s < 0.3);
+      if (wasStationary) confidence += 0.10;
+
+      confidence *= (0.7 + 0.3 * distancePriority(p));
+
+      const signals: EvidenceSignal[] = [
+        { name: "was_lying", value: 1, weight: 0.4, passed: true },
+        { name: "now_standing", value: 1, weight: 0.3, passed: true },
+        { name: "was_stationary", value: wasStationary ? 1 : 0, weight: 0.3, passed: wasStationary },
+      ];
+
+      console.log(`[TTC] ISOLATED: person#${p.id} recovery AR ${prevAR.toFixed(2)}->${currentAR.toFixed(2)} conf=${confidence.toFixed(3)}`);
+      evidence.push({
+        type: "person_fall",
+        confidence: Math.min(0.9, confidence),
+        objects: [p.id],
+        details: `Person recovery: AR ${prevAR.toFixed(2)}->${currentAR.toFixed(2)} (was lying, now standing)`,
+        signals,
+        sceneContext: "isolated",
+      });
+    }
+  }
+
+  // 3. Vehicle speed spike then drop = collision impact
+  for (const v of vehicles) {
+    if (!isNearCamera(v)) continue;
+    if (v.speedHistory.length < 5) continue;
+
+    // Check for speed spike: sudden increase followed by sudden decrease
+    const speeds = v.speedHistory.slice(0, 5);
+    const maxSpeed = Math.max(...speeds);
+    const currentSpeed = speeds[0];
+    const hadSpike = maxSpeed > 1.5 && currentSpeed < maxSpeed * 0.4;
+
+    if (hadSpike) {
+      let confidence = 0.50;
+      confidence *= (0.7 + 0.3 * distancePriority(v));
+
+      if (confidence >= 0.40) {
+        console.log(`[TTC] ISOLATED: ${v.class}#${v.id} speed spike ${maxSpeed.toFixed(1)}->${currentSpeed.toFixed(1)} conf=${confidence.toFixed(3)}`);
+        evidence.push({
+          type: "collision",
+          confidence: Math.min(0.85, confidence),
+          objects: [v.id],
+          details: `${v.class} speed spike: ${maxSpeed.toFixed(1)}->${currentSpeed.toFixed(1)} px/f`,
+          signals: [
+            { name: "speed_spike", value: 1, weight: 0.5, passed: true },
+            { name: "now_slow", value: currentSpeed < 0.5 ? 1 : 0, weight: 0.5, passed: currentSpeed < 0.5 },
+          ],
+          sceneContext: "isolated",
+        });
+      }
+    }
+  }
+
+  return evidence;
+}
+
 export function detectAccidents(entities: TrackedEntity[], envMode: EnvMode): AccidentEvidence[] {
   let evidence: AccidentEvidence[] = [];
 
   // 1. Motion-based anomalies (works even when objects aren't detected properly)
   evidence.push(...detectMotionAnomalies(entities, envMode));
 
-  // 2. Person-bike crash detection
+  // 2. Isolated-mode specific: thrown vehicles, person recovery, speed spikes
+  if (envMode === "isolated") {
+    evidence.push(...detectIsolatedAnomalies(entities));
+  }
+
+  // 3. Person-bike crash detection
   const pairs = findPersonBikePairs(entities);
   evidence.push(...detectBikeCrash(pairs, envMode));
 
-  // 3. Vehicle collision (near-camera only)
+  // 4. Vehicle collision (near-camera only)
   evidence.push(...detectVehicleCollision(entities, envMode));
 
-  // 4. Vehicle fall (near-camera only)
+  // 5. Vehicle fall (near-camera only)
   evidence.push(...detectVehicleFall(entities, envMode));
 
-  // 5. Person fall (near-camera only)
+  // 6. Person fall (near-camera only)
   evidence.push(...detectPersonFall(entities, envMode));
 
   // Deduplicate: keep highest confidence per object set
