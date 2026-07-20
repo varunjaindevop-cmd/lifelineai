@@ -120,7 +120,7 @@ export interface TrackedEntity {
 export class MultiObjectTracker {
   private entities: Map<number, TrackedEntity> = new Map();
   private nextId = 1;
-  private maxAge = 12; // frames before removing (increased from 10)
+  private maxAge = 8; // frames before removing (lowered for faster response)
 
   update(detections: { class: string; cx: number; cy: number; w: number; h: number; confidence: number }[], frame: number): TrackedEntity[] {
     const matched = new Set<number>();

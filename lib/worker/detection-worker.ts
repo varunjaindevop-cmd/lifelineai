@@ -205,7 +205,7 @@ self.onmessage = async (e: MessageEvent) => {
       });
 
       const changeGrid = computeChangeGrid(imageData);
-      const rawEvidence = detectAccidents(validEntities, envMode, lostEntities);
+      const rawEvidence = detectAccidents(validEntities, envMode, lostEntities, changeGrid);
 
       // Debug logging
       if (validEntities.length > 0) {

@@ -96,7 +96,7 @@ export default function DetectionOverlay({
     for (const ev of currentEvidence) {
       for (const objId of ev.objects) {
         const entity = currentEntities.find(e => e.id === objId);
-        if (!entity || entity.age < 1) continue;
+        if (!entity || entity.age < 0) continue;
 
         const bx = (entity.x - entity.w / 2) * scaleX;
         const by = (entity.y - entity.h / 2) * scaleY;
@@ -122,9 +122,9 @@ export default function DetectionOverlay({
       }
     }
 
-    // Draw entity bounding boxes
+    // Draw entity bounding boxes — show IMMEDIATELY when detected (age >= 0)
     for (const entity of currentEntities) {
-      if (entity.age < 1) continue;
+      if (entity.age < 0) continue;
       const isInvolved = currentEvidence.some(e => e.objects.includes(entity.id));
       const baseColor = CLASS_COLORS[entity.class] || "#22c55e";
       const color = isInvolved ? getSeverityColor(currentEvidence.find(e => e.objects.includes(entity.id))?.confidence || 0) : baseColor;
@@ -195,7 +195,7 @@ export default function DetectionOverlay({
     ctx.fillStyle = "#fff";
     ctx.font = `${Math.max(11, 11 * scaleX)}px Arial`;
     ctx.fillText(
-      `Objects: ${currentEntities.filter(e => e.age >= 1).length} | Alerts: ${currentEvidence.length} | FPS: ${fps}`,
+      `Objects: ${currentEntities.filter(e => e.age >= 0).length} | Alerts: ${currentEvidence.length} | FPS: ${fps}`,
       8,
       barY + 15
     );
