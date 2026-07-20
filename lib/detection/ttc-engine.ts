@@ -1,13 +1,12 @@
-// Collision Detection Engine v13 — Velocity discontinuity + Gemini-ready architecture
-// Core principle: A collision causes VELOCITY DISCONTINUITY, not just proximity
-// A car passing a person at constant speed = NOT a collision
-// A car that suddenly stops when near someone = POSSIBLE collision
-// Two objects that both suddenly change velocity = LIKELY collision
+// Collision Detection Engine v14 — Zero false-positive architecture
+// RULE: A collision requires MUTUAL velocity discontinuity
+// If car passes person at constant speed = NO alert
+// If car hits person = BOTH show sudden velocity change = ALERT
 
 import { TrackedEntity } from "./kalman-tracker";
 
 export interface AccidentEvidence {
-  type: "collision" | "person_fall" | "bike_off_track" | "scene_anomaly";
+  type: "collision" | "person_fall" | "bike_off_track";
   confidence: number;
   objects: number[];
   details: string;
@@ -30,195 +29,120 @@ function isOverlapping(a: TrackedEntity, b: TrackedEntity): boolean {
   const ay = a.kalman.getState().y - a.h / 2;
   const bx = b.kalman.getState().x - b.w / 2;
   const by = b.kalman.getState().y - b.h / 2;
-  return !(ax + a.w < bx || bx + b.w < ax || ay + a.h < by || by + b.h > ay);
-}
-
-function isOverlappingFixed(a: TrackedEntity, b: TrackedEntity): boolean {
-  const ax = a.kalman.getState().x - a.w / 2;
-  const ay = a.kalman.getState().y - a.h / 2;
-  const bx = b.kalman.getState().x - b.w / 2;
-  const by = b.kalman.getState().y - b.h / 2;
   return !(ax + a.w < bx || bx + b.w < ax || ay + a.h < by || by + b.h < ay);
 }
 
 /**
- * VELOCITY ANOMALY DETECTION
- * A collision causes sudden velocity change. Normal driving does not.
- * Returns a score 0-1 indicating how "abnormal" the velocity change is.
+ * SMOOTHED velocity change detection
+ * Uses weighted average of recent speeds to avoid noise
  */
-function velocityAnomalyScore(entity: TrackedEntity): number {
+function smoothedSpeed(entity: TrackedEntity, lookback: number = 3): number {
   const h = entity.speedHistory;
-  if (h.length < 4) return 0;
-
-  // Calculate average speed of first 3 frames vs last 3 frames
-  const oldAvg = (h[3] + (h[4] || h[3])) / 2;
-  const newAvg = (h[0] + h[1]) / 2;
-
-  // Sudden speed change
-  const speedChange = Math.abs(oldAvg - newAvg);
-  const speedChangeRatio = oldAvg > 0.5 ? speedChange / oldAvg : 0;
-
-  // Sudden heading change
-  const headingHist = entity.headingHistory;
-  if (headingHist.length >= 3) {
-    const headingChange = Math.abs(headingHist[0] - headingHist[2]);
-    const wrappedChange = headingChange > Math.PI ? 2 * Math.PI - headingChange : headingChange;
-    if (wrappedChange > 0.5) return Math.min(1.0, 0.5 + wrappedChange * 0.3);
-  }
-
-  // Speed dropped to near zero suddenly
-  if (oldAvg > 1.0 && newAvg < 0.3) return Math.min(1.0, 0.6 + speedChangeRatio * 0.4);
-
-  // Speed increased suddenly (less likely collision, more like acceleration)
-  if (speedChangeRatio > 0.8 && newAvg > oldAvg) return 0.2;
-
-  return Math.min(1.0, speedChangeRatio * 0.5);
+  if (h.length === 0) return 0;
+  const n = Math.min(lookback, h.length);
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum += h[i];
+  return sum / n;
 }
 
 /**
- * MUTUAL VELOCITY ANOMALY
- * Both objects showing velocity discontinuity = collision
- * Only one showing it = might be braking or turning
+ * Detect if entity had a SUDDEN velocity change
+ * Requires: was fast (smoothed) -> now slow/stopped
+ * Returns 0-1 anomaly score
  */
-function mutualVelocityAnomaly(a: TrackedEntity, b: TrackedEntity): number {
-  const aAnomaly = velocityAnomalyScore(a);
-  const bAnomaly = velocityAnomalyScore(b);
+function suddenVelocityChange(entity: TrackedEntity): number {
+  const h = entity.speedHistory;
+  if (h.length < 5) return 0;
 
-  if (aAnomaly > 0.3 && bAnomaly > 0.3) {
-    // Both anomalous = very likely collision
-    return Math.min(1.0, (aAnomaly + bAnomaly) / 2 + 0.2);
-  }
-  if (aAnomaly > 0.3 || bAnomaly > 0.3) {
-    // One anomalous = possible but less certain
-    return Math.max(aAnomaly, bAnomaly) * 0.7;
-  }
-  return 0;
+  // Smoothed speed from 3-5 frames ago
+  const oldSpeed = (h[3] + h[4]) / 2;
+  // Smoothed speed from last 2 frames
+  const newSpeed = (h[0] + h[1]) / 2;
+
+  // Must have been moving fast and now slow
+  if (oldSpeed < 1.0) return 0; // Wasn't moving fast enough
+  if (newSpeed > oldSpeed * 0.7) return 0; // Didn't slow down much
+
+  // How sudden was the change?
+  const speedDrop = (oldSpeed - newSpeed) / oldSpeed;
+  return Math.min(1.0, speedDrop);
 }
 
 /**
- * Check if entity was recently moving fast
+ * Check if entity was recently moving fast (for post-collision detection)
  */
-function wasFast(entity: TrackedEntity, threshold: number = 1.0): boolean {
-  return entity.speedHistory.some(s => s > threshold);
+function wasRecentlyFast(entity: TrackedEntity): boolean {
+  return entity.speedHistory.slice(0, 5).some(s => s > 1.5);
 }
 
-/**
- * Check if entity is stationary
- */
-function isStopped(entity: TrackedEntity): boolean {
-  return entity.speed < 0.3;
-}
+// ========== CORE DETECTION: MUTUAL VELOCITY DISCONTINUITY ==========
 
-// ========== POST-COLLISION DETECTION ==========
-// Detects accidents where objects are already stopped after collision
-
-function detectPostCollision(entities: TrackedEntity[]): AccidentEvidence[] {
+function detectCollisions(entities: TrackedEntity[]): AccidentEvidence[] {
   const evidence: AccidentEvidence[] = [];
 
-  for (let i = 0; i < entities.length; i++) {
-    for (let j = i + 1; j < entities.length; j++) {
-      const a = entities[i];
-      const b = entities[j];
+  const valid = entities.filter(e => e.age >= 5);
+
+  for (let i = 0; i < valid.length; i++) {
+    for (let j = i + 1; j < valid.length; j++) {
+      const a = valid[i];
+      const b = valid[j];
+
+      // Skip person-person
       if (a.class === "person" && b.class === "person") continue;
 
       const d = dist(a, b);
       const cr = combinedR(a, b);
-      const overlapping = isOverlappingFixed(a, b);
-      const veryClose = d < cr * 0.8;
 
-      if (!overlapping && !veryClose) continue;
+      // Must be within detection range
+      if (d > cr * 2.0) continue;
 
-      const aIsVehicle = ["car", "truck", "bus", "motorcycle"].includes(a.class);
-      const bIsVehicle = ["car", "truck", "bus", "motorcycle"].includes(b.class);
-      if (!aIsVehicle && !bIsVehicle) continue;
+      // KEY CHECK: Both objects must show velocity discontinuity
+      const aAnomaly = suddenVelocityChange(a);
+      const bAnomaly = suddenVelocityChange(b);
 
-      const aStopped = isStopped(a);
-      const bStopped = isStopped(b);
-      if (!aStopped && !bStopped) continue;
+      // Without mutual anomaly, it's NOT a collision
+      // A car passing at constant speed = 0 anomaly for both = rejected
+      if (aAnomaly < 0.2 && bAnomaly < 0.2) continue;
 
-      const aWasMoving = wasFast(a, 1.0);
-      const bWasMoving = wasFast(b, 1.0);
-      if (!aWasMoving && !bWasMoving) continue;
-      if (a.age < 3 || b.age < 3) continue;
+      // Calculate collision confidence based on multiple signals
+      let confidence = 0;
+      const reasons: string[] = [];
 
-      // KEY: Check velocity anomaly - was there a sudden change?
-      const anomaly = mutualVelocityAnomaly(a, b);
+      // Signal 1: Mutual velocity anomaly (PRIMARY - required)
+      const mutualAnomaly = Math.min(aAnomaly, bAnomaly); // Weakest link
+      if (mutualAnomaly < 0.2) continue; // Both MUST show significant change
+      confidence += mutualAnomaly * 0.4;
+      reasons.push(`mutual_anomaly=${mutualAnomaly.toFixed(2)}`);
 
-      let confidence = 0.6;
-      if (overlapping) confidence += 0.15;
-      if (d < cr * 0.4) confidence += 0.1;
-      if (anomaly > 0.3) confidence += anomaly * 0.2;
+      // Signal 2: Proximity
+      if (d < cr * 0.5) { confidence += 0.25; reasons.push("touching"); }
+      else if (d < cr * 1.0) { confidence += 0.15; reasons.push("close"); }
 
-      // Person hit by vehicle is very serious
-      const personHit = (a.class === "person" && bIsVehicle) || (b.class === "person" && aIsVehicle);
-      if (personHit) confidence += 0.1;
+      // Signal 3: Overlap
+      if (isOverlapping(a, b)) { confidence += 0.15; reasons.push("overlap"); }
 
-      if (confidence < 0.65) continue;
+      // Signal 4: One was moving fast before (impact)
+      const aWasFast = wasRecentlyFast(a);
+      const bWasFast = wasRecentlyFast(b);
+      if (aWasFast || bWasFast) { confidence += 0.1; reasons.push("was_fast"); }
+
+      // Signal 5: Both now stopped or slow (post-impact)
+      const aSlow = a.speed < 0.5;
+      const bSlow = b.speed < 0.5;
+      if (aSlow && bSlow) { confidence += 0.1; reasons.push("both_slow"); }
+
+      // Minimum threshold
+      if (confidence < 0.5) continue;
 
       evidence.push({
         type: "collision",
         confidence: Math.min(confidence, 0.95),
         objects: [a.id, b.id],
-        details: `Post-collision: ${a.class}#${a.id}+${b.class}#${b.id} anomaly=${anomaly.toFixed(2)} d=${d.toFixed(0)}`,
+        details: `${a.class}#${a.id}+${b.class}#${b.id} conf=${confidence.toFixed(2)} [${reasons.join("+")}]`,
       });
     }
   }
-  return evidence;
-}
 
-// ========== ACTIVE COLLISION DETECTION ==========
-// Detects collisions happening RIGHT NOW (velocity discontinuity)
-
-function detectActiveCollisions(entities: TrackedEntity[]): AccidentEvidence[] {
-  const evidence: AccidentEvidence[] = [];
-
-  for (let i = 0; i < entities.length; i++) {
-    for (let j = i + 1; j < entities.length; j++) {
-      const a = entities[i];
-      const b = entities[j];
-      if (a.class === "person" && b.class === "person") continue;
-
-      const d = dist(a, b);
-      const cr = combinedR(a, b);
-      if (d > cr * 2.5) continue;
-
-      // KEY CHECK: Velocity discontinuity
-      const anomaly = mutualVelocityAnomaly(a, b);
-
-      // Without velocity anomaly, objects near each other are NOT colliding
-      if (anomaly < 0.2) continue;
-
-      let score = 0;
-      const reasons: string[] = [];
-
-      // Velocity anomaly is the PRIMARY signal
-      score += anomaly * 0.5;
-      reasons.push(`anomaly=${anomaly.toFixed(2)}`);
-
-      // Proximity
-      if (d < cr * 0.6) { score += 0.25; reasons.push("touching"); }
-      else if (d < cr * 1.2) { score += 0.15; reasons.push("close"); }
-      else if (d < cr * 2.0) { score += 0.05; reasons.push("moderate"); }
-
-      // Overlap
-      if (isOverlappingFixed(a, b)) { score += 0.15; reasons.push("overlap"); }
-
-      // Both decelerated (not just one)
-      const aDecel = a.speedHistory.length >= 3 && a.speedHistory[0] > 1.5 && a.speed < 0.5;
-      const bDecel = b.speedHistory.length >= 3 && b.speedHistory[0] > 1.5 && b.speed < 0.5;
-      if (aDecel && bDecel) { score += 0.15; reasons.push("both_decel"); }
-      else if (aDecel || bDecel) { score += 0.08; reasons.push("one_decel"); }
-
-      if (score < 0.4) continue;
-
-      evidence.push({
-        type: "collision",
-        confidence: Math.min(score, 0.95),
-        objects: [a.id, b.id],
-        details: `Active: ${a.class}#${a.id}+${b.class}#${b.id} score=${score.toFixed(2)} [${reasons.join("+")}]`,
-      });
-    }
-  }
   return evidence;
 }
 
@@ -226,40 +150,42 @@ function detectActiveCollisions(entities: TrackedEntity[]): AccidentEvidence[] {
 
 function detectPersonFall(entities: TrackedEntity[]): AccidentEvidence[] {
   const evidence: AccidentEvidence[] = [];
+
   for (const entity of entities) {
     if (entity.class !== "person" || entity.age < 4) continue;
-    if (entity.aspectHistory.length < 3) continue;
+    if (entity.aspectHistory.length < 4) continue;
 
     const currentAR = entity.aspectHistory[entity.aspectHistory.length - 1];
-    const prevAR = entity.aspectHistory.length >= 3
-      ? (entity.aspectHistory[0] + entity.aspectHistory[1]) / 2
-      : currentAR;
+    const prevAR = (entity.aspectHistory[0] + entity.aspectHistory[1]) / 2;
 
     const wasStanding = prevAR < 0.8;
     const nowLying = currentAR > 0.9;
 
-    if (wasStanding && nowLying) {
-      const velocityAnomaly = velocityAnomalyScore(entity);
-      const wasMoving = entity.speedHistory.some(s => s > 0.8);
-      const stationary = isStopped(entity);
-      const lastY = entity.positions[entity.positions.length - 1]?.y || 0;
-      const prevY = entity.positions.length >= 3 ? entity.positions[entity.positions.length - 3].y : lastY;
-      const dropped = lastY > prevY + 2;
+    if (!wasStanding || !nowLying) continue;
 
-      let confidence = 0.65;
-      if (dropped) confidence += 0.1;
-      if (velocityAnomaly > 0.3) confidence += 0.1;
-      if (stationary && nowLying) confidence += 0.1;
-      if (wasMoving) confidence += 0.05;
+    // Must show velocity change (person was moving, now stopped)
+    const velocityChange = suddenVelocityChange(entity);
+    const wasMoving = entity.speedHistory.slice(0, 5).some(s => s > 0.5);
+    const isStopped = entity.speed < 0.3;
 
-      evidence.push({
-        type: "person_fall",
-        confidence: Math.min(confidence, 0.9),
-        objects: [entity.id],
-        details: `Fall: AR ${prevAR.toFixed(2)}->${currentAR.toFixed(2)} anomaly=${velocityAnomaly.toFixed(2)} dropped=${dropped}`,
-      });
-    }
+    // Y position drop
+    const lastY = entity.positions[entity.positions.length - 1]?.y || 0;
+    const prevY = entity.positions.length >= 3 ? entity.positions[entity.positions.length - 3].y : lastY;
+    const dropped = lastY > prevY + 3;
+
+    let confidence = 0.6;
+    if (velocityChange > 0.2) confidence += 0.15;
+    if (wasMoving && isStopped) confidence += 0.1;
+    if (dropped) confidence += 0.1;
+
+    evidence.push({
+      type: "person_fall",
+      confidence: Math.min(confidence, 0.9),
+      objects: [entity.id],
+      details: `Fall: AR ${prevAR.toFixed(2)}->${currentAR.toFixed(2)} velChange=${velocityChange.toFixed(2)}`,
+    });
   }
+
   return evidence;
 }
 
@@ -267,6 +193,7 @@ function detectPersonFall(entities: TrackedEntity[]): AccidentEvidence[] {
 
 function detectBikeOffTrack(entities: TrackedEntity[]): AccidentEvidence[] {
   const evidence: AccidentEvidence[] = [];
+
   for (const entity of entities) {
     if (entity.class !== "motorcycle" || entity.age < 4) continue;
     if (entity.headingHistory.length < 4) continue;
@@ -276,19 +203,20 @@ function detectBikeOffTrack(entities: TrackedEntity[]): AccidentEvidence[] {
     let headingChange = Math.abs(recentH - prevH);
     if (headingChange > Math.PI) headingChange = 2 * Math.PI - headingChange;
 
-    const anomaly = velocityAnomalyScore(entity);
-    const wasMoving = entity.speedHistory.some(s => s > 1.0);
+    const velocityChange = suddenVelocityChange(entity);
+    const wasMoving = entity.speedHistory.slice(0, 5).some(s => s > 1.0);
     const significantChange = headingChange > Math.PI * 0.3;
 
-    if ((wasMoving && significantChange) || anomaly > 0.5) {
+    if ((wasMoving && significantChange) || velocityChange > 0.5) {
       evidence.push({
         type: "bike_off_track",
-        confidence: Math.min(0.6 + anomaly * 0.2, 0.85),
+        confidence: Math.min(0.6 + velocityChange * 0.2, 0.85),
         objects: [entity.id],
-        details: `Bike heading ${(headingChange * 180 / Math.PI).toFixed(0)} deg anomaly=${anomaly.toFixed(2)}`,
+        details: `Bike heading ${(headingChange * 180 / Math.PI).toFixed(0)} deg velChange=${velocityChange.toFixed(2)}`,
       });
     }
   }
+
   return evidence;
 }
 
@@ -303,20 +231,14 @@ export function detectAccidents(
 ): AccidentEvidence[] {
   let evidence: AccidentEvidence[] = [];
 
-  if (envMode === "traffic") {
-    // Traffic: use active collision detection (velocity anomaly required)
-    evidence = detectActiveCollisions(entities);
-  } else {
-    // Isolated/marketplace: both post-collision and active detection
-    evidence.push(...detectPostCollision(entities));
-    evidence.push(...detectActiveCollisions(entities));
-  }
+  // Core collision detection (same for all modes - requires mutual velocity anomaly)
+  evidence = detectCollisions(entities);
 
-  // Always run person fall and bike off-track
+  // Always run person fall and bike detection
   evidence.push(...detectPersonFall(entities));
   evidence.push(...detectBikeOffTrack(entities));
 
-  // Deduplicate: keep highest confidence per object pair
+  // Deduplicate
   const deduped: AccidentEvidence[] = [];
   const seen = new Set<string>();
   evidence.sort((a, b) => b.confidence - a.confidence);
