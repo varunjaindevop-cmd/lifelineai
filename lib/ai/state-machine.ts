@@ -1,16 +1,6 @@
 /**
- * Detection State Machine — gates alert generation.
- *
- * States:
- *   monitoring → watching → confirming → alert → (cooldown) → monitoring
- *
- * Thresholds:
- *   monitoring → watching : one event with confidence > 0.7
- *   watching  → confirming: continuous event for 0.5s (real time)
- *   confirming → alert    : continuous evidence for 1 full second
- *   Any state → monitoring: signal lost or confidence drops
- *
- * Cooldown: 5 seconds after alert fires, ignore new events.
+ * Simplified Detection State Machine.
+ * idle → watching → confirming → alert, then cooldown.
  */
 
 export type DetectionState = "monitoring" | "watching" | "confirming" | "alert";
@@ -29,25 +19,19 @@ export class DetectionStateMachine {
   private lastAlertTime = 0;
   private lastEventType: string | null = null;
 
-  // Tunable thresholds
   private watchThreshold = 0.7;
-  private watchDurationMs = 500;    // 0.5 seconds
-  private confirmDurationMs = 1000; // 1 second
-  private cooldownMs = 5000;        // 5 seconds
+  private watchDurationMs = 500;
+  private confirmDurationMs = 1000;
+  private cooldownMs = 5000;
 
-  getState(): DetectionState {
-    return this.state;
-  }
+  getState(): DetectionState { return this.state; }
 
-  processFrame(
-    evidence: { type: string; confidence: number } | null
-  ): StateResult {
+  processFrame(evidence: { type: string; confidence: number } | null): StateResult {
     const now = Date.now();
     const hasEvidence = evidence !== null && evidence.confidence > 0;
     const confidence = evidence?.confidence ?? 0;
     const eventType = evidence?.type ?? null;
 
-    // Cooldown check
     if (now - this.lastAlertTime < this.cooldownMs) {
       return { state: this.state, shouldAlert: false, alertType: null, confidence: 0 };
     }
@@ -60,67 +44,32 @@ export class DetectionStateMachine {
           this.lastEventType = eventType;
         }
         break;
-
       case "watching":
-        if (!hasEvidence || confidence < 0.4) {
-          // Signal lost — back to monitoring
-          this.state = "monitoring";
-        } else if (now - this.watchStartTime >= this.watchDurationMs) {
-          // Held long enough — advance to confirming
+        if (!hasEvidence || confidence < 0.4) { this.state = "monitoring"; }
+        else if (now - this.watchStartTime >= this.watchDurationMs) {
           this.state = "confirming";
           this.confirmStartTime = now;
-          this.lastEventType = eventType;
         }
-        // else: still watching, keep accumulating
         break;
-
       case "confirming":
-        if (!hasEvidence || confidence < 0.3) {
-          // Signal lost during confirmation
-          this.state = "monitoring";
-        } else if (now - this.confirmStartTime >= this.confirmDurationMs) {
-          // Full confirmation period elapsed — fire alert
+        if (!hasEvidence || confidence < 0.3) { this.state = "monitoring"; }
+        else if (now - this.confirmStartTime >= this.confirmDurationMs) {
           this.state = "alert";
           this.lastAlertTime = now;
-          return {
-            state: this.state,
-            shouldAlert: true,
-            alertType: this.lastEventType,
-            confidence,
-          };
+          return { state: this.state, shouldAlert: true, alertType: this.lastEventType, confidence };
         }
-        // else: still confirming, keep accumulating
         break;
-
       case "alert":
-        // Should not stay in alert — immediately return to monitoring
         this.state = "monitoring";
         break;
     }
 
-    return {
-      state: this.state,
-      shouldAlert: false,
-      alertType: null,
-      confidence,
-    };
+    return { state: this.state, shouldAlert: false, alertType: null, confidence };
   }
 
-  reset(): void {
-    this.state = "monitoring";
-    this.watchStartTime = 0;
-    this.confirmStartTime = 0;
-    this.lastAlertTime = 0;
-    this.lastEventType = null;
-  }
+  reset(): void { this.state = "monitoring"; this.watchStartTime = 0; this.confirmStartTime = 0; this.lastAlertTime = 0; this.lastEventType = null; }
 
-  /** Override thresholds (e.g. from debug page). */
-  setThresholds(opts: {
-    watchThreshold?: number;
-    watchDurationMs?: number;
-    confirmDurationMs?: number;
-    cooldownMs?: number;
-  }) {
+  setThresholds(opts: { watchThreshold?: number; watchDurationMs?: number; confirmDurationMs?: number; cooldownMs?: number }) {
     if (opts.watchThreshold !== undefined) this.watchThreshold = opts.watchThreshold;
     if (opts.watchDurationMs !== undefined) this.watchDurationMs = opts.watchDurationMs;
     if (opts.confirmDurationMs !== undefined) this.confirmDurationMs = opts.confirmDurationMs;
@@ -128,7 +77,6 @@ export class DetectionStateMachine {
   }
 }
 
-// Get severity from confidence
 export function getSeverity(confidence: number): "critical" | "major" | "minor" | "suspicious" {
   if (confidence > 0.8) return "critical";
   if (confidence > 0.6) return "major";
