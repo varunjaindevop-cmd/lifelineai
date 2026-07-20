@@ -1,0 +1,10 @@
+ultralytics>=8.0.200
+roboflow>=1.1.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+onnx>=1.15.0
+onnxruntime>=1.16.0
+Pillow>=10.0.0
+pyyaml>=6.0
+tqdm>=4.65.0

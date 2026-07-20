@@ -88,12 +88,22 @@ export default function MapContent() {
 
     fetchData();
 
+    // Throttle realtime updates to prevent query storms
+    let lastFetchTime = 0;
+    const throttledFetch = () => {
+      const now = Date.now();
+      if (now - lastFetchTime > 1000) { // Max once per second
+        lastFetchTime = now;
+        fetchData();
+      }
+    };
+
     const channel = supabase
       .channel("map-updates")
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "incidents" },
-        () => fetchData()
+        throttledFetch
       )
       .subscribe();
 

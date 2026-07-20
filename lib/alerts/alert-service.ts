@@ -73,7 +73,8 @@ export async function createIncident(data: IncidentData): Promise<string | null>
     data.vehicleSpeed
   );
 
-  for (const role of notifyRoles) {
+  // Send all role-based alerts in parallel
+  await Promise.all(notifyRoles.map(async (role) => {
     // Create alert record
     await supabase.from("alerts").insert({
       incident_id: incident.id,
@@ -98,7 +99,7 @@ export async function createIncident(data: IncidentData): Promise<string | null>
         vehicle_speed: data.vehicleSpeed,
       },
     });
-  }
+  }));
 
   return incident.id;
 }

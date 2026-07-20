@@ -100,17 +100,25 @@ export default function UserDashboard() {
 
     init();
 
+    // Throttle realtime updates
+    let lastUpdateTime = 0;
+    const throttledHandler = (payload: any) => {
+      const now = Date.now();
+      if (now - lastUpdateTime < 500) return; // Max once per 500ms
+      lastUpdateTime = now;
+
+      const inc = payload.new as Incident;
+      if (inc.latitude == null || inc.longitude == null) return;
+      setIncidents((prev) => [inc, ...prev]);
+      if (userLocation) {
+        const dist = calcDistance(userLocation.lat, userLocation.lng, inc.latitude, inc.longitude);
+        if (dist < 5) toast.error(`Nearby: ${inc.incident_type.replace(/_/g, " ")}`, { duration: 8000 });
+      }
+    };
+
     const channel = supabase
       .channel("user-incidents")
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "incidents" }, (payload) => {
-        const inc = payload.new as Incident;
-        if (inc.latitude == null || inc.longitude == null) return;
-        setIncidents((prev) => [inc, ...prev]);
-        if (userLocation) {
-          const dist = calcDistance(userLocation.lat, userLocation.lng, inc.latitude, inc.longitude);
-          if (dist < 5) toast.error(`Nearby: ${inc.incident_type.replace(/_/g, " ")}`, { duration: 8000 });
-        }
-      })
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "incidents" }, throttledHandler)
       .subscribe();
 
     return () => { supabase.removeChannel(channel); };
@@ -127,18 +135,22 @@ export default function UserDashboard() {
     }
   }, [userLocation, incidents]);
 
-  // Search with Nominatim
+  // Search with Nominatim (with AbortController for stale request cancellation)
   useEffect(() => {
     if (searchQuery.length < 3) { setSearchResults([]); return; }
+    const controller = new AbortController();
     const timer = setTimeout(async () => {
       setSearching(true);
       try {
-        const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(searchQuery + " Indore")}&format=json&limit=5`, { headers: { "User-Agent": "LifelineAI/1.0" } });
+        const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(searchQuery + " Indore")}&format=json&limit=5`, {
+          headers: { "User-Agent": "LifelineAI/1.0" },
+          signal: controller.signal,
+        });
         setSearchResults(await res.json());
-      } catch { setSearchResults([]); }
+      } catch { if (!controller.signal.aborted) setSearchResults([]); }
       setSearching(false);
     }, 400);
-    return () => clearTimeout(timer);
+    return () => { clearTimeout(timer); controller.abort(); };
   }, [searchQuery]);
 
   const selectSearchResult = (result: SearchResult) => {

@@ -4,13 +4,11 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import {
   ArrowLeft, Video, Play, Pause, AlertTriangle, Clock,
-  Navigation, RotateCcw, Loader2, Zap, Car, Users,
+  Navigation, Loader2, Zap, Car, Users,
 } from "lucide-react";
 import Link from "next/link";
 import { toast } from "sonner";
-import { MultiObjectTracker, TrackedEntity } from "@/lib/detection/kalman-tracker";
-import { findAllTTCPairs, detectAccidents, TTCPair, AccidentEvidence } from "@/lib/detection/ttc-engine";
-import { autoCalibrate, calculateRealSpeed, perspectiveCorrectedSpeed } from "@/lib/detection/speed-estimator";
+import { useDetectionWorker, type UseDetectionWorkerReturn } from "@/hooks/useDetectionWorker";
 
 interface VideoClip { name: string; src: string; description: string }
 interface IncidentAlert { type: string; severity: string; confidence: number; timestamp: string; latitude: number; longitude: number }
@@ -23,92 +21,40 @@ const VIDEO_CLIPS: VideoClip[] = [
   { name: "checking.mp4", src: "/videos/checking.mp4", description: "System check" },
 ];
 
-const COCO_MAP: Record<string, string> = {
-  car: "car", truck: "car", bus: "car",
-  motorcycle: "motorcycle", motorbike: "motorcycle", bicycle: "motorcycle",
-  person: "person",
-};
-
 const LAT = 22.7196, LNG = 75.8577;
 const GRID_COLS = 10, GRID_ROWS = 8;
 
 export default function VideoAnalysisPage() {
   const [selectedClip, setSelectedClip] = useState<VideoClip | null>(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [videoReady, setVideoReady] = useState(false);
-  const [incidents, setIncidents] = useState<IncidentAlert[]>([]);
-  const [state, setState] = useState("monitoring");
-  const [objectCount, setObjectCount] = useState(0);
   const [envMode, setEnvMode] = useState<EnvMode>("isolated");
-  const [modelReady, setModelReady] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const tmpCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const rafRef = useRef<number>(0);
-  const analyzingRef = useRef(false);
-  const trackerRef = useRef(new MultiObjectTracker());
-  const modelRef = useRef<any>(null);
-  const stateRef = useRef("monitoring");
-  const frameRef = useRef(0);
-  const cooldownRef = useRef(0);
-  const accumRef = useRef<Float32Array>(new Float32Array(GRID_COLS * GRID_ROWS));
-  const prevChangeGridRef = useRef<Float32Array | null>(null);
-  const consecutiveAnomalyRef = useRef(0);
-  const pixelsPerMeterRef = useRef(20);
-  const alertTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const videoReadyTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const canvasSizedRef = useRef(false);
   const supabase = createClient();
 
-  // Load COCO-SSD once on mount
-  useEffect(() => {
-    const loadModel = async () => {
-      try {
-        const [tf, cocoSsd] = await Promise.all([
-          import("@tensorflow/tfjs"),
-          import("@tensorflow-models/coco-ssd"),
-        ]);
-        await tf.ready();
-        modelRef.current = await cocoSsd.load({ base: "lite_mobilenet_v2" });
-        setModelReady(true);
-      } catch (e) {
-        console.error("COCO-SSD load failed:", e);
-        toast.error("AI model failed to load.");
-      }
-    };
-    loadModel();
-    return () => {
-      cancelAnimationFrame(rafRef.current);
-      if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current);
-      if (videoReadyTimeoutRef.current) clearTimeout(videoReadyTimeoutRef.current);
-    };
-  }, []);
+  // Use the worker-based detection hook
+  const detection: UseDetectionWorkerReturn = useDetectionWorker(envMode);
+  const { isReady, isAnalyzing, state, entities, evidence, changeGrid, fps, incidents } = detection;
 
-  // Fallback: force videoReady after 5s if events don't fire (Vercel issue)
+  // Fallback: force videoReady after 5s if events don't fire
   useEffect(() => {
     if (selectedClip) {
       setVideoReady(false);
       if (videoReadyTimeoutRef.current) clearTimeout(videoReadyTimeoutRef.current);
       videoReadyTimeoutRef.current = setTimeout(() => {
         setVideoReady(true);
-        console.log("[SAGE] Video ready forced by timeout (events may not have fired)");
       }, 5000);
     }
     return () => { if (videoReadyTimeoutRef.current) clearTimeout(videoReadyTimeoutRef.current); };
   }, [selectedClip]);
 
-  // Recalibrate PPM when env mode changes
+  // Update worker mode when envMode changes
   useEffect(() => {
-    if (videoRef.current) {
-      pixelsPerMeterRef.current = autoCalibrate(videoRef.current.videoWidth || 640, videoRef.current.videoHeight || 480, envMode);
-    }
-  }, [envMode]);
-
-  const getTmp = useCallback(() => {
-    if (!tmpCanvasRef.current) tmpCanvasRef.current = document.createElement("canvas");
-    return tmpCanvasRef.current;
-  }, []);
+    detection.setMode(envMode);
+  }, [envMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Create AudioContext on first user interaction
   const getAudioCtx = useCallback(() => {
@@ -132,132 +78,8 @@ export default function VideoAnalysisPage() {
     } catch {}
   }, [getAudioCtx]);
 
-  const computeChangeGrid = (data: Uint8ClampedArray, w: number, h: number): Float32Array => {
-    const grid = new Float32Array(GRID_COLS * GRID_ROWS);
-    const cw = Math.floor(w / GRID_COLS), ch = Math.floor(h / GRID_ROWS);
-    for (let r = 0; r < GRID_ROWS; r++) for (let c = 0; c < GRID_COLS; c++) {
-      let s = 0, n = 0;
-      for (let dy = 0; dy < ch; dy += 4) for (let dx = 0; dx < cw; dx += 4) {
-        const i = ((r * ch + dy) * w + (c * cw + dx)) * 4;
-        s += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114; n++;
-      }
-      grid[r * GRID_COLS + c] = n > 0 ? s / n : 128;
-    }
-    return grid;
-  };
-
-  const drawFrame = (entities: TrackedEntity[], ttcPairs: TTCPair[], evidence: AccidentEvidence[], videoW: number, videoH: number) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    // Size canvas once
-    if (!canvasSizedRef.current || canvas.width !== videoW || canvas.height !== videoH) {
-      canvas.width = videoW;
-      canvas.height = videoH;
-      canvasSizedRef.current = true;
-    }
-    ctx.clearRect(0, 0, videoW, videoH);
-
-    // Draw objects with ESP boxes
-    for (const entity of entities) {
-      if (entity.age < 1) continue;
-      const isInvolved = evidence.some(e => e.objects.includes(entity.id));
-      const baseColor = entity.class === "car" ? "#22c55e" : entity.class === "motorcycle" ? "#f59e0b" : "#3b82f6";
-      const color = isInvolved ? "#ef4444" : baseColor;
-      const cx = entity.kalman.getState().x, cy = entity.kalman.getState().y;
-      const bx = cx - entity.w / 2, by = cy - entity.h / 2;
-
-      // Bounding box with rounded corners effect
-      ctx.strokeStyle = color;
-      ctx.lineWidth = isInvolved ? 3 : 2;
-      ctx.strokeRect(bx, by, entity.w, entity.h);
-
-      // Corner markers for precision
-      const cornerLen = Math.min(8, entity.w * 0.15, entity.h * 0.15);
-      ctx.lineWidth = 3;
-      // Top-left
-      ctx.beginPath(); ctx.moveTo(bx, by + cornerLen); ctx.lineTo(bx, by); ctx.lineTo(bx + cornerLen, by); ctx.stroke();
-      // Top-right
-      ctx.beginPath(); ctx.moveTo(bx + entity.w - cornerLen, by); ctx.lineTo(bx + entity.w, by); ctx.lineTo(bx + entity.w, by + cornerLen); ctx.stroke();
-      // Bottom-left
-      ctx.beginPath(); ctx.moveTo(bx, by + entity.h - cornerLen); ctx.lineTo(bx, by + entity.h); ctx.lineTo(bx + cornerLen, by + entity.h); ctx.stroke();
-      // Bottom-right
-      ctx.beginPath(); ctx.moveTo(bx + entity.w - cornerLen, by + entity.h); ctx.lineTo(bx + entity.w, by + entity.h); ctx.lineTo(bx + entity.w, by + entity.h - cornerLen); ctx.stroke();
-
-      // Heading arrow with arrowhead
-      const arrowLen = Math.min(entity.w, entity.h) * 0.6;
-      const endX = cx + Math.cos(entity.heading) * arrowLen;
-      const endY = cy + Math.sin(entity.heading) * arrowLen;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(endX, endY);
-      ctx.strokeStyle = isInvolved ? "#ef4444" : "#fff";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      // Arrowhead
-      const headLen = 6;
-      const headAngle = 0.5;
-      ctx.beginPath();
-      ctx.moveTo(endX, endY);
-      ctx.lineTo(endX - headLen * Math.cos(entity.heading - headAngle), endY - headLen * Math.sin(entity.heading - headAngle));
-      ctx.moveTo(endX, endY);
-      ctx.lineTo(endX - headLen * Math.cos(entity.heading + headAngle), endY - headLen * Math.sin(entity.heading + headAngle));
-      ctx.stroke();
-
-      // Trail (last 5 positions)
-      if (entity.positions.length > 1) {
-        ctx.beginPath();
-        ctx.strokeStyle = `${color}66`;
-        ctx.lineWidth = 1;
-        const trail = entity.positions.slice(-5);
-        for (let i = 0; i < trail.length; i++) {
-          i === 0 ? ctx.moveTo(trail[i].x, trail[i].y) : ctx.lineTo(trail[i].x, trail[i].y);
-        }
-        ctx.stroke();
-      }
-
-      // ESP info label
-      const { current: speedKmh } = calculateRealSpeed(entity, pixelsPerMeterRef.current);
-      const corrected = perspectiveCorrectedSpeed(speedKmh, cy, videoH);
-      const accelLabel = entity.acceleration < -0.3 ? " BRAKE" : entity.acceleration > 0.3 ? " ACC" : "";
-      const headingDeg = Math.round(entity.heading * 180 / Math.PI);
-      const label = `#${entity.id} ${entity.class} ${corrected}km/h ${headingDeg}°${accelLabel}`;
-      ctx.font = "bold 10px monospace";
-      const tw = ctx.measureText(label).width;
-      ctx.fillStyle = isInvolved ? "#ef4444" : "rgba(0,0,0,0.8)";
-      ctx.fillRect(bx, by - 20, tw + 8, 18);
-      ctx.fillStyle = "#fff";
-      ctx.fillText(label, bx + 4, by - 6);
-    }
-
-    // TTC lines
-    for (const pair of ttcPairs) {
-      if (pair.severity === "none") continue;
-      const lineColor = pair.severity === "impact" ? "#ef4444" : pair.severity === "critical" ? "#f97316" : "#f59e0b";
-      ctx.setLineDash([4, 4]);
-      ctx.strokeStyle = lineColor;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(pair.a.kalman.getState().x, pair.a.kalman.getState().y);
-      ctx.lineTo(pair.b.kalman.getState().x, pair.b.kalman.getState().y);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-
-    // Bottom bar
-    const barY = videoH - 20;
-    ctx.fillStyle = "rgba(0,0,0,0.7)";
-    ctx.fillRect(0, barY, videoW, 20);
-    ctx.fillStyle = "#fff";
-    ctx.font = "11px Arial";
-    const modeLabel = envMode === "traffic" ? "TRAFFIC" : envMode === "marketplace" ? "MARKETPLACE" : "ISOLATED";
-    ctx.fillText(`${modeLabel} | Objects: ${entities.filter(e => e.age >= 1).length} | PPM: ${pixelsPerMeterRef.current.toFixed(1)}`, 8, barY + 14);
-  };
-
-  const createIncident = async (alert: IncidentAlert) => {
-    setIncidents(prev => [...prev, alert]);
+  // Create incident when detection fires
+  const createIncident = useCallback(async (alert: IncidentAlert) => {
     toast.error(`ACCIDENT: ${alert.type.replace(/_/g, " ")} (${alert.severity})`);
     playAlertSound();
 
@@ -267,7 +89,7 @@ export default function VideoAnalysisPage() {
         latitude: alert.latitude, longitude: alert.longitude,
         location_name: `Video Analysis: ${selectedClip?.name}`,
         detection_confidence: alert.confidence,
-        detection_data: { source: "ttc_engine", clip: selectedClip?.name },
+        detection_data: { source: "yolov8n_worker", clip: selectedClip?.name },
         video_clip_url: selectedClip?.src || null,
         status: "detected",
       }).select().single();
@@ -282,212 +104,156 @@ export default function VideoAnalysisPage() {
         } catch {}
       }
     } catch (e) { console.error("Incident failed:", e); }
-  };
+  }, [supabase, selectedClip, playAlertSound]);
 
-  // ========== MAIN LOOP ==========
-  const startAnalysis = async () => {
-    if (!videoRef.current || !selectedClip || analyzingRef.current) return;
-    if (!modelRef.current) { toast.error("AI model still loading..."); return; }
+  // Handle new incidents from worker
+  useEffect(() => {
+    if (incidents.length === 0) return;
+    const latest = incidents[incidents.length - 1];
+    createIncident({
+      ...latest,
+      latitude: LAT + (Math.random() - 0.5) * 0.01,
+      longitude: LNG + (Math.random() - 0.5) * 0.01,
+    });
+  }, [incidents.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Draw frame overlay on canvas (only UI rendering, no detection)
+  const drawFrame = useCallback(() => {
+    const canvas = canvasRef.current;
     const video = videoRef.current;
-    try { await video.play(); } catch {
-      video.muted = true;
-      try { await video.play(); } catch { toast.error("Cannot play video"); return; }
+    if (!canvas || !video) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const videoW = video.videoWidth || 640;
+    const videoH = video.videoHeight || 480;
+
+    if (!canvasSizedRef.current || canvas.width !== videoW || canvas.height !== videoH) {
+      canvas.width = videoW;
+      canvas.height = videoH;
+      canvasSizedRef.current = true;
+    }
+    ctx.clearRect(0, 0, videoW, videoH);
+
+    // Draw entities from worker results
+    for (const entity of entities) {
+      if (entity.age < 1) continue;
+      const isInvolved = evidence.some(e => e.objects.includes(entity.id));
+      const baseColor = entity.class === "car" ? "#22c55e" : entity.class === "motorcycle" ? "#f59e0b" : "#3b82f6";
+      const color = isInvolved ? "#ef4444" : baseColor;
+      const cx = entity.x, cy = entity.y;
+      const bx = cx - entity.w / 2, by = cy - entity.h / 2;
+
+      // Bounding box
+      ctx.strokeStyle = color;
+      ctx.lineWidth = isInvolved ? 3 : 2;
+      ctx.strokeRect(bx, by, entity.w, entity.h);
+
+      // Corner markers
+      const cornerLen = Math.min(8, entity.w * 0.15, entity.h * 0.15);
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(bx, by + cornerLen); ctx.lineTo(bx, by); ctx.lineTo(bx + cornerLen, by); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(bx + entity.w - cornerLen, by); ctx.lineTo(bx + entity.w, by); ctx.lineTo(bx + entity.w, by + cornerLen); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(bx, by + entity.h - cornerLen); ctx.lineTo(bx, by + entity.h); ctx.lineTo(bx + cornerLen, by + entity.h); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(bx + entity.w - cornerLen, by + entity.h); ctx.lineTo(bx + entity.w, by + entity.h); ctx.lineTo(bx + entity.w, by + entity.h - cornerLen); ctx.stroke();
+
+      // Heading arrow
+      const arrowLen = Math.min(entity.w, entity.h) * 0.6;
+      const endX = cx + Math.cos(entity.heading) * arrowLen;
+      const endY = cy + Math.sin(entity.heading) * arrowLen;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(endX, endY);
+      ctx.strokeStyle = isInvolved ? "#ef4444" : "#fff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      const headLen = 6;
+      const headAngle = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(endX, endY);
+      ctx.lineTo(endX - headLen * Math.cos(entity.heading - headAngle), endY - headLen * Math.sin(entity.heading - headAngle));
+      ctx.moveTo(endX, endY);
+      ctx.lineTo(endX - headLen * Math.cos(entity.heading + headAngle), endY - headLen * Math.sin(entity.heading + headAngle));
+      ctx.stroke();
+
+      // Trail
+      if (entity.positions.length > 1) {
+        ctx.beginPath();
+        ctx.strokeStyle = `${color}66`;
+        ctx.lineWidth = 1;
+        const trail = entity.positions.slice(-5);
+        for (let i = 0; i < trail.length; i++) {
+          i === 0 ? ctx.moveTo(trail[i].x, trail[i].y) : ctx.lineTo(trail[i].x, trail[i].y);
+        }
+        ctx.stroke();
+      }
+
+      // ESP info label
+      const speedKmh = Math.round(entity.speed * 10); // Approximate from Kalman velocity
+      const corrected = speedKmh; // Worker handles perspective correction internally
+      const accelLabel = entity.acceleration < -0.3 ? " BRAKE" : entity.acceleration > 0.3 ? " ACC" : "";
+      const headingDeg = Math.round(entity.heading * 180 / Math.PI);
+      const label = `#${entity.id} ${entity.class} ${corrected}km/h ${headingDeg}°${accelLabel}`;
+      ctx.font = "bold 10px monospace";
+      const tw = ctx.measureText(label).width;
+      ctx.fillStyle = isInvolved ? "#ef4444" : "rgba(0,0,0,0.8)";
+      ctx.fillRect(bx, by - 20, tw + 8, 18);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(label, bx + 4, by - 6);
     }
 
-    trackerRef.current.reset();
-    accumRef.current.fill(0);
-    prevChangeGridRef.current = null;
-    frameRef.current = 0;
-    cooldownRef.current = 0;
-    consecutiveAnomalyRef.current = 0;
-    stateRef.current = "monitoring";
+    // Bottom bar
+    const barY = videoH - 20;
+    ctx.fillStyle = "rgba(0,0,0,0.7)";
+    ctx.fillRect(0, barY, videoW, 20);
+    ctx.fillStyle = "#fff";
+    ctx.font = "11px Arial";
+    const modeLabel = envMode === "traffic" ? "TRAFFIC" : envMode === "marketplace" ? "MARKETPLACE" : "ISOLATED";
+    ctx.fillText(`${modeLabel} | Objects: ${entities.filter(e => e.age >= 1).length} | FPS: ${fps}`, 8, barY + 14);
+  }, [entities, evidence, envMode, fps]);
+
+  // RAF loop for canvas drawing (lightweight, on main thread)
+  useEffect(() => {
+    if (!isAnalyzing) return;
+    let rafId: number;
+    const draw = () => {
+      drawFrame();
+      rafId = requestAnimationFrame(draw);
+    };
+    rafId = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(rafId);
+  }, [isAnalyzing, drawFrame]);
+
+  const startAnalysis = useCallback(() => {
+    if (!videoRef.current || !selectedClip) return;
+    const video = videoRef.current;
     canvasSizedRef.current = false;
-    pixelsPerMeterRef.current = autoCalibrate(video.videoWidth || 640, video.videoHeight || 480, envMode);
 
-    analyzingRef.current = true;
-    setIsAnalyzing(true);
-    setIncidents([]);
-    setState("monitoring");
-    setObjectCount(0);
+    video.play().then(() => {
+      detection.startAnalysis(video);
+    }).catch(() => {
+      video.muted = true;
+      video.play().then(() => {
+        detection.startAnalysis(video);
+      }).catch(() => toast.error("Cannot play video"));
+    });
+  }, [detection, selectedClip]);
 
-    let lastDetectTime = 0;
-    let latestDetections: { class: string; cx: number; cy: number; w: number; h: number; confidence: number }[] = [];
-    let isDetecting = false;
+  const stopAnalysis = useCallback(() => {
+    detection.stopAnalysis();
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.currentTime = 0;
+    }
+  }, [detection]);
 
-    const scheduleDetection = (vid: HTMLVideoElement) => {
-      if (isDetecting || !modelRef.current || vid.paused || vid.ended) return;
-      const now = Date.now();
-      if (now - lastDetectTime < 300) return;
-      isDetecting = true;
-      lastDetectTime = now;
-      modelRef.current.detect(vid).then((preds: any[]) => {
-        // Filter by class and score
-        const filtered = preds
-          .filter((p: any) => p.class in COCO_MAP && p.score > 0.25)
-          .map((p: any) => {
-            const [x, y, w, h] = p.bbox;
-            return { class: COCO_MAP[p.class], cx: x + w / 2, cy: y + h / 2, w, h, confidence: p.score };
-          });
-
-        // Merge duplicate detections of same class that overlap heavily
-        const merged: typeof filtered = [];
-        const used = new Set<number>();
-        for (let i = 0; i < filtered.length; i++) {
-          if (used.has(i)) continue;
-          let best = filtered[i];
-          for (let j = i + 1; j < filtered.length; j++) {
-            if (used.has(j)) continue;
-            if (filtered[i].class !== filtered[j].class) continue;
-            // Check center distance — if very close, it's the same object
-            const d = Math.sqrt((best.cx - filtered[j].cx) ** 2 + (best.cy - filtered[j].cy) ** 2);
-            const avgSize = (best.w + best.h + filtered[j].w + filtered[j].h) / 4;
-            if (d < avgSize * 0.5) {
-              // Merge: keep the higher confidence one
-              if (filtered[j].confidence > best.confidence) best = filtered[j];
-              used.add(j);
-            }
-          }
-          merged.push(best);
-        }
-
-        latestDetections = merged;
-        console.log(`[SAGE] COCO-SSD: ${preds.length} raw → ${filtered.length} filtered → ${merged.length} merged`);
-      }).catch((e: any) => {
-        console.error("[SAGE] COCO-SSD error:", e);
-      }).finally(() => { isDetecting = false; });
-    };
-
-    let lastChangeTime = 0;
-
-    const loop = () => {
-      try {
-        if (!videoRef.current || videoRef.current.paused || videoRef.current.ended || !analyzingRef.current) return;
-
-        const now = Date.now();
-        frameRef.current++;
-        if (cooldownRef.current > 0) cooldownRef.current--;
-
-        scheduleDetection(videoRef.current);
-
-        const entities = trackerRef.current.update(latestDetections, frameRef.current);
-        const validEntities = entities.filter(e => e.age >= 1); // age 1 = just detected
-
-        // Debug logging every 3 seconds
-        if (now - (loop as any).lastLogTime > 3000) {
-          (loop as any).lastLogTime = now;
-          console.log(`[SAGE] Frame ${frameRef.current} | Objects: ${validEntities.length} | Detections: ${latestDetections.length} | Mode: ${envMode}`);
-        }
-
-        // Update object count every 500ms
-        if (now % 500 < 20) setObjectCount(validEntities.length);
-
-        // Change detection — time-based, every 500ms
-        if (now - lastChangeTime > 500) {
-          lastChangeTime = now;
-          try {
-            const tmp = getTmp();
-            tmp.width = video.videoWidth || 640;
-            tmp.height = video.videoHeight || 480;
-            const tCtx = tmp.getContext("2d", { willReadFrequently: true })!;
-            tCtx.drawImage(video, 0, 0, tmp.width, tmp.height);
-            const imgData = tCtx.getImageData(0, 0, tmp.width, tmp.height);
-            const changeGrid = computeChangeGrid(imgData.data, tmp.width, tmp.height);
-            const prev = prevChangeGridRef.current;
-            for (let i = 0; i < GRID_COLS * GRID_ROWS; i++) {
-              const diff = prev ? Math.abs(changeGrid[i] - prev[i]) / 255 : 0;
-              accumRef.current[i] = accumRef.current[i] * 0.95 + diff * 3;
-            }
-            prevChangeGridRef.current = changeGrid;
-          } catch {}
-        }
-
-        const ttcPairs = findAllTTCPairs(validEntities);
-        const evidence = detectAccidents(validEntities, ttcPairs, envMode);
-
-        drawFrame(validEntities, ttcPairs, evidence, video.videoWidth || 640, video.videoHeight || 480);
-
-        // State machine
-        const hasCollision = evidence.length > 0;
-
-        if (hasCollision) consecutiveAnomalyRef.current++;
-        else consecutiveAnomalyRef.current = 0;
-
-        let st = stateRef.current;
-
-        if (hasCollision && consecutiveAnomalyRef.current >= 2) {
-          st = "alert";
-        } else if (!hasCollision) {
-          st = "monitoring";
-        }
-
-        // Alert
-        if (st === "alert" && stateRef.current !== "alert" && cooldownRef.current <= 0) {
-          cooldownRef.current = 300; // 10 seconds at 60fps — long cooldown
-          consecutiveAnomalyRef.current = 0;
-
-          const topEv = evidence[0];
-          let incidentType = "vehicle_collision";
-          let severity = "major";
-
-          if (topEv?.type === "person_fall") {
-            incidentType = "pedestrian_collision";
-          } else if (topEv?.type === "bike_off_track") {
-            incidentType = "vehicle_collision";
-          } else if (topEv?.confidence && topEv.confidence > 0.8) {
-            severity = "critical";
-          }
-
-          if (incidentType) {
-            createIncident({
-              type: incidentType, severity,
-              confidence: topEv?.confidence || 0.6,
-              timestamp: new Date().toISOString(),
-              latitude: LAT + (Math.random() - 0.5) * 0.01,
-              longitude: LNG + (Math.random() - 0.5) * 0.01,
-            });
-            if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current);
-            alertTimeoutRef.current = setTimeout(() => { stateRef.current = "monitoring"; setState("monitoring"); }, 8000);
-          }
-        }
-
-        stateRef.current = st;
-        setState(st);
-      } catch (e) { console.error(e); }
-
-      if (analyzingRef.current && videoRef.current && !videoRef.current.paused) {
-        rafRef.current = requestAnimationFrame(loop);
-      }
-    };
-    rafRef.current = requestAnimationFrame(loop);
-  };
-
-  const stopAnalysis = () => {
-    analyzingRef.current = false;
-    cancelAnimationFrame(rafRef.current);
-    if (alertTimeoutRef.current) { clearTimeout(alertTimeoutRef.current); alertTimeoutRef.current = null; }
-    if (videoRef.current) { videoRef.current.pause(); videoRef.current.currentTime = 0; }
-    setIsAnalyzing(false);
-    setState("monitoring");
-    stateRef.current = "monitoring";
-  };
-
-  const resetClip = () => {
+  const resetClip = useCallback(() => {
     stopAnalysis();
-    setIncidents([]);
-    trackerRef.current.reset();
-    accumRef.current.fill(0);
-    prevChangeGridRef.current = null;
-    frameRef.current = 0;
-    cooldownRef.current = 0;
-    consecutiveAnomalyRef.current = 0;
     canvasSizedRef.current = false;
-    setObjectCount(0);
-  };
+  }, [stopAnalysis]);
 
   const stateColors: Record<string, string> = {
     monitoring: "bg-green-500/20 text-green-500",
-    watching: "bg-yellow-500/20 text-yellow-500",
-    confirming: "bg-orange-500/20 text-orange-500",
     alert: "bg-red-500/20 text-red-500 animate-pulse",
   };
 
@@ -504,7 +270,7 @@ export default function VideoAnalysisPage() {
       </Link>
       <div>
         <h1 className="text-2xl font-bold">Video Analysis</h1>
-        <p className="text-muted-foreground">COCO-SSD AI + Kalman tracking + TTC prediction</p>
+        <p className="text-muted-foreground">YOLOv8n AI + Kalman tracking + TTC prediction (Web Worker)</p>
       </div>
 
       {!selectedClip ? (
@@ -544,14 +310,14 @@ export default function VideoAnalysisPage() {
                   </div>}
                   {isAnalyzing && <div className="absolute top-4 left-4 flex items-center gap-2">
                     <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
-                    <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">Tracking {objectCount} objects</span>
+                    <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">Tracking {entities.length} objects | {fps} FPS</span>
                   </div>}
                 </div>
                 <div className="p-4 border-t border-border flex items-center gap-3 flex-wrap">
                   {!isAnalyzing ? (
-                    <button onClick={startAnalysis} disabled={!videoReady || !modelReady}
+                    <button onClick={startAnalysis} disabled={!videoReady || !isReady}
                       className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2 disabled:opacity-50">
-                      {!modelReady ? <><Loader2 size={16} className="animate-spin" /> Loading AI...</> :
+                      {!isReady ? <><Loader2 size={16} className="animate-spin" /> Loading AI...</> :
                         <><Play size={16} /> Start Analysis</>}
                     </button>
                   ) : (
@@ -578,20 +344,20 @@ export default function VideoAnalysisPage() {
               <div className="bg-card p-4 rounded-xl border border-border">
                 <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> State</h3>
                 <div className="space-y-2">
-                  {["monitoring", "watching", "confirming", "alert"].map(s => (
+                  {["monitoring", "alert"].map(s => (
                     <div key={s} className={`flex items-center gap-2 p-2 rounded ${state === s ? stateColors[s] : "text-muted-foreground"}`}>
                       <div className={`w-2 h-2 rounded-full ${state === s ? "bg-current animate-pulse" : "bg-border"}`} />
                       <span className="text-sm capitalize">{s}</span>
                     </div>
                   ))}
                 </div>
-                <div className="mt-2 text-xs text-muted-foreground">Mode: {envMode} | PPM: {pixelsPerMeterRef.current.toFixed(1)}</div>
+                <div className="mt-2 text-xs text-muted-foreground">Mode: {envMode}</div>
               </div>
 
               <div className="bg-card p-4 rounded-xl border border-border">
                 <h3 className="font-semibold mb-3 flex items-center gap-2"><Zap size={16} /> Change Detection</h3>
                 <div className="grid gap-px" style={{ gridTemplateColumns: `repeat(${GRID_COLS}, 1fr)` }}>
-                  {Array.from(accumRef.current).map((v, i) => (
+                  {changeGrid.map((v, i) => (
                     <div key={i} className="aspect-square rounded-sm" style={{
                       backgroundColor: v > 0.08 ? `rgb(${Math.min(255, Math.floor(v * 2000))},0,0)` :
                         v > 0.03 ? `rgb(${Math.min(255, Math.floor(v * 1500))},${Math.floor(v * 500)},0)` :
@@ -604,30 +370,25 @@ export default function VideoAnalysisPage() {
               <div className="bg-card p-4 rounded-xl border border-border">
                 <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> Vehicle ESP</h3>
                 <div className="space-y-2 max-h-60 overflow-y-auto">
-                  {(() => {
-                    const entities = Array.from((trackerRef.current as any).entities?.values?.() || []) as TrackedEntity[];
-                    const filtered = entities.filter((b: any) => b.age >= 1);
-                    if (filtered.length === 0) return <p className="text-sm text-muted-foreground">{isAnalyzing ? "Scanning..." : "Start"}</p>;
-                    return filtered.map((b: any) => {
-                      const { current: speedKmh } = calculateRealSpeed(b, pixelsPerMeterRef.current);
-                      const corrected = perspectiveCorrectedSpeed(speedKmh, b.kalman.getState().y, videoRef.current?.videoHeight || 480);
-                      const accelLabel = b.acceleration < -0.3 ? "BRAKE" : b.acceleration > 0.3 ? "ACC" : "CRUISE";
-                      const accelColor = b.acceleration < -0.3 ? "text-red-400" : b.acceleration > 0.3 ? "text-green-400" : "text-gray-400";
-                      return (
-                        <div key={b.id} className="p-2 bg-background rounded text-xs">
-                          <div className="flex items-center justify-between">
-                            <span className={`font-medium ${b.class === "car" ? "text-green-400" : b.class === "motorcycle" ? "text-yellow-400" : "text-blue-400"}`}>{b.class} #{b.id}</span>
-                            <span className={accelColor}>{accelLabel}</span>
-                          </div>
-                          <div className="flex gap-2 text-muted-foreground flex-wrap">
-                            <span>{corrected}km/h</span>
-                            <span>a:{b.acceleration.toFixed(2)}</span>
-                            <span>θ:{Math.round(b.heading * 180 / Math.PI)}°</span>
-                          </div>
+                  {entities.filter(e => e.age >= 1).length === 0 ? (
+                    <p className="text-sm text-muted-foreground">{isAnalyzing ? "Scanning..." : "Start"}</p>
+                  ) : entities.filter(e => e.age >= 1).map(b => {
+                    const accelLabel = b.acceleration < -0.3 ? "BRAKE" : b.acceleration > 0.3 ? "ACC" : "CRUISE";
+                    const accelColor = b.acceleration < -0.3 ? "text-red-400" : b.acceleration > 0.3 ? "text-green-400" : "text-gray-400";
+                    return (
+                      <div key={b.id} className="p-2 bg-background rounded text-xs">
+                        <div className="flex items-center justify-between">
+                          <span className={`font-medium ${b.class === "car" ? "text-green-400" : b.class === "motorcycle" ? "text-yellow-400" : "text-blue-400"}`}>{b.class} #{b.id}</span>
+                          <span className={accelColor}>{accelLabel}</span>
                         </div>
-                      );
-                    });
-                  })()}
+                        <div className="flex gap-2 text-muted-foreground flex-wrap">
+                          <span>{Math.round(b.speed * 10)}km/h</span>
+                          <span>a:{b.acceleration.toFixed(2)}</span>
+                          <span>&theta;:{Math.round(b.heading * 180 / Math.PI)}&deg;</span>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
 

@@ -52,6 +52,8 @@ export default function CameraFeedPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [frameBuffer, setFrameBuffer] = useState<ImageData[]>([]);
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const objectUrlRef = useRef<string | null>(null);
   const supabase = createClient();
 
   useEffect(() => {
@@ -68,6 +70,16 @@ export default function CameraFeedPage() {
     };
 
     fetchCamera();
+
+    return () => {
+      // Cleanup on unmount
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+      }
+    };
   }, [params.id]);
 
   // Capture frame from video
@@ -213,7 +225,7 @@ export default function CameraFeedPage() {
     }
 
     // Analysis interval
-    const interval = setInterval(() => {
+    intervalRef.current = setInterval(() => {
       const frame = captureFrame();
       if (!frame) return;
 
@@ -248,17 +260,13 @@ export default function CameraFeedPage() {
       }
     }, 200); // 5 FPS analysis
 
-    // Cleanup
-    return () => {
-      clearInterval(interval);
-      if (videoRef.current?.srcObject) {
-        const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
-        tracks.forEach((track) => track.stop());
-      }
-    };
   };
 
   const stopAnalysis = () => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
     setIsAnalyzing(false);
     if (videoRef.current?.srcObject) {
       const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
@@ -269,8 +277,13 @@ export default function CameraFeedPage() {
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
+      // Revoke previous ObjectURL to prevent memory leak
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+      }
       setSelectedFile(file);
       const url = URL.createObjectURL(file);
+      objectUrlRef.current = url;
       if (videoRef.current) {
         videoRef.current.src = url;
         videoRef.current.play();
