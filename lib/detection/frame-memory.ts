@@ -15,7 +15,7 @@ export interface FrameSnapshot {
   }[];
 }
 
-const MAX_HISTORY = 30; // Store last 30 frames (~10 seconds at 3 FPS)
+const MAX_HISTORY = 60; // Store last 60 frames (~20 seconds at 3 FPS)
 
 export class FrameMemory {
   private history: FrameSnapshot[] = [];
@@ -27,9 +27,6 @@ export class FrameMemory {
     }
   }
 
-  /**
-   * Get frames from N seconds ago
-   */
   getPastFrames(secondsAgo: number, fps: number = 3): FrameSnapshot[] {
     const framesAgo = Math.round(secondsAgo * fps);
     const cutoff = this.history.length - framesAgo;
@@ -37,17 +34,44 @@ export class FrameMemory {
     return this.history.slice(0, cutoff);
   }
 
-  /**
-   * Get recent frames (last N seconds)
-   */
   getRecentFrames(seconds: number = 2, fps: number = 3): FrameSnapshot[] {
     const frameCount = Math.round(seconds * fps);
     return this.history.slice(-frameCount);
   }
 
   /**
-   * Detect if an entity's behavior changed (e.g., was walking, now lying)
+   * Get speed history for a specific entity over the last N frames.
    */
+  getEntitySpeedHistory(entityId: number, frames: number = 10): number[] {
+    const speeds: number[] = [];
+    const start = Math.max(0, this.history.length - frames);
+    for (let i = start; i < this.history.length; i++) {
+      const entity = this.history[i].entities.find(e => e.id === entityId);
+      speeds.push(entity?.speed ?? 0);
+    }
+    return speeds;
+  }
+
+  /**
+   * Get position delta for an entity over N frames.
+   */
+  getEntityPositionDelta(entityId: number, framesAgo: number): { dx: number; dy: number } | null {
+    if (this.history.length < framesAgo + 1) return null;
+
+    const current = this.history[this.history.length - 1];
+    const past = this.history[this.history.length - 1 - framesAgo];
+
+    const currEntity = current.entities.find(e => e.id === entityId);
+    const pastEntity = past.entities.find(e => e.id === entityId);
+
+    if (!currEntity || !pastEntity) return null;
+
+    return {
+      dx: currEntity.x - pastEntity.x,
+      dy: currEntity.y - pastEntity.y,
+    };
+  }
+
   detectBehaviorChange(entityId: number): {
     wasMoving: boolean;
     isMoving: boolean;
@@ -67,8 +91,6 @@ export class FrameMemory {
 
     const wasMoving = pastEntity.speed > 0.5;
     const isMoving = recentEntity.speed > 0.5;
-
-    // Rough upright detection: if speed dropped and entity is person, might have fallen
     const wasUpright = wasMoving || recentEntity.class !== "person";
     const isUpright = isMoving || recentEntity.class !== "person";
 
@@ -81,9 +103,6 @@ export class FrameMemory {
     };
   }
 
-  /**
-   * Get the speed trend for an entity (accelerating, decelerating, constant)
-   */
   getSpeedTrend(entityId: number): "accelerating" | "decelerating" | "constant" | "unknown" {
     if (this.history.length < 3) return "unknown";
 
@@ -103,16 +122,12 @@ export class FrameMemory {
     return "constant";
   }
 
-  /**
-   * Check if scene has changed significantly
-   */
   hasSceneChanged(threshold: number = 0.3): boolean {
     if (this.history.length < 2) return false;
 
     const current = this.history[this.history.length - 1];
     const prev = this.history[this.history.length - 2];
 
-    // Compare entity positions
     let totalMovement = 0;
     let count = 0;
 
@@ -128,7 +143,7 @@ export class FrameMemory {
 
     if (count === 0) return false;
     const avgMovement = totalMovement / count;
-    return avgMovement > threshold * 100; // Scale threshold
+    return avgMovement > threshold * 100;
   }
 
   getHistory(): FrameSnapshot[] {

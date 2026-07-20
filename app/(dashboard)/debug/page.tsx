@@ -10,20 +10,12 @@ import {
   Activity,
   Settings,
   RotateCcw,
+  MapPin,
 } from "lucide-react";
 import Link from "next/link";
 import { useDetectionWorker, type UseDetectionWorkerReturn } from "@/hooks/useDetectionWorker";
 import DetectionOverlay from "@/components/DetectionOverlay";
-
-const STORAGE_KEY = "sage_debug_thresholds";
-
-const DEFAULTS = {
-  iouThreshold: 0.2,
-  speedDropPct: 0.4,
-  fallConfThreshold: 0.6,
-  confirmDurationMs: 500,
-  cooldownMs: 5000,
-};
+import type { EnvMode } from "@/lib/worker/message-types";
 
 interface VideoClip {
   name: string;
@@ -38,39 +30,18 @@ const VIDEO_CLIPS: VideoClip[] = [
   { name: "checking.mp4", src: "/videos/checking.mp4", description: "System check" },
 ];
 
+const MODE_INFO: Record<EnvMode, { label: string; color: string; description: string }> = {
+  isolated: { label: "Isolated", color: "#22c55e", description: "Low traffic, easy detection. Threshold: 40%, 3-frame confirm." },
+  traffic: { label: "Traffic", color: "#f59e0b", description: "Busy road, conservative filtering. Threshold: 65%, 5-frame confirm. Both vehicles must decelerate." },
+  marketplace: { label: "Marketplace", color: "#8b5cf6", description: "Pedestrian-heavy area. Threshold: 55%, 5-frame confirm. Vehicle alerts suppressed." },
+};
+
 export default function DebugPage() {
-  const [values, setValues] = useState(DEFAULTS);
   const [selectedClip, setSelectedClip] = useState<VideoClip | null>(null);
   const [videoReady, setVideoReady] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const detection: UseDetectionWorkerReturn = useDetectionWorker("isolated");
-  const { isReady, isAnalyzing, state, entities, evidence, fps, incidents } = detection;
-
-  // Load saved thresholds
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) setValues({ ...DEFAULTS, ...JSON.parse(raw) });
-    } catch {}
-  }, []);
-
-  // Sync thresholds to worker
-  useEffect(() => {
-    detection.setMode?.("isolated" as any);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const update = (key: keyof typeof values, val: number) => {
-    setValues((prev) => {
-      const next = { ...prev, [key]: val };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-      return next;
-    });
-  };
-
-  const resetDefaults = () => {
-    setValues(DEFAULTS);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(DEFAULTS));
-  };
+  const { isReady, isAnalyzing, state, entities, evidence, fps, incidents, mode, setMode } = detection;
 
   const startAnalysis = useCallback(() => {
     if (!videoRef.current || !selectedClip) return;
@@ -105,7 +76,7 @@ export default function DebugPage() {
       </Link>
       <h1 className="text-2xl font-bold mb-2">Debug — Detection Calibration</h1>
       <p className="text-sm text-muted-foreground mb-6">
-        Load a video, tune thresholds, and observe detection/tracking/alerting in real time.
+        Load a video, select mode, tune detection, and observe in real time.
       </p>
 
       {!selectedClip ? (
@@ -136,6 +107,34 @@ export default function DebugPage() {
           >
             &larr; Choose different clip
           </button>
+
+          {/* Mode Selector */}
+          <div className="bg-card p-4 rounded-xl border border-border">
+            <h3 className="font-semibold mb-3 flex items-center gap-2">
+              <MapPin size={16} /> Detection Mode
+            </h3>
+            <div className="grid grid-cols-3 gap-3">
+              {(Object.keys(MODE_INFO) as EnvMode[]).map((m) => {
+                const info = MODE_INFO[m];
+                const isActive = mode === m;
+                return (
+                  <button
+                    key={m}
+                    onClick={() => setMode(m)}
+                    className={`p-3 rounded-lg border-2 transition-all text-left ${
+                      isActive
+                        ? "border-current bg-current/10"
+                        : "border-border hover:border-muted-foreground/50"
+                    }`}
+                    style={{ color: isActive ? info.color : undefined }}
+                  >
+                    <div className="font-semibold text-sm">{info.label}</div>
+                    <div className="text-xs text-muted-foreground mt-1">{info.description}</div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
 
           {/* Video + Overlay */}
           <div className="bg-card rounded-xl border border-border overflow-hidden">
@@ -169,7 +168,7 @@ export default function DebugPage() {
                 <div className="absolute top-4 left-4 flex items-center gap-2">
                   <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
                   <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">
-                    Tracking {entities.length} objects | {fps} FPS
+                    {MODE_INFO[mode].label} Mode | {entities.length} objects | {fps} FPS
                   </span>
                 </div>
               )}
@@ -194,7 +193,7 @@ export default function DebugPage() {
               ) : (
                 <button
                   onClick={stopAnalysis}
-                  className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors flex items-center gap-2"
+                  className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 flex items-center gap-2"
                 >
                   <Pause size={16} /> Stop
                 </button>
@@ -207,122 +206,7 @@ export default function DebugPage() {
 
       {/* Debug Panels */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Left: Threshold Sliders */}
-        <div className="space-y-4">
-          <div className="bg-card p-4 rounded-xl border border-border">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="font-semibold flex items-center gap-2">
-                <Settings size={16} /> Thresholds
-              </h3>
-              <button
-                onClick={resetDefaults}
-                className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
-              >
-                <RotateCcw size={12} /> Reset
-              </button>
-            </div>
-
-            <div className="space-y-4">
-              <div>
-                <label className="text-sm text-muted-foreground">
-                  IoU Threshold: {values.iouThreshold.toFixed(2)}
-                </label>
-                <input
-                  type="range"
-                  min={0.05}
-                  max={0.5}
-                  step={0.01}
-                  value={values.iouThreshold}
-                  onChange={(e) => update("iouThreshold", parseFloat(e.target.value))}
-                  className="w-full"
-                />
-                <p className="text-xs text-muted-foreground">
-                  Min overlap to consider collision candidate.
-                </p>
-              </div>
-
-              <div>
-                <label className="text-sm text-muted-foreground">
-                  Speed Drop %: {(values.speedDropPct * 100).toFixed(0)}%
-                </label>
-                <input
-                  type="range"
-                  min={0.1}
-                  max={0.8}
-                  step={0.05}
-                  value={values.speedDropPct}
-                  onChange={(e) => update("speedDropPct", parseFloat(e.target.value))}
-                  className="w-full"
-                />
-                <p className="text-xs text-muted-foreground">
-                  Min speed reduction to flag deceleration.
-                </p>
-              </div>
-
-              <div>
-                <label className="text-sm text-muted-foreground">
-                  Fall Confidence: {values.fallConfThreshold.toFixed(2)}
-                </label>
-                <input
-                  type="range"
-                  min={0.3}
-                  max={0.95}
-                  step={0.05}
-                  value={values.fallConfThreshold}
-                  onChange={(e) => update("fallConfThreshold", parseFloat(e.target.value))}
-                  className="w-full"
-                />
-                <p className="text-xs text-muted-foreground">
-                  Min confidence for fallen_person detection.
-                </p>
-              </div>
-
-              <div>
-                <label className="text-sm text-muted-foreground">
-                  Confirm Duration: {values.confirmDurationMs}ms
-                </label>
-                <input
-                  type="range"
-                  min={200}
-                  max={3000}
-                  step={100}
-                  value={values.confirmDurationMs}
-                  onChange={(e) => update("confirmDurationMs", parseInt(e.target.value))}
-                  className="w-full"
-                />
-                <p className="text-xs text-muted-foreground">
-                  How long event must persist before alert.
-                </p>
-              </div>
-
-              <div>
-                <label className="text-sm text-muted-foreground">
-                  Cooldown: {values.cooldownMs}ms
-                </label>
-                <input
-                  type="range"
-                  min={1000}
-                  max={15000}
-                  step={500}
-                  value={values.cooldownMs}
-                  onChange={(e) => update("cooldownMs", parseInt(e.target.value))}
-                  className="w-full"
-                />
-                <p className="text-xs text-muted-foreground">
-                  Time to ignore new events after alert.
-                </p>
-              </div>
-            </div>
-
-            <div className="mt-4 p-3 bg-background rounded-lg">
-              <pre className="text-xs text-muted-foreground overflow-x-auto">
-                {JSON.stringify(values, null, 2)}
-              </pre>
-            </div>
-          </div>
-        </div>
-
-        {/* Center: State Machine + Collision Candidates */}
+        {/* Left: State Machine + Mode */}
         <div className="space-y-4">
           <div className="bg-card p-4 rounded-xl border border-border">
             <h3 className="font-semibold mb-3 flex items-center gap-2">
@@ -350,18 +234,19 @@ export default function DebugPage() {
               ))}
             </div>
             <div className="mt-3 text-xs text-muted-foreground">
-              Ready: {isReady ? "Yes" : "No"} | Analyzing: {isAnalyzing ? "Yes" : "No"} | FPS: {fps}
+              Ready: {isReady ? "Yes" : "No"} | Analyzing: {isAnalyzing ? "Yes" : "No"} | FPS: {fps} | Backend: {detection.backend}
             </div>
           </div>
 
+          {/* Collision Candidates with Signal Breakdown */}
           <div className="bg-card p-4 rounded-xl border border-border">
             <h3 className="font-semibold mb-3 flex items-center gap-2">
-              <AlertTriangle size={16} /> Collision Candidates
+              <AlertTriangle size={16} /> Collision Evidence
             </h3>
-            <div className="max-h-48 overflow-y-auto space-y-2">
+            <div className="max-h-64 overflow-y-auto space-y-3">
               {evidence.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
-                  {isAnalyzing ? "No candidates detected" : "Start analysis"}
+                  {isAnalyzing ? "No alerts detected" : "Start analysis"}
                 </p>
               ) : (
                 evidence.map((ev, i) => (
@@ -370,7 +255,9 @@ export default function DebugPage() {
                     className={`p-3 rounded-lg border-l-4 ${
                       ev.confidence > 0.7
                         ? "border-red-500 bg-red-500/10"
-                        : "border-orange-500 bg-orange-500/10"
+                        : ev.confidence > 0.5
+                        ? "border-orange-500 bg-orange-500/10"
+                        : "border-yellow-500 bg-yellow-500/10"
                     }`}
                   >
                     <div className="flex items-center gap-2">
@@ -378,10 +265,29 @@ export default function DebugPage() {
                       <span className="text-sm font-medium capitalize">
                         {ev.type.replace(/_/g, " ")}
                       </span>
+                      <span className="text-xs px-2 py-0.5 rounded-full bg-muted">
+                        {ev.sceneContext}
+                      </span>
                     </div>
                     <div className="flex gap-3 mt-1 text-xs text-muted-foreground">
-                      <span>{(ev.confidence * 100).toFixed(0)}%</span>
+                      <span className="font-bold">{(ev.confidence * 100).toFixed(0)}%</span>
                       <span>Objects: {ev.objects.join(", ")}</span>
+                    </div>
+                    {/* Signal Breakdown */}
+                    <div className="mt-2 grid grid-cols-5 gap-1">
+                      {ev.signals.map((sig, j) => (
+                        <div
+                          key={j}
+                          className={`text-center text-[10px] p-1 rounded ${
+                            sig.passed
+                              ? "bg-green-500/20 text-green-400"
+                              : "bg-muted text-muted-foreground"
+                          }`}
+                        >
+                          <div className="font-medium">{sig.name}</div>
+                          <div>{(sig.value * 100).toFixed(0)}%</div>
+                        </div>
+                      ))}
                     </div>
                     <p className="text-xs text-muted-foreground mt-1">{ev.details}</p>
                   </div>
@@ -389,10 +295,13 @@ export default function DebugPage() {
               )}
             </div>
           </div>
+        </div>
 
+        {/* Center: Incidents */}
+        <div className="space-y-4">
           <div className="bg-card p-4 rounded-xl border border-border">
             <h3 className="font-semibold mb-3">Incidents ({incidents.length})</h3>
-            <div className="max-h-32 overflow-y-auto space-y-2">
+            <div className="max-h-48 overflow-y-auto space-y-2">
               {incidents.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
                   {isAnalyzing ? "Monitoring..." : "None"}
@@ -404,13 +313,59 @@ export default function DebugPage() {
                     className={`p-2 rounded text-xs ${
                       inc.severity === "critical"
                         ? "bg-red-500/10 text-red-400"
-                        : "bg-orange-500/10 text-orange-400"
+                        : inc.severity === "major"
+                        ? "bg-orange-500/10 text-orange-400"
+                        : "bg-yellow-500/10 text-yellow-400"
                     }`}
                   >
-                    {inc.type.replace(/_/g, " ")} ({(inc.confidence * 100).toFixed(0)}%)
+                    <div className="flex justify-between">
+                      <span className="font-medium">{inc.type.replace(/_/g, " ")}</span>
+                      <span>{(inc.confidence * 100).toFixed(0)}%</span>
+                    </div>
+                    {/* Mini signal summary */}
+                    <div className="flex gap-1 mt-1">
+                      {inc.signals.map((sig, j) => (
+                        <span
+                          key={j}
+                          className={`px-1 rounded ${
+                            sig.passed ? "bg-green-500/30 text-green-300" : "bg-muted text-muted-foreground"
+                          }`}
+                        >
+                          {sig.name.slice(0, 4)}
+                        </span>
+                      ))}
+                    </div>
                   </div>
                 ))
               )}
+            </div>
+          </div>
+
+          <div className="bg-card p-4 rounded-xl border border-border">
+            <h3 className="font-semibold mb-3 flex items-center gap-2">
+              <Settings size={16} /> Mode Thresholds
+            </h3>
+            <div className="space-y-2 text-xs">
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Current Mode</span>
+                <span className="font-medium" style={{ color: MODE_INFO[mode].color }}>{MODE_INFO[mode].label}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Min Score</span>
+                <span>{mode === "isolated" ? "0.40" : mode === "traffic" ? "0.65" : "0.55"}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Confirm Frames</span>
+                <span>{mode === "isolated" ? "3" : "5"}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Both Decel Required</span>
+                <span>{mode === "traffic" ? "Yes" : "No"}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Passing Filter</span>
+                <span>{mode === "traffic" ? "Strict" : "Basic"}</span>
+              </div>
             </div>
           </div>
         </div>
@@ -449,10 +404,12 @@ export default function DebugPage() {
                         ? "text-yellow-400"
                         : "text-blue-400";
 
+                    const isInvolved = evidence.some(e => e.objects.includes(b.id));
+
                     return (
-                      <div key={b.id} className="p-2 bg-background rounded text-xs">
+                      <div key={b.id} className={`p-2 bg-background rounded text-xs ${isInvolved ? "border border-red-500/50" : ""}`}>
                         <div className="flex items-center justify-between">
-                          <span className={`font-medium ${clsColor}`}>
+                          <span className={`font-medium ${isInvolved ? "text-red-400" : clsColor}`}>
                             {b.class} #{b.id}
                           </span>
                           <span className={accelColor}>{accelLabel}</span>
@@ -462,6 +419,7 @@ export default function DebugPage() {
                           <span>a:{b.acceleration.toFixed(2)}</span>
                           <span>&theta;:{Math.round((b.heading * 180) / Math.PI)}&deg;</span>
                           <span>age:{b.age}</span>
+                          <span>cf:{b.confirmedFrames}</span>
                         </div>
                       </div>
                     );

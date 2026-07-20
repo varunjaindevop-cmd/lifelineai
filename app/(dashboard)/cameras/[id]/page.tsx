@@ -9,10 +9,13 @@ import {
   AlertTriangle,
   Play,
   Pause,
-  Settings,
+  Loader2,
 } from "lucide-react";
 import Link from "next/link";
 import { toast } from "sonner";
+import { useDetectionWorker } from "@/hooks/useDetectionWorker";
+import DetectionOverlay from "@/components/DetectionOverlay";
+import type { EnvMode } from "@/lib/worker/message-types";
 
 interface Camera {
   id: string;
@@ -26,35 +29,19 @@ interface Camera {
   calibration_data?: any;
 }
 
-interface Detection {
-  class: string;
-  confidence: number;
-  bbox: [number, number, number, number]; // x1, y1, x2, y2
-  speed?: number;
-}
-
-interface QualityMetrics {
-  brightness: number;
-  contrast: number;
-  sharpness: number;
-  noise: number;
-}
-
 export default function CameraFeedPage() {
   const params = useParams();
   const [camera, setCamera] = useState<Camera | null>(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [detections, setDetections] = useState<Detection[]>([]);
-  const [quality, setQuality] = useState<QualityMetrics | null>(null);
-  const [incidentCount, setIncidentCount] = useState(0);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [frameBuffer, setFrameBuffer] = useState<ImageData[]>([]);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const objectUrlRef = useRef<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [envMode, setEnvMode] = useState<EnvMode>("isolated");
   const supabase = createClient();
+
+  const detection = useDetectionWorker(envMode);
+  const { isReady, isAnalyzing, entities, evidence, fps, incidents, startAnalysis, stopAnalysis, setMode } = detection;
 
   useEffect(() => {
     const fetchCamera = async () => {
@@ -63,224 +50,39 @@ export default function CameraFeedPage() {
         .select("*")
         .eq("id", params.id)
         .single();
-
-      if (data) {
-        setCamera(data);
-      }
+      if (data) setCamera(data);
     };
-
     fetchCamera();
 
     return () => {
-      // Cleanup on unmount
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
-      if (objectUrlRef.current) {
-        URL.revokeObjectURL(objectUrlRef.current);
-      }
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
     };
   }, [params.id]);
 
-  // Capture frame from video
-  const captureFrame = useCallback((): ImageData | null => {
+  const handleStart = useCallback(() => {
     const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas) return null;
+    if (!video) return;
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return null;
-
-    canvas.width = 640;
-    canvas.height = 480;
-    ctx.drawImage(video, 0, 0, 640, 480);
-
-    return ctx.getImageData(0, 0, 640, 480);
-  }, []);
-
-  // Analyze image quality
-  const analyzeQuality = (imageData: ImageData): QualityMetrics => {
-    const data = imageData.data;
-    let sum = 0;
-    let sumSq = 0;
-    const pixels = data.length / 4;
-
-    for (let i = 0; i < data.length; i += 4) {
-      const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
-      sum += gray;
-      sumSq += gray * gray;
-    }
-
-    const mean = sum / pixels;
-    const variance = sumSq / pixels - mean * mean;
-
-    return {
-      brightness: mean,
-      contrast: Math.sqrt(variance),
-      sharpness: Math.random() * 100, // Simplified
-      noise: Math.random() * 50, // Simplified
-    };
-  };
-
-  // Detect objects (simplified YOLO simulation for demo)
-  const detectObjects = (imageData: ImageData): Detection[] => {
-    // In production, this would run ONNX inference
-    // For demo, we simulate detections
-    const detections: Detection[] = [];
-
-    // Simulate random detections for demo
-    if (Math.random() > 0.7) {
-      detections.push({
-        class: "person",
-        confidence: 0.6 + Math.random() * 0.3,
-        bbox: [
-          100 + Math.random() * 200,
-          100 + Math.random() * 200,
-          150 + Math.random() * 200,
-          250 + Math.random() * 200,
-        ],
+    video
+      .play()
+      .then(() => startAnalysis(video))
+      .catch(() => {
+        video.muted = true;
+        video.play().then(() => startAnalysis(video)).catch(() => {});
       });
+  }, [startAnalysis]);
+
+  const handleStop = useCallback(() => {
+    stopAnalysis();
+    if (videoRef.current) {
+      videoRef.current.pause();
     }
-
-    if (Math.random() > 0.8) {
-      detections.push({
-        class: "car",
-        confidence: 0.5 + Math.random() * 0.4,
-        bbox: [
-          300 + Math.random() * 100,
-          200 + Math.random() * 100,
-          400 + Math.random() * 100,
-          300 + Math.random() * 100,
-        ],
-        speed: Math.floor(20 + Math.random() * 80),
-      });
-    }
-
-    return detections;
-  };
-
-  // Draw detections on canvas
-  const drawDetections = (dets: Detection[]) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    dets.forEach((det) => {
-      const [x1, y1, x2, y2] = det.bbox;
-      const color =
-        det.class === "person"
-          ? "#3B82F6"
-          : det.class === "car"
-          ? "#22C55E"
-          : "#F97316";
-
-      // Draw bounding box
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-
-      // Draw label
-      ctx.fillStyle = color;
-      ctx.fillRect(x1, y1 - 20, 120, 20);
-      ctx.fillStyle = "white";
-      ctx.font = "12px Arial";
-      ctx.fillText(
-        `${det.class} ${(det.confidence * 100).toFixed(0)}%${
-          det.speed ? ` | ${det.speed} km/h` : ""
-        }`,
-        x1 + 4,
-        y1 - 6
-      );
-    });
-  };
-
-  // Main analysis loop
-  const startAnalysis = async () => {
-    if (!camera) return;
-
-    setIsAnalyzing(true);
-    setIncidentCount(0);
-
-    // If using browser camera
-    if (camera.stream_type === "browser" || !camera.stream_url) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: 640, height: 480 },
-        });
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.play();
-        }
-      } catch (err) {
-        toast.error(
-          "Camera access denied. Please upload a video file instead."
-        );
-        setIsAnalyzing(false);
-        return;
-      }
-    }
-
-    // Analysis interval
-    intervalRef.current = setInterval(() => {
-      const frame = captureFrame();
-      if (!frame) return;
-
-      // Maintain 15-second buffer (75 frames at 5fps)
-      setFrameBuffer((prev) => {
-        const newBuffer = [...prev, frame];
-        if (newBuffer.length > 75) {
-          newBuffer.shift();
-        }
-        return newBuffer;
-      });
-
-      // Analyze quality
-      const q = analyzeQuality(frame);
-      setQuality(q);
-
-      // Detect objects
-      const dets = detectObjects(frame);
-      setDetections(dets);
-      drawDetections(dets);
-
-      // Check for incidents (simplified)
-      const hasAccident = dets.some(
-        (d) =>
-          (d.class === "car" && d.confidence > 0.8) ||
-          (d.class === "person" && d.confidence > 0.85)
-      );
-
-      if (hasAccident && Math.random() > 0.95) {
-        setIncidentCount((prev) => prev + 1);
-        toast.error("Potential incident detected!");
-      }
-    }, 200); // 5 FPS analysis
-
-  };
-
-  const stopAnalysis = () => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-    setIsAnalyzing(false);
-    if (videoRef.current?.srcObject) {
-      const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
-      tracks.forEach((track) => track.stop());
-    }
-  };
+  }, [stopAnalysis]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      // Revoke previous ObjectURL to prevent memory leak
-      if (objectUrlRef.current) {
-        URL.revokeObjectURL(objectUrlRef.current);
-      }
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
       setSelectedFile(file);
       const url = URL.createObjectURL(file);
       objectUrlRef.current = url;
@@ -291,11 +93,14 @@ export default function CameraFeedPage() {
     }
   };
 
+  const handleModeChange = (mode: EnvMode) => {
+    setEnvMode(mode);
+    setMode(mode);
+  };
+
   if (!camera) {
     return (
-      <div className="text-center py-12 text-muted-foreground">
-        Loading camera...
-      </div>
+      <div className="text-center py-12 text-muted-foreground">Loading camera...</div>
     );
   }
 
@@ -312,26 +117,38 @@ export default function CameraFeedPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold">{camera.name}</h1>
-          <p className="text-muted-foreground">
-            {camera.location_name || "AI-Powered Camera Feed"}
-          </p>
+          <p className="text-muted-foreground">{camera.location_name || "AI-Powered Camera Feed"}</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 items-center">
+          {/* Mode Selector */}
+          <select
+            value={envMode}
+            onChange={(e) => handleModeChange(e.target.value as EnvMode)}
+            className="px-3 py-2 bg-background border border-border rounded-lg text-sm"
+          >
+            <option value="isolated">Isolated</option>
+            <option value="traffic">Traffic</option>
+            <option value="marketplace">Marketplace</option>
+          </select>
+
           {!isAnalyzing ? (
             <button
-              onClick={startAnalysis}
-              className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2"
+              onClick={handleStart}
+              disabled={!isReady}
+              className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2 disabled:opacity-50"
             >
-              <Play size={16} />
-              Start AI Analysis
+              {!isReady ? (
+                <><Loader2 size={16} className="animate-spin" /> Loading AI...</>
+              ) : (
+                <><Play size={16} /> Start AI Analysis</>
+              )}
             </button>
           ) : (
             <button
-              onClick={stopAnalysis}
+              onClick={handleStop}
               className="px-4 py-2 bg-severity-critical text-white rounded-lg hover:bg-severity-critical/90 transition-colors flex items-center gap-2"
             >
-              <Pause size={16} />
-              Stop
+              <Pause size={16} /> Stop
             </button>
           )}
         </div>
@@ -348,31 +165,31 @@ export default function CameraFeedPage() {
                 playsInline
                 muted
               />
-              <canvas
-                ref={canvasRef}
-                className="absolute inset-0 w-full h-full"
-                style={{ pointerEvents: "none" }}
+              <DetectionOverlay
+                videoRef={videoRef}
+                entities={entities}
+                evidence={evidence}
+                isAnalyzing={isAnalyzing}
+                fps={fps}
               />
 
-              {/* Detection overlay */}
               {isAnalyzing && (
                 <div className="absolute top-4 left-4 flex items-center gap-2">
                   <div className="w-3 h-3 bg-severity-critical rounded-full animate-severity-pulse" />
                   <span className="text-sm font-medium bg-black/50 px-2 py-1 rounded">
-                    AI Analysis Active
+                    AI Active | {envMode} mode
                   </span>
                 </div>
               )}
 
-              {/* Detection count */}
               {isAnalyzing && (
                 <div className="absolute top-4 right-4 bg-black/50 px-3 py-1 rounded text-sm">
-                  Objects: {detections.length}
+                  Objects: {entities.filter(e => e.age >= 1).length} | Alerts: {evidence.length}
                 </div>
               )}
             </div>
 
-            {/* File upload for demo */}
+            {/* File upload */}
             <div className="p-4 border-t border-border">
               <input
                 type="file"
@@ -421,125 +238,78 @@ export default function CameraFeedPage() {
 
         {/* Side Panel */}
         <div className="space-y-4">
-          {/* State Machine */}
+          {/* Detection State */}
           <div className="bg-card p-4 rounded-xl border border-border">
             <h3 className="font-semibold mb-3 flex items-center gap-2">
               <AlertTriangle size={16} />
               Detection State
             </h3>
             <div className="space-y-2">
-              {["Monitoring", "Watching", "Confirming", "Alert"].map(
-                (state, i) => {
-                  const isActive = isAnalyzing && i === 0;
-                  return (
+              {["Monitoring", "Watching", "Confirming", "Alert"].map((s, i) => {
+                const stateName = s.toLowerCase();
+                const isActive = stateName === detection.state;
+                return (
+                  <div
+                    key={s}
+                    className={`flex items-center gap-2 p-2 rounded ${
+                      isActive ? "bg-primary/20 text-primary" : "text-muted-foreground"
+                    }`}
+                  >
                     <div
-                      key={state}
-                      className={`flex items-center gap-2 p-2 rounded ${
-                        isActive
-                          ? "bg-primary/20 text-primary"
-                          : "text-muted-foreground"
+                      className={`w-2 h-2 rounded-full ${
+                        isActive ? "bg-primary animate-pulse" : "bg-border"
                       }`}
-                    >
-                      <div
-                        className={`w-2 h-2 rounded-full ${
-                          isActive ? "bg-primary animate-pulse" : "bg-border"
-                        }`}
-                      />
-                      <span className="text-sm">{state}</span>
-                    </div>
-                  );
-                }
-              )}
+                    />
+                    <span className="text-sm">{s}</span>
+                  </div>
+                );
+              })}
             </div>
           </div>
 
-          {/* Quality Metrics */}
-          {quality && (
-            <div className="bg-card p-4 rounded-xl border border-border">
-              <h3 className="font-semibold mb-3 flex items-center gap-2">
-                <Settings size={16} />
-                Quality Analysis
-              </h3>
-              <div className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Brightness</span>
-                  <span>{quality.brightness.toFixed(0)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Contrast</span>
-                  <span>{quality.contrast.toFixed(0)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Sharpness</span>
-                  <span>{quality.sharpness.toFixed(0)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Noise</span>
-                  <span>{quality.noise.toFixed(0)}</span>
-                </div>
-              </div>
-              {(quality.brightness < 50 || quality.contrast < 30) && (
-                <div className="mt-3 p-2 bg-severity-major/20 text-severity-major rounded text-xs">
-                  Auto-enhancing: {quality.brightness < 50 ? "CLAHE enabled" : ""}
-                  {quality.contrast < 30 ? " Contrast boost" : ""}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Detections */}
+          {/* Evidence */}
           <div className="bg-card p-4 rounded-xl border border-border">
-            <h3 className="font-semibold mb-3">Detected Objects</h3>
-            <div className="space-y-2">
-              {detections.length === 0 ? (
+            <h3 className="font-semibold mb-3">Detected Objects ({entities.filter(e => e.age >= 1).length})</h3>
+            <div className="space-y-2 max-h-48 overflow-y-auto">
+              {entities.filter(e => e.age >= 1).length === 0 ? (
                 <p className="text-sm text-muted-foreground">
-                  {isAnalyzing
-                    ? "Scanning for objects..."
-                    : "Start analysis to detect objects"}
+                  {isAnalyzing ? "Scanning for objects..." : "Start analysis to detect objects"}
                 </p>
               ) : (
-                detections.map((det, i) => (
-                  <div
-                    key={i}
-                    className="flex items-center justify-between p-2 bg-background rounded"
-                  >
-                    <div className="flex items-center gap-2">
-                      <div
-                        className={`w-2 h-2 rounded-full ${
-                          det.class === "person"
-                            ? "bg-primary"
-                            : det.class === "car"
-                            ? "bg-green-500"
-                            : "bg-severity-major"
-                        }`}
-                      />
-                      <span className="text-sm capitalize">{det.class}</span>
+                entities.filter(e => e.age >= 1).map((ent) => {
+                  const isInvolved = evidence.some(e => e.objects.includes(ent.id));
+                  return (
+                    <div key={ent.id} className={`flex items-center justify-between p-2 bg-background rounded ${isInvolved ? "border border-red-500/50" : ""}`}>
+                      <div className="flex items-center gap-2">
+                        <div className={`w-2 h-2 rounded-full ${isInvolved ? "bg-red-500" : ent.class === "person" ? "bg-primary" : ent.class === "car" ? "bg-green-500" : "bg-severity-major"}`} />
+                        <span className="text-sm capitalize">{ent.class}</span>
+                        <span className="text-xs text-muted-foreground">#{ent.id}</span>
+                      </div>
+                      <div className="text-right">
+                        <span className="text-sm">{(ent.confidence * 100).toFixed(0)}%</span>
+                        <span className="text-xs text-severity-major ml-2">age:{ent.age}</span>
+                      </div>
                     </div>
-                    <div className="text-right">
-                      <span className="text-sm">
-                        {(det.confidence * 100).toFixed(0)}%
-                      </span>
-                      {det.speed && (
-                        <span className="text-xs text-severity-major ml-2">
-                          {det.speed} km/h
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>
 
-          {/* Incidents */}
+          {/* Alerts */}
           <div className="bg-card p-4 rounded-xl border border-border">
             <h3 className="font-semibold mb-3">Incidents Detected</h3>
-            <p className="text-3xl font-bold text-severity-critical">
-              {incidentCount}
-            </p>
-            <p className="text-sm text-muted-foreground">
-              Potential incidents in this session
-            </p>
+            <p className="text-3xl font-bold text-severity-critical">{incidents.length}</p>
+            <p className="text-sm text-muted-foreground">Alerts in this session</p>
+            {incidents.length > 0 && (
+              <div className="mt-2 space-y-1 max-h-24 overflow-y-auto">
+                {incidents.slice(-5).reverse().map((inc, i) => (
+                  <div key={i} className="text-xs p-1 rounded bg-severity-critical/10 text-severity-critical">
+                    {inc.type.replace(/_/g, " ")} ({(inc.confidence * 100).toFixed(0)}%)
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </div>

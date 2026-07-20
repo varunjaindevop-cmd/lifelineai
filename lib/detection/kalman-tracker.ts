@@ -21,11 +21,10 @@ export class KalmanTracker {
       x: initialX, y: initialY,
       vx: 0, vy: 0,
       ax: 0, ay: 0,
-      P: this.eye(6).map(row => row.map(v => v * 100)), // large initial uncertainty
+      P: this.eye(6).map(row => row.map(v => v * 100)),
     };
   }
 
-  // Update state with new measurement
   update(measurementX: number, measurementY: number, dt: number = 1): KalmanState {
     if (!this.initialized) {
       this.state.x = measurementX;
@@ -36,33 +35,24 @@ export class KalmanTracker {
 
     const { x, y, vx, vy, ax, ay } = this.state;
 
-    // Predict
     const predX = x + vx * dt + 0.5 * ax * dt * dt;
     const predY = y + vy * dt + 0.5 * ay * dt * dt;
     const predVx = vx + ax * dt;
     const predVy = vy + ay * dt;
 
-    // Innovation
     const innovX = measurementX - predX;
     const innovY = measurementY - predY;
 
-    // Simplified Kalman gain (scalar approximation for speed)
     const S = this.state.P[0][0] + this.R;
     const K = Math.max(0.1, Math.min(0.9, this.state.P[0][0] / S));
 
-    // Update position
     this.state.x = predX + K * innovX;
     this.state.y = predY + K * innovY;
-
-    // Update velocity from position change
     this.state.vx = predVx + K * (innovX / dt) * 0.5;
     this.state.vy = predVy + K * (innovY / dt) * 0.5;
-
-    // Update acceleration
     this.state.ax = (this.state.vx - vx) / dt * 0.3;
     this.state.ay = (this.state.vy - vy) / dt * 0.3;
 
-    // Update covariance (simplified)
     const pFactor = 1 - K;
     for (let i = 0; i < 6; i++) {
       for (let j = 0; j < 6; j++) {
@@ -74,7 +64,6 @@ export class KalmanTracker {
     return this.state;
   }
 
-  // Predict future position
   predict(dt: number): { x: number; y: number } {
     return {
       x: this.state.x + this.state.vx * dt + 0.5 * this.state.ax * dt * dt,
@@ -124,12 +113,14 @@ export interface TrackedEntity {
   heading: number;
   acceleration: number;
   w: number; h: number;
+  bbox: [number, number, number, number]; // [cx-w/2, cy-h/2, cx+w/2, cy+h/2]
+  confirmedFrames: number; // consecutive frames this entity has been tracked
 }
 
 export class MultiObjectTracker {
   private entities: Map<number, TrackedEntity> = new Map();
   private nextId = 1;
-  private maxAge = 10; // frames before removing
+  private maxAge = 12; // frames before removing (increased from 10)
 
   update(detections: { class: string; cx: number; cy: number; w: number; h: number; confidence: number }[], frame: number): TrackedEntity[] {
     const matched = new Set<number>();
@@ -137,7 +128,7 @@ export class MultiObjectTracker {
     // Match detections to existing entities by class + proximity
     for (const entity of Array.from(this.entities.values())) {
       let bestDet = -1;
-      let bestDist = 60; // max matching distance
+      let bestDist = 60;
 
       for (let i = 0; i < detections.length; i++) {
         if (matched.has(i)) continue;
@@ -161,23 +152,28 @@ export class MultiObjectTracker {
         entity.confidence = det.confidence;
         entity.lastSeen = frame;
         entity.age++;
-        
-        const pos = { x: entity.kalman.getState().x, y: entity.kalman.getState().y };
+        entity.confirmedFrames++;
+
+        const kx = entity.kalman.getState().x;
+        const ky = entity.kalman.getState().y;
+        entity.bbox = [kx - det.w / 2, ky - det.h / 2, kx + det.w / 2, ky + det.h / 2];
+
+        const pos = { x: kx, y: ky };
         entity.positions.push(pos);
-        if (entity.positions.length > 20) entity.positions.shift();
-        
+        if (entity.positions.length > 30) entity.positions.shift();
+
         entity.speed = entity.kalman.getSpeed();
         entity.heading = entity.kalman.getHeading();
         entity.acceleration = entity.kalman.getAcceleration();
-        
+
         entity.speedHistory.push(entity.speed);
-        if (entity.speedHistory.length > 10) entity.speedHistory.shift();
+        if (entity.speedHistory.length > 15) entity.speedHistory.shift();
         entity.headingHistory.push(entity.heading);
-        if (entity.headingHistory.length > 10) entity.headingHistory.shift();
+        if (entity.headingHistory.length > 15) entity.headingHistory.shift();
         const ar = det.w / Math.max(det.h, 1);
         entity.aspectHistory.push(ar);
-        if (entity.aspectHistory.length > 10) entity.aspectHistory.shift();
-        
+        if (entity.aspectHistory.length > 15) entity.aspectHistory.shift();
+
         matched.add(bestDet);
       }
     }
@@ -191,11 +187,12 @@ export class MultiObjectTracker {
       const pos = { x: det.cx, y: det.cy };
       this.entities.set(id, {
         id, class: det.class, confidence: det.confidence,
-        kalman, lastSeen: frame, age: 1,
+        kalman, lastSeen: frame, age: 1, confirmedFrames: 1,
         positions: [pos], speedHistory: [0], headingHistory: [0],
         aspectHistory: [det.w / Math.max(det.h, 1)],
         speed: 0, heading: 0, acceleration: 0,
         w: det.w, h: det.h,
+        bbox: [det.cx - det.w / 2, det.cy - det.h / 2, det.cx + det.w / 2, det.cy + det.h / 2],
       });
     }
 

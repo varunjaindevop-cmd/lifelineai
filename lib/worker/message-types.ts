@@ -34,6 +34,7 @@ export type WorkerOutput =
       state: string;
       fps: number;
       detectionCount: number;
+      sceneContext?: EnvMode;
     }
   | { type: "ERROR"; message: string };
 
@@ -54,6 +55,7 @@ export interface SerializedEntity {
   w: number;
   h: number;
   age: number;
+  confirmedFrames: number;
   positions: { x: number; y: number }[];
   speedHistory: number[];
   headingHistory: number[];
@@ -61,8 +63,10 @@ export interface SerializedEntity {
 }
 
 export interface SerializedEvidence {
-  type: "collision" | "person_fall";
+  type: "collision" | "person_fall" | "bike_off_track";
   confidence: number;
   objects: number[];
   details: string;
+  signals: { name: string; value: number; weight: number; passed: boolean }[];
+  sceneContext: EnvMode;
 }

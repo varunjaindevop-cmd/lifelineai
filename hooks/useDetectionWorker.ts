@@ -7,20 +7,21 @@ export interface DetectionState {
   isReady: boolean;
   isAnalyzing: boolean;
   state: string;
-  backend: string; // "onnx" or "demo"
+  backend: string;
   entities: SerializedEntity[];
   evidence: SerializedEvidence[];
   changeGrid: number[];
   fps: number;
   detectionCount: number;
   error: string | null;
+  mode: EnvMode;
 }
 
 export interface UseDetectionWorkerReturn extends DetectionState {
   startAnalysis: (video: HTMLVideoElement) => void;
   stopAnalysis: () => void;
   setMode: (mode: EnvMode) => void;
-  incidents: Array<{ type: string; severity: string; confidence: number; timestamp: string }>;
+  incidents: Array<{ type: string; severity: string; confidence: number; timestamp: string; signals: { name: string; value: number; weight: number; passed: boolean }[] }>;
 }
 
 export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetectionWorkerReturn {
@@ -35,13 +36,13 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
   const [state, setState] = useState<DetectionState>({
     isReady: false, isAnalyzing: false, state: "monitoring", backend: "unknown",
     entities: [], evidence: [], changeGrid: new Array(80).fill(0),
-    fps: 0, detectionCount: 0, error: null,
+    fps: 0, detectionCount: 0, error: null, mode: initialMode,
   });
-  const [incidents, setIncidents] = useState<Array<{ type: string; severity: string; confidence: number; timestamp: string }>>([]);
+  const [incidents, setIncidents] = useState<Array<{ type: string; severity: string; confidence: number; timestamp: string; signals: { name: string; value: number; weight: number; passed: boolean }[] }>>([]);
 
-  // Keep refs for FPS calculation inside RAF loop
   const backendRef = useRef("unknown");
   const fpsDisplayRef = useRef(0);
+  const modeRef = useRef<EnvMode>(initialMode);
 
   // Initialize worker
   useEffect(() => {
@@ -53,7 +54,7 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
       switch (msg.type) {
         case "READY":
           console.log("[SAGE] Worker ready, sending INIT...");
-          worker.postMessage({ type: "INIT", modelPath: "/models/best.onnx" });
+          worker.postMessage({ type: "INIT", modelPath: "/models/best.onnx", envMode: modeRef.current });
           break;
         case "MODEL_LOADED":
           console.log(`[SAGE] Model loaded (backend: ${msg.backend})`);
@@ -65,7 +66,6 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
           setState(prev => ({ ...prev, error: msg.error, backend: "error" }));
           break;
         case "RESULTS": {
-          // FPS — compute from wall-clock time between RESULTS messages
           fpsFramesRef.current++;
           const now = Date.now();
           let fps = fpsDisplayRef.current;
@@ -89,10 +89,16 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
           if (msg.state === "alert" && msg.evidence.length > 0 && msg.frame !== lastIncidentFrameRef.current) {
             lastIncidentFrameRef.current = msg.frame;
             const top = msg.evidence[0];
-            const severity = top.confidence > 0.8 ? "critical" : top.confidence > 0.6 ? "major" : "minor";
-            const incidentType = top.type === "person_fall" ? "pedestrian_fall" : "vehicle_collision";
-            console.log(`[SAGE] INCIDENT: ${incidentType} (${severity}) conf=${top.confidence.toFixed(2)}`);
-            setIncidents(prev => [...prev, { type: incidentType, severity, confidence: top.confidence, timestamp: new Date().toISOString() }]);
+            const severity = top.confidence > 0.85 ? "critical" : top.confidence > 0.65 ? "major" : top.confidence > 0.45 ? "minor" : "suspicious";
+            const incidentType = top.type === "person_fall" ? "pedestrian_fall" : top.type === "bike_off_track" ? "bike_off_track" : "vehicle_collision";
+            console.log(`[SAGE] INCIDENT: ${incidentType} (${severity}) conf=${top.confidence.toFixed(2)} mode=${top.sceneContext}`);
+            setIncidents(prev => [...prev, {
+              type: incidentType,
+              severity,
+              confidence: top.confidence,
+              timestamp: new Date().toISOString(),
+              signals: top.signals,
+            }]);
           }
           break;
         }
@@ -109,7 +115,7 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
 
     workerRef.current = worker;
     return () => worker.terminate();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   // Detection loop
   const runDetection = useCallback(() => {
@@ -161,24 +167,10 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
   }, []);
 
   const setMode = useCallback((mode: EnvMode) => {
+    modeRef.current = mode;
     workerRef.current?.postMessage({ type: "SET_MODE", envMode: mode });
+    setState(prev => ({ ...prev, mode }));
   }, []);
-
-  // Sync thresholds from localStorage to worker
-  const syncThresholds = useCallback(() => {
-    try {
-      const raw = localStorage.getItem("sage_debug_thresholds");
-      if (raw && workerRef.current) {
-        workerRef.current.postMessage({ type: "SET_THRESHOLDS", ...JSON.parse(raw) });
-      }
-    } catch {}
-  }, []);
-
-  useEffect(() => {
-    syncThresholds();
-    const id = setInterval(syncThresholds, 5000);
-    return () => clearInterval(id);
-  }, [syncThresholds]);
 
   return { ...state, startAnalysis, stopAnalysis, setMode, incidents };
 }

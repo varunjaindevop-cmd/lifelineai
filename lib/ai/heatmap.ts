@@ -1,12 +1,15 @@
 /**
  * Safety heatmap generation for Leaflet maps.
  * Accumulates incident GPS coordinates and produces a heat layer.
+ * Supports temporal decay and mode-specific intensity weighting.
  */
 
 export interface HeatPoint {
   lat: number;
   lng: number;
-  intensity: number; // 0-1, higher = more severe
+  intensity: number;
+  timestamp: number;
+  mode: string;
 }
 
 const SEVERITY_WEIGHT: Record<string, number> = {
@@ -16,6 +19,16 @@ const SEVERITY_WEIGHT: Record<string, number> = {
   suspicious: 0.2,
 };
 
+// Mode-specific weight multipliers
+const MODE_WEIGHT: Record<string, number> = {
+  isolated: 1.0,    // isolated incidents are significant
+  traffic: 0.85,    // traffic incidents slightly less weighted (more false positives)
+  marketplace: 0.9, // marketplace incidents moderate weight
+};
+
+// Decay: incidents lose intensity over time (half-life: 24 hours)
+const HALF_LIFE_MS = 24 * 60 * 60 * 1000;
+
 /**
  * Convert an incident to a heat point with appropriate intensity.
  */
@@ -23,17 +36,30 @@ export function incidentToHeatPoint(incident: {
   latitude: number;
   longitude: number;
   severity: string;
+  mode?: string;
+  timestamp?: number;
 }): HeatPoint {
   return {
     lat: incident.latitude,
     lng: incident.longitude,
     intensity: SEVERITY_WEIGHT[incident.severity] ?? 0.3,
+    timestamp: incident.timestamp ?? Date.now(),
+    mode: incident.mode ?? "isolated",
   };
 }
 
 /**
+ * Apply temporal decay to a heat point.
+ */
+function applyDecay(point: HeatPoint, now: number): number {
+  const age = now - point.timestamp;
+  const decayFactor = Math.pow(0.5, age / HALF_LIFE_MS);
+  const modeWeight = MODE_WEIGHT[point.mode] ?? 1.0;
+  return point.intensity * decayFactor * modeWeight;
+}
+
+/**
  * Build a Leaflet heat layer from an array of heat points.
- * Uses leaflet.heat plugin (L.heatLayer).
  */
 export function createHeatLayer(
   points: HeatPoint[],
@@ -44,7 +70,12 @@ export function createHeatLayer(
   const L = typeof window !== "undefined" ? require("leaflet") : null;
   if (!L || !L.heatLayer) return null;
 
-  const latLngs = points.map((p) => [p.lat, p.lng, p.intensity] as [number, number, number]);
+  const now = Date.now();
+  const latLngs = points
+    .map((p) => [p.lat, p.lng, applyDecay(p, now)] as [number, number, number])
+    .filter(([, , intensity]) => intensity > 0.05); // filter negligible points
+
+  if (!latLngs.length) return null;
 
   return L.heatLayer(latLngs, {
     radius: 30,
@@ -62,8 +93,7 @@ export function createHeatLayer(
 }
 
 /**
- * Grid-based heatmap: divide area into cells and count incidents per cell.
- * Useful for non-Leaflet rendering (e.g., Canvas-based heatmap).
+ * Grid-based heatmap with decay support.
  */
 export function buildGridHeatmap(
   points: HeatPoint[],
@@ -76,14 +106,17 @@ export function buildGridHeatmap(
 
   const latRange = bounds.latMax - bounds.latMin || 0.01;
   const lngRange = bounds.lngMax - bounds.lngMin || 0.01;
+  const now = Date.now();
 
   for (const p of points) {
+    const intensity = applyDecay(p, now);
+    if (intensity < 0.05) continue;
+
     const row = Math.min(gridSize - 1, Math.max(0, Math.floor(((p.lat - bounds.latMin) / latRange) * gridSize)));
     const col = Math.min(gridSize - 1, Math.max(0, Math.floor(((p.lng - bounds.lngMin) / lngRange) * gridSize)));
-    grid[row][col] += p.intensity;
+    grid[row][col] += intensity;
   }
 
-  // Normalize to 0-1
   const maxVal = Math.max(1, ...grid.flat());
   return grid.map((row) => row.map((v) => Math.min(1, v / maxVal)));
 }

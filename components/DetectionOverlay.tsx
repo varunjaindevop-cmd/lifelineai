@@ -14,6 +14,7 @@ interface Entity {
   heading: number;
   acceleration: number;
   age: number;
+  confirmedFrames: number;
   positions?: { x: number; y: number }[];
 }
 
@@ -22,6 +23,8 @@ interface Evidence {
   confidence: number;
   objects: number[];
   details: string;
+  signals: { name: string; value: number; weight: number; passed: boolean }[];
+  sceneContext: string;
 }
 
 interface DetectionOverlayProps {
@@ -41,6 +44,13 @@ const CLASS_COLORS: Record<string, string> = {
   bicycle: "#06b6d4",
   fallen_person: "#ef4444",
 };
+
+function getSeverityColor(confidence: number): string {
+  if (confidence > 0.85) return "#ef4444"; // critical - red
+  if (confidence > 0.65) return "#f97316"; // major - orange
+  if (confidence > 0.45) return "#eab308"; // minor - yellow
+  return "#6b7280"; // suspicious - gray
+}
 
 export default function DetectionOverlay({
   videoRef,
@@ -82,19 +92,49 @@ export default function DetectionOverlay({
     const scaleX = displayW / videoW;
     const scaleY = displayH / videoH;
 
+    // Draw evidence alerts (red overlay on involved entities)
+    for (const ev of currentEvidence) {
+      for (const objId of ev.objects) {
+        const entity = currentEntities.find(e => e.id === objId);
+        if (!entity || entity.age < 1) continue;
+
+        const bx = (entity.x - entity.w / 2) * scaleX;
+        const by = (entity.y - entity.h / 2) * scaleY;
+        const bw = entity.w * scaleX;
+        const bh = entity.h * scaleY;
+
+        // Pulsing red border for alert
+        const severityColor = getSeverityColor(ev.confidence);
+        ctx.strokeStyle = severityColor;
+        ctx.lineWidth = 3;
+        ctx.setLineDash([5, 3]);
+        ctx.strokeRect(bx - 2, by - 2, bw + 4, bh + 4);
+        ctx.setLineDash([]);
+
+        // Confidence badge
+        const confText = `${(ev.confidence * 100).toFixed(0)}%`;
+        ctx.font = `bold ${Math.max(10, 10 * scaleX)}px monospace`;
+        const tw = ctx.measureText(confText).width;
+        ctx.fillStyle = severityColor;
+        ctx.fillRect(bx + bw - tw - 8, by - 18, tw + 8, 16);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(confText, bx + bw - tw - 4, by - 5);
+      }
+    }
+
+    // Draw entity bounding boxes
     for (const entity of currentEntities) {
       if (entity.age < 1) continue;
-      const isInvolved = currentEvidence.some((e) => e.objects.includes(entity.id));
+      const isInvolved = currentEvidence.some(e => e.objects.includes(entity.id));
       const baseColor = CLASS_COLORS[entity.class] || "#22c55e";
-      const color = isInvolved ? "#ef4444" : baseColor;
+      const color = isInvolved ? getSeverityColor(currentEvidence.find(e => e.objects.includes(entity.id))?.confidence || 0) : baseColor;
 
-      // Entity coords are in video intrinsic pixel space
       const bx = (entity.x - entity.w / 2) * scaleX;
       const by = (entity.y - entity.h / 2) * scaleY;
       const bw = entity.w * scaleX;
       const bh = entity.h * scaleY;
 
-      // Green bounding box for all objects
+      // Bounding box
       ctx.strokeStyle = color;
       ctx.lineWidth = isInvolved ? 3 : 2;
       ctx.strokeRect(bx, by, bw, bh);
@@ -102,6 +142,7 @@ export default function DetectionOverlay({
       // Corner markers
       const cl = Math.min(8, bw * 0.15, bh * 0.15);
       ctx.lineWidth = 3;
+      ctx.strokeStyle = color;
       const corners: [number, number, number, number, number, number][] = [
         [bx, by + cl, bx, by, bx + cl, by],
         [bx + bw - cl, by, bx + bw, by, bx + bw, by + cl],
@@ -129,33 +170,34 @@ export default function DetectionOverlay({
         ctx.stroke();
       }
 
-      // Class label + confidence above box (green text for all)
+      // Class label + confidence above box
       const label = `${entity.class} ${(entity.confidence * 100).toFixed(0)}%`;
       ctx.font = `bold ${Math.max(10, 10 * scaleX)}px monospace`;
       const tw = ctx.measureText(label).width;
       ctx.fillStyle = "rgba(0,0,0,0.8)";
       ctx.fillRect(bx, by - 20, tw + 8, 18);
-      ctx.fillStyle = "#22c55e"; // Green for all objects
+      ctx.fillStyle = isInvolved ? getSeverityColor(0.7) : "#22c55e";
       ctx.fillText(label, bx + 4, by - 6);
 
-      // Track ID in yellow for tracked objects
-      const idLabel = `ID:${entity.id}`;
+      // Track ID
+      const idLabel = `#${entity.id}`;
       ctx.fillStyle = "rgba(0,0,0,0.8)";
       ctx.fillRect(bx + tw + 12, by - 20, ctx.measureText(idLabel).width + 8, 18);
-      ctx.fillStyle = "#facc15"; // Yellow for track ID
+      ctx.fillStyle = "#facc15";
       ctx.fillText(idLabel, bx + tw + 16, by - 6);
     }
 
     // Bottom status bar
-    const barY = displayH - 20;
-    ctx.fillStyle = "rgba(0,0,0,0.7)";
-    ctx.fillRect(0, barY, displayW, 20);
+    const barH = 22;
+    const barY = displayH - barH;
+    ctx.fillStyle = "rgba(0,0,0,0.75)";
+    ctx.fillRect(0, barY, displayW, barH);
     ctx.fillStyle = "#fff";
     ctx.font = `${Math.max(11, 11 * scaleX)}px Arial`;
     ctx.fillText(
-      `Objects: ${currentEntities.filter((e) => e.age >= 1).length} | FPS: ${fps}`,
+      `Objects: ${currentEntities.filter(e => e.age >= 1).length} | Alerts: ${currentEvidence.length} | FPS: ${fps}`,
       8,
-      barY + 14
+      barY + 15
     );
   }, [videoRef, fps]);
 
