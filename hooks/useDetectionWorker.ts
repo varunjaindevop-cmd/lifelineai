@@ -134,8 +134,8 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
     if (video.paused || video.ended) return;
 
     const now = Date.now();
-    // Throttle detection to every 500ms
-    if (now - lastDetectTimeRef.current < 500) {
+    // Throttle detection to every 300ms (~3 FPS)
+    if (now - lastDetectTimeRef.current < 300) {
       rafRef.current = requestAnimationFrame(runDetection);
       return;
     }
