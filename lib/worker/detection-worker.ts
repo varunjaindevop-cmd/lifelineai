@@ -1,16 +1,115 @@
 /**
- * Detection Web Worker — unified pipeline with COCO-SSD fallback.
- * ONNX inference → Kalman tracking → 5-signal collision detection → temporal confirmation.
- * Falls back to COCO-SSD (TensorFlow.js) when ONNX model is unavailable.
+ * Detection Web Worker v5 — COCO-SSD + MoveNet pose + Kalman tracking.
+ * Detects objects, tracks them, estimates poses, and finds accidents.
  */
 
-import { loadModel, detect as onnxDetect, isModelReady, toPixelDetections, type Detection } from "../detection/onnx-engine";
-import { loadCocoModel, detectWithCoco, isCocoReady, toPixelDetections as cocoToPixel } from "../detection/coco-engine";
+import { loadModel, detect as onnxDetect, toPixelDetections, type Detection } from "../detection/onnx-engine";
+import { loadCocoModel, detectWithCoco, toPixelDetections as cocoToPixel } from "../detection/coco-engine";
 import { MultiObjectTracker, type TrackedEntity } from "../detection/kalman-tracker";
 import { FrameMemory } from "../detection/frame-memory";
 import { detectAccidents, type AccidentEvidence, type EnvMode } from "../detection/ttc-engine";
-import type { WorkerOutput } from "./message-types";
+import type { WorkerOutput, SerializedSkeleton } from "./message-types";
 
+// MoveNet loading (dynamic import to avoid bundling issues)
+let poseDetector: any = null;
+let poseReady = false;
+
+async function loadPoseModel() {
+  try {
+    const tf = await import("@tensorflow/tfjs");
+    const poseDetection = await import("@tensorflow-models/pose-detection");
+    await tf.ready();
+    poseDetector = await poseDetection.createDetector(
+      poseDetection.SupportedModels.MoveNet,
+      { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING, enableSmoothing: true }
+    );
+    poseReady = true;
+    console.log("[Worker] MoveNet pose model loaded");
+  } catch (err: any) {
+    console.warn("[Worker] MoveNet failed:", err.message);
+    poseReady = false;
+  }
+}
+
+function analyzeKeypoints(keypoints: any[]): {
+  bodyAngle: number; isUpright: boolean; isFallen: boolean; isSitting: boolean;
+} {
+  const nose = keypoints[0];
+  const ls = keypoints[5], rs = keypoints[6]; // shoulders
+  const lh = keypoints[11], rh = keypoints[12]; // hips
+  const lk = keypoints[13], rk = keypoints[14]; // knees
+
+  const shoulderY = (ls.y + rs.y) / 2;
+  const hipY = (lh.y + rh.y) / 2;
+  const kneeY = (lk.y + rk.y) / 2;
+
+  const shoulderX = (ls.x + rs.x) / 2;
+  const hipX = (lh.x + rh.x) / 2;
+
+  // Body angle relative to vertical
+  const dx = shoulderX - hipX;
+  const dy = shoulderY - hipY;
+  const bodyAngle = Math.abs(Math.atan2(dx, -dy) * 180 / Math.PI);
+
+  const headAboveHips = nose.y < hipY;
+  const isUpright = bodyAngle < 30 && headAboveHips;
+  const isFallen = bodyAngle > 50 || (!headAboveHips && nose.y > kneeY);
+  const isSitting = !isUpright && !isFallen && hipY > kneeY * 0.8;
+
+  return { bodyAngle, isUpright, isFallen, isSitting };
+}
+
+async function detectPoses(imageData: ImageData): Promise<SerializedSkeleton[]> {
+  if (!poseDetector || !poseReady) return [];
+
+  try {
+    const canvas = new OffscreenCanvas(imageData.width, imageData.height);
+    const ctx = canvas.getContext("2d")!;
+    ctx.putImageData(imageData, 0, 0);
+    const bitmap = await createImageBitmap(canvas);
+    const poses = await poseDetector.estimatePoses(bitmap as any);
+    bitmap.close();
+
+    const results: SerializedSkeleton[] = [];
+    for (let i = 0; i < poses.length; i++) {
+      const pose = poses[i];
+      const kps = pose.keypoints.map((kp: any) => ({
+        x: kp.x / imageData.width,
+        y: kp.y / imageData.height,
+        score: kp.score,
+        name: ["nose","left_eye","right_eye","left_ear","right_ear","left_shoulder","right_shoulder","left_elbow","right_elbow","left_wrist","right_wrist","left_hip","right_hip","left_knee","right_knee","left_ankle","right_ankle"][kp.index] || `kp${kp.index}`,
+      }));
+
+      const avgScore = kps.reduce((s: number, k: any) => s + k.score, 0) / kps.length;
+      if (avgScore < 0.25) continue;
+
+      const analysis = analyzeKeypoints(kps);
+      const validKps = kps.filter((k: any) => k.score > 0.3);
+      if (validKps.length < 4) continue;
+
+      const xs = validKps.map((k: any) => k.x);
+      const ys = validKps.map((k: any) => k.y);
+      const x1 = Math.min(...xs), y1 = Math.min(...ys);
+      const x2 = Math.max(...xs), y2 = Math.max(...ys);
+
+      results.push({
+        id: i,
+        keypoints: kps,
+        bodyAngle: analysis.bodyAngle,
+        isUpright: analysis.isUpright,
+        isFallen: analysis.isFallen,
+        isSitting: analysis.isSitting,
+        confidence: avgScore,
+        bbox: [x1, y1, x2, y2],
+      });
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+// ── Worker state ──
 let tracker = new MultiObjectTracker();
 let frameMemory = new FrameMemory();
 let frameCount = 0;
@@ -18,185 +117,108 @@ let modelLoaded = false;
 let cocoLoaded = false;
 let envMode: EnvMode = "isolated";
 
-// Offscreen canvas for bitmap → ImageData conversion
 let offscreen: OffscreenCanvas | null = null;
 let offCtx: OffscreenCanvasRenderingContext2D | null = null;
-
-// Previous frame for change detection
 let prevFrameData: Uint8ClampedArray | null = null;
-const GRID_COLS = 10;
-const GRID_ROWS = 8;
-
-// Speed estimation: pixels per meter (auto-calibrated per mode)
-let pixelsPerMeter = 20; // default, updated on mode change
+const GRID_COLS = 10, GRID_ROWS = 8;
+let pixelsPerMeter = 20;
 
 function updatePPM(mode: EnvMode) {
-  const assumptions = { isolated: 2, traffic: 3, marketplace: 1 };
-  const laneWidth = 3.5;
-  const roadWidthMeters = assumptions[mode] * laneWidth;
-  // Assume road occupies ~35% of the shorter dimension
-  const refPixels = 320; // half of 640
-  const roadPixels = refPixels * 0.35;
-  pixelsPerMeter = Math.max(8, Math.min(35, roadPixels / roadWidthMeters));
+  const lanes = { isolated: 2, traffic: 3, marketplace: 1 };
+  const roadMeters = lanes[mode] * 3.5;
+  pixelsPerMeter = Math.max(8, Math.min(35, (320 * 0.35) / roadMeters));
 }
 
-// Mode-specific thresholds
 function getModeThreshold(mode: EnvMode): number {
-  switch (mode) {
-    case "isolated": return 0.35;
-    case "traffic": return 0.60;
-    case "marketplace": return 0.50;
-  }
+  return mode === "isolated" ? 0.35 : mode === "traffic" ? 0.60 : 0.50;
 }
-
 function getRequiredFrames(mode: EnvMode): number {
-  switch (mode) {
-    case "isolated": return 2; // fast confirmation for isolated
-    case "traffic": return 4;
-    case "marketplace": return 3;
-  }
+  return mode === "isolated" ? 2 : mode === "traffic" ? 4 : 3;
 }
 
-// ── Temporal confirmation buffer ──
-interface ConfirmationEntry {
-  key: string;
-  firstSeen: number;
-  lastSeen: number;
-  maxConfidence: number;
-  signalHistory: number[];
-}
-
+interface ConfirmationEntry { key: string; firstSeen: number; lastSeen: number; signalHistory: number[] }
 const confirmBuffer = new Map<string, ConfirmationEntry>();
 
 function checkConfirmation(evidence: AccidentEvidence, frame: number): boolean {
   const key = `${evidence.type}:${[...evidence.objects].sort().join(",")}`;
   const existing = confirmBuffer.get(key);
-  const requiredFrames = getRequiredFrames(envMode);
+  const required = getRequiredFrames(envMode);
 
   if (!existing) {
-    confirmBuffer.set(key, {
-      key, firstSeen: frame, lastSeen: frame,
-      maxConfidence: evidence.confidence,
-      signalHistory: [evidence.confidence],
-    });
+    confirmBuffer.set(key, { key, firstSeen: frame, lastSeen: frame, signalHistory: [evidence.confidence] });
     return false;
   }
 
   existing.lastSeen = frame;
-  existing.maxConfidence = Math.max(existing.maxConfidence, evidence.confidence);
   existing.signalHistory.push(evidence.confidence);
   if (existing.signalHistory.length > 10) existing.signalHistory.shift();
 
-  if (existing.lastSeen - existing.firstSeen < requiredFrames) {
-    console.log(`[Confirm] ${evidence.type} frames=${existing.lastSeen - existing.firstSeen}/${requiredFrames} conf=${evidence.confidence.toFixed(3)}`);
-    return false;
-  }
+  if (existing.lastSeen - existing.firstSeen < required) return false;
 
   const recent = existing.signalHistory.slice(-3);
-  const avgConf = recent.reduce((a, b) => a + b, 0) / recent.length;
-  const threshold = getModeThreshold(envMode);
-  console.log(`[Confirm] ${evidence.type} READY avg=${avgConf.toFixed(3)} threshold=${threshold} pass=${avgConf > threshold}`);
-  return avgConf > threshold;
+  const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
+  return avg > getModeThreshold(envMode);
 }
 
 function cleanConfirmBuffer(frame: number) {
-  const entries = Array.from(confirmBuffer.entries());
-  for (const [key, entry] of entries) {
+  for (const [key, entry] of Array.from(confirmBuffer.entries())) {
     if (frame - entry.lastSeen > 30) confirmBuffer.delete(key);
   }
 }
 
-// ── Change detection grid ──
 function computeChangeGrid(imageData: ImageData): number[] {
   const grid = new Array(GRID_COLS * GRID_ROWS).fill(0);
-  const data = imageData.data;
-  const w = imageData.width;
-  const h = imageData.height;
-  const cellW = Math.floor(w / GRID_COLS);
-  const cellH = Math.floor(h / GRID_ROWS);
-
-  if (!prevFrameData) {
-    prevFrameData = new Uint8ClampedArray(data);
-    return grid;
-  }
-
-  let totalDiff = 0;
-  let count = 0;
-
+  const { data, width: w, height: h } = imageData;
+  const cellW = Math.floor(w / GRID_COLS), cellH = Math.floor(h / GRID_ROWS);
+  if (!prevFrameData) { prevFrameData = new Uint8ClampedArray(data); return grid; }
   for (let gy = 0; gy < GRID_ROWS; gy++) {
     for (let gx = 0; gx < GRID_COLS; gx++) {
-      let cellDiff = 0;
-      let cellCount = 0;
-
-      // Sample every 4th pixel for speed
+      let diff = 0, cnt = 0;
       for (let y = gy * cellH; y < (gy + 1) * cellH; y += 4) {
         for (let x = gx * cellW; x < (gx + 1) * cellW; x += 4) {
           const idx = (y * w + x) * 4;
           const gray = data[idx] * 0.299 + data[idx + 1] * 0.587 + data[idx + 2] * 0.114;
-          const prevGray = prevFrameData[idx] * 0.299 + prevFrameData[idx + 1] * 0.587 + prevFrameData[idx + 2] * 0.114;
-          cellDiff += Math.abs(gray - prevGray);
-          cellCount++;
+          const pGray = prevFrameData[idx] * 0.299 + prevFrameData[idx + 1] * 0.587 + prevFrameData[idx + 2] * 0.114;
+          diff += Math.abs(gray - pGray); cnt++;
         }
       }
-
-      const avgDiff = cellCount > 0 ? cellDiff / cellCount / 255 : 0;
-      grid[gy * GRID_COLS + gx] = avgDiff;
-      totalDiff += avgDiff;
-      count++;
+      grid[gy * GRID_COLS + gx] = cnt > 0 ? diff / cnt / 255 : 0;
     }
   }
-
-  // Save current frame for next comparison (subsample to save memory)
-  prevFrameData = new Uint8ClampedArray(data.length);
+  prevFrameData = new Uint8ClampedArray(data);
   prevFrameData.set(data);
-
   return grid;
 }
 
 // ── Message handler ──
-
 self.onmessage = async (e: MessageEvent) => {
   const msg = e.data;
 
   switch (msg.type) {
     case "INIT": {
-      // Try ONNX first, then COCO-SSD as fallback
+      // Load object detection
       try {
         await loadModel(msg.modelPath || "/models/best.onnx");
         modelLoaded = true;
-        console.log("[Worker] ONNX model loaded successfully");
-      } catch (err: any) {
-        console.warn("[Worker] ONNX model load failed:", err.message);
+      } catch {
         modelLoaded = false;
-
-        // Try COCO-SSD fallback
-        try {
-          await loadCocoModel();
-          cocoLoaded = true;
-          console.log("[Worker] COCO-SSD loaded as fallback");
-        } catch (err2: any) {
-          console.warn("[Worker] COCO-SSD also failed:", err2.message);
-          cocoLoaded = false;
-        }
+        try { await loadCocoModel(); cocoLoaded = true; } catch { cocoLoaded = false; }
       }
+      // Load pose detection in parallel (non-blocking)
+      loadPoseModel();
 
-      if (msg.envMode) {
-        envMode = msg.envMode;
-        updatePPM(envMode);
-      }
-
+      if (msg.envMode) { envMode = msg.envMode; updatePPM(envMode); }
       const backend = modelLoaded ? "onnx" : cocoLoaded ? "coco-ssd" : "demo";
-      console.log(`[Worker] Backend: ${backend}`);
+      console.log(`[Worker] Backend: ${backend}, Pose: loading...`);
       self.postMessage({ type: "MODEL_LOADED", backend } satisfies WorkerOutput);
       break;
     }
 
     case "FRAME": {
       const bitmap = msg.bitmap as ImageBitmap;
-      const frameNumber = msg.frame ?? msg.frameNumber ?? frameCount;
+      const frameNumber = msg.frame ?? frameCount;
       frameCount++;
 
-      // Convert bitmap → ImageData
       if (!offscreen || offscreen.width !== bitmap.width || offscreen.height !== bitmap.height) {
         offscreen = new OffscreenCanvas(bitmap.width, bitmap.height);
         offCtx = offscreen.getContext("2d", { willReadFrequently: true })!;
@@ -205,23 +227,11 @@ self.onmessage = async (e: MessageEvent) => {
       const imageData = offCtx!.getImageData(0, 0, bitmap.width, bitmap.height);
       bitmap.close();
 
-      // Run inference with best available backend
+      // Object detection
       let detections: Detection[] = [];
-      if (modelLoaded) {
-        try {
-          detections = await onnxDetect(imageData);
-        } catch (err) {
-          console.error("[Worker] ONNX inference error:", err);
-        }
-      } else if (cocoLoaded) {
-        try {
-          detections = await detectWithCoco(imageData);
-        } catch (err) {
-          console.error("[Worker] COCO inference error:", err);
-        }
-      }
+      if (modelLoaded) { try { detections = await onnxDetect(imageData); } catch {} }
+      else if (cocoLoaded) { try { detections = await detectWithCoco(imageData); } catch {} }
 
-      // Convert to pixel space for tracker
       const pixelDets = modelLoaded
         ? toPixelDetections(detections, imageData.width, imageData.height)
         : cocoToPixel(detections, imageData.width, imageData.height);
@@ -230,28 +240,18 @@ self.onmessage = async (e: MessageEvent) => {
       const entities = tracker.update(pixelDets, frameNumber);
       const validEntities = entities.filter(e => e.age >= 1);
 
-      // Compute real speed in km/h for each entity
+      // Speed in km/h
       for (const entity of validEntities) {
-        // Use position history for actual speed
         if (entity.positions.length >= 2) {
           const last = entity.positions[entity.positions.length - 1];
           const prev = entity.positions[entity.positions.length - 2];
-          const dx = last.x - prev.x;
-          const dy = last.y - prev.y;
-          const pixelDist = Math.sqrt(dx * dx + dy * dy);
-          // Convert: pixels/frame → meters/frame → meters/sec → km/h
-          const metersPerFrame = pixelDist / pixelsPerMeter;
-          const metersPerSec = metersPerFrame * 3; // ~3 FPS detection
-          (entity as any).speedKmh = Math.round(metersPerSec * 3.6);
-        } else {
-          (entity as any).speedKmh = 0;
-        }
+          const pixelDist = Math.sqrt((last.x - prev.x) ** 2 + (last.y - prev.y) ** 2);
+          (entity as any).speedKmh = Math.round((pixelDist / pixelsPerMeter) * 3 * 3.6);
+        } else { (entity as any).speedKmh = 0; }
       }
 
-      // Store in frame memory
       frameMemory.addFrame({
-        frame: frameNumber,
-        timestamp: Date.now(),
+        frame: frameNumber, timestamp: Date.now(),
         entities: validEntities.map(e => ({
           id: e.id, class: e.class,
           x: e.kalman.getState().x, y: e.kalman.getState().y,
@@ -259,28 +259,50 @@ self.onmessage = async (e: MessageEvent) => {
         })),
       });
 
-      // Compute change detection grid
+      // Pose detection (runs every frame, non-blocking)
+      let skeletons: SerializedSkeleton[] = [];
+      try { skeletons = await detectPoses(imageData); } catch {}
+
+      // Use skeleton data to enhance person entities
+      for (const entity of validEntities) {
+        if (entity.class !== "person") continue;
+        // Find the nearest skeleton to this person entity
+        const ex = entity.kalman.getState().x / imageData.width;
+        const ey = entity.kalman.getState().y / imageData.height;
+        let bestSkeleton: SerializedSkeleton | null = null;
+        let bestDist = 0.15; // max matching distance (normalized)
+        for (const sk of skeletons) {
+          const skX = (sk.bbox[0] + sk.bbox[2]) / 2;
+          const skY = (sk.bbox[1] + sk.bbox[3]) / 2;
+          const d = Math.sqrt((ex - skX) ** 2 + (ey - skY) ** 2);
+          if (d < bestDist) { bestDist = d; bestSkeleton = sk; }
+        }
+        if (bestSkeleton) {
+          // Attach pose data to entity for TTC engine
+          (entity as any).skeleton = bestSkeleton;
+          (entity as any).bodyAngle = bestSkeleton.bodyAngle;
+          (entity as any).isFallen = bestSkeleton.isFallen;
+        }
+      }
+
       const changeGrid = computeChangeGrid(imageData);
 
-      // UNIFIED detection pipeline
+      // Detection pipeline
       const rawEvidence = detectAccidents(validEntities, envMode);
 
-      // Temporal confirmation
       const confirmedEvidence: AccidentEvidence[] = [];
       for (const ev of rawEvidence) {
-        if (checkConfirmation(ev, frameNumber)) {
-          confirmedEvidence.push(ev);
-        }
+        if (checkConfirmation(ev, frameNumber)) confirmedEvidence.push(ev);
       }
       cleanConfirmBuffer(frameNumber);
 
-      // Serialize entities with real speed
+      // Serialize
       const serializedEntities = validEntities.map(e => {
         const k = e.kalman.getState();
         return {
           id: e.id, class: e.class, confidence: e.confidence,
           x: k.x, y: k.y, vx: k.vx, vy: k.vy, ax: k.ax, ay: k.ay,
-          speed: (entity => (entity as any).speedKmh ?? 0)(e),
+          speed: (e as any).speedKmh ?? 0,
           heading: e.heading, acceleration: e.acceleration,
           w: e.w, h: e.h, age: e.age, confirmedFrames: e.confirmedFrames,
           positions: [...e.positions],
@@ -290,20 +312,17 @@ self.onmessage = async (e: MessageEvent) => {
         };
       });
 
-      const serializedEvidence = confirmedEvidence.map(ev => ({
-        type: ev.type,
-        confidence: ev.confidence,
-        objects: [...ev.objects],
-        details: ev.details,
-        signals: ev.signals.map(s => ({ name: s.name, value: s.value, weight: s.weight, passed: s.passed })),
-        sceneContext: envMode,
-      }));
-
       self.postMessage({
         type: "RESULTS",
         frame: frameNumber,
         entities: serializedEntities,
-        evidence: serializedEvidence,
+        evidence: confirmedEvidence.map(ev => ({
+          type: ev.type, confidence: ev.confidence, objects: [...ev.objects],
+          details: ev.details,
+          signals: ev.signals.map(s => ({ name: s.name, value: s.value, weight: s.weight, passed: s.passed })),
+          sceneContext: envMode,
+        })),
+        skeletons,
         changeGrid,
         state: confirmedEvidence.length > 0 ? "alert" : "monitoring",
         fps: 0,
@@ -312,15 +331,12 @@ self.onmessage = async (e: MessageEvent) => {
       break;
     }
 
-    case "SET_THRESHOLDS": {
-      break;
-    }
+    case "SET_THRESHOLDS": break;
 
     case "SET_MODE": {
       envMode = msg.envMode;
       updatePPM(envMode);
       confirmBuffer.clear();
-      console.log(`[Worker] Mode set to: ${envMode}, PPM: ${pixelsPerMeter.toFixed(1)}`);
       break;
     }
 

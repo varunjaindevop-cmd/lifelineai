@@ -30,6 +30,7 @@ export type WorkerOutput =
       frame: number;
       entities: SerializedEntity[];
       evidence: SerializedEvidence[];
+      skeletons: SerializedSkeleton[];
       changeGrid: number[];
       state: string;
       fps: number;
@@ -38,7 +39,7 @@ export type WorkerOutput =
     }
   | { type: "ERROR"; message: string };
 
-// Serializable entity for postMessage (no circular refs from Kalman)
+// Serializable entity for postMessage
 export interface SerializedEntity {
   id: number;
   class: string;
@@ -49,7 +50,7 @@ export interface SerializedEntity {
   vy: number;
   ax: number;
   ay: number;
-  speed: number; // km/h (converted from pixel speed in worker)
+  speed: number; // km/h
   heading: number;
   acceleration: number;
   w: number;
@@ -69,4 +70,15 @@ export interface SerializedEvidence {
   details: string;
   signals: { name: string; value: number; weight: number; passed: boolean }[];
   sceneContext: EnvMode;
+}
+
+export interface SerializedSkeleton {
+  id: number;
+  keypoints: { x: number; y: number; score: number; name: string }[];
+  bodyAngle: number;
+  isUpright: boolean;
+  isFallen: boolean;
+  isSitting: boolean;
+  confidence: number;
+  bbox: [number, number, number, number]; // [x1, y1, x2, y2] normalized
 }
