@@ -142,13 +142,16 @@ self.onmessage = async (e: MessageEvent) => {
         : cocoToPixel(detections, imageData.width, imageData.height);
 
       const entities = tracker.update(pixelDets, frameNumber);
-      const validEntities = entities.filter(e => e.age >= 1);
+      // For detection: only use FRESH entities (age>=1 AND not stale)
+      // Stale = COCO-SSD stopped seeing it — Kalman is predicting, not measuring
+      const freshEntities = entities.filter(e => e.age >= 1 && !e.isStale);
+      // For ESP overlay: send ALL entities (including stale for visual continuity)
 
-      // Detect entities that disappeared since last frame
-      const currentIds = new Set(validEntities.map(e => e.id));
+      // Detect entities that disappeared — track from last FRESH match
+      const currentFreshIds = new Set(freshEntities.map(e => e.id));
       for (const prevId of Array.from(previousEntityIds)) {
-        if (!currentIds.has(prevId)) {
-          // This entity disappeared — find its last known state from frame memory
+        if (!currentFreshIds.has(prevId)) {
+          // Entity was fresh last frame but stale/gone this frame — likely disappeared from COCO-SSD
           const history = frameMemory.getHistory();
           for (let i = history.length - 1; i >= 0; i--) {
             const snapshot = history[i];
@@ -171,7 +174,7 @@ self.onmessage = async (e: MessageEvent) => {
           }
         }
       }
-      previousEntityIds = currentIds;
+      previousEntityIds = currentFreshIds;
 
       // Clean old lost entities
       for (let i = lostEntities.length - 1; i >= 0; i--) {
@@ -186,7 +189,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       // Speed in km/h
-      for (const entity of validEntities) {
+      for (const entity of freshEntities) {
         if (entity.positions.length >= 2) {
           const last = entity.positions[entity.positions.length - 1];
           const prev = entity.positions[entity.positions.length - 2];
@@ -197,7 +200,7 @@ self.onmessage = async (e: MessageEvent) => {
 
       frameMemory.addFrame({
         frame: frameNumber, timestamp: Date.now(),
-        entities: validEntities.map(e => ({
+        entities: freshEntities.map(e => ({
           id: e.id, class: e.class,
           x: e.kalman.getState().x, y: e.kalman.getState().y,
           speed: e.speed, heading: e.heading,
@@ -205,15 +208,12 @@ self.onmessage = async (e: MessageEvent) => {
       });
 
       const changeGrid = computeChangeGrid(imageData);
-      const rawEvidence = detectAccidents(validEntities, envMode, lostEntities, changeGrid);
+      const rawEvidence = detectAccidents(freshEntities, envMode, lostEntities, changeGrid);
 
       // Debug logging
-      if (validEntities.length > 0) {
-        const entitySummary = validEntities.map(e => `${e.class}#${e.id}(spd=${(e as any).speedKmh ?? 0}km/h age=${e.age})`).join(", ");
-        console.log(`[Worker] F${frameNumber}: ${validEntities.length} entities [${entitySummary}] lost=${lostEntities.length}`);
-      }
-      if (rawEvidence.length > 0) {
-        console.log(`[Worker] F${frameNumber}: ${rawEvidence.length} raw evidence`);
+      if (freshEntities.length > 0) {
+        const entitySummary = freshEntities.map(e => `${e.class}#${e.id}(spd=${(e as any).speedKmh ?? 0}km/h age=${e.age})`).join(", ");
+        console.log(`[Worker] F${frameNumber}: ${freshEntities.length} fresh [${entitySummary}] lost=${lostEntities.length}`);
       }
 
       const confirmedEvidence: AccidentEvidence[] = [];
@@ -222,8 +222,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
       cleanConfirmBuffer(frameNumber);
 
-      // Serialize ALL entities for ESP boxes (including brand-new age=0)
-      // Detection pipeline uses validEntities (age>=1) but overlay shows everything
+      // Serialize ALL entities for ESP boxes — but mark stale ones
       const serializedEntities = entities.map(e => {
         const k = e.kalman.getState();
         const normalizedY = k.y / (bitmap.height || 480);
@@ -236,6 +235,7 @@ self.onmessage = async (e: MessageEvent) => {
           speed: (e as any).speedKmh ?? 0,
           heading: e.heading, acceleration: e.acceleration,
           w: e.w, h: e.h, age: e.age, confirmedFrames: e.confirmedFrames,
+          isStale: e.isStale,
           positions: [...e.positions],
           speedHistory: [...e.speedHistory],
           headingHistory: [...e.headingHistory],

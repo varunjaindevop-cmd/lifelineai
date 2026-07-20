@@ -1083,33 +1083,59 @@ export function detectAccidents(
   // ====== ISOLATED/MARKETPLACE: full detection ======
   let evidence: AccidentEvidence[] = [];
 
-  // 1. Heatmap collision detection (isolated mode)
+  // 1. Fast entity disappearance — most reliable collision indicator
+  // When a fast-moving entity vanishes near camera, something happened to it
+  for (const lost of lostEntities) {
+    if (lost.lastY < 0.35) continue; // must be near camera (bottom 65%)
+    if (lost.lastSpeed < 0.6) continue; // must have been moving fast
+    // Don't require any nearby entity — the disappearance at speed IS the evidence
+
+    let confidence = 0.50;
+    confidence *= (0.7 + 0.3 * (lost.lastY > 0.7 ? 1.0 : lost.lastY > 0.5 ? 0.8 : 0.5));
+    if (lost.lastSpeed > 1.0) confidence += 0.10;
+
+    console.log(`[TTC] ISOLATED LOST: ${lost.class}#${lost.id} was ${lost.lastSpeed.toFixed(1)}px/f conf=${confidence.toFixed(3)}`);
+    evidence.push({
+      type: "collision",
+      confidence: Math.min(0.85, confidence),
+      objects: [lost.id],
+      details: `${lost.class} vanished at ${(lost.lastSpeed * 3.6).toFixed(0)}km/h near camera`,
+      signals: [
+        { name: "entity_lost", value: 1, weight: 0.40, passed: true },
+        { name: "was_fast", value: 1, weight: 0.30, passed: true },
+        { name: "near_camera", value: 1, weight: 0.30, passed: true },
+      ],
+      sceneContext: envMode,
+    });
+  }
+
+  // 2. Heatmap collision detection (isolated mode)
   if (envMode === "isolated" && changeGrid.length > 0) {
     evidence.push(...detectHeatmapCollision(entities, changeGrid));
   }
 
-  // 2. Lost entity detection
+  // 3. Lost entity detection (with nearby entity check)
   evidence.push(...detectLostEntityAccidents(lostEntities, entities, envMode));
 
-  // 3. Motion-based anomalies
+  // 4. Motion-based anomalies
   evidence.push(...detectMotionAnomalies(entities, envMode));
 
-  // 4. Isolated-mode specific
+  // 5. Isolated-mode specific
   if (envMode === "isolated") {
     evidence.push(...detectIsolatedAnomalies(entities));
   }
 
-  // 5. Person-bike crash detection
+  // 6. Person-bike crash detection
   const pairs = findPersonBikePairs(entities);
   evidence.push(...detectBikeCrash(pairs, envMode));
 
-  // 6. Vehicle collision (near-camera only)
+  // 7. Vehicle collision (near-camera only)
   evidence.push(...detectVehicleCollision(entities, envMode));
 
-  // 7. Vehicle fall (near-camera only)
+  // 8. Vehicle fall (near-camera only)
   evidence.push(...detectVehicleFall(entities, envMode));
 
-  // 8. Person fall (near-camera only)
+  // 9. Person fall (near-camera only)
   evidence.push(...detectPersonFall(entities, envMode));
 
   return deduplicate(evidence);
