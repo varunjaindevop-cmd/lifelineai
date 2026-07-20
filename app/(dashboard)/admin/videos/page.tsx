@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import {
   ArrowLeft, Video, Play, Pause, AlertTriangle, Clock,
-  Navigation, Loader2, Zap, Car, Users,
+  Navigation, Loader2, Zap, Car, Users, Activity, BarChart3, TrendingUp,
 } from "lucide-react";
 import Link from "next/link";
 import { toast } from "sonner";
@@ -24,6 +24,45 @@ const VIDEO_CLIPS: VideoClip[] = [
 const LAT = 22.7196, LNG = 75.8577;
 const GRID_COLS = 10, GRID_ROWS = 8;
 
+// Mini sparkline component
+function MiniSparkline({ data, color = "#22c55e", maxVal = 80 }: { data: number[]; color?: string; maxVal?: number }) {
+  if (data.length < 2) return <div className="h-6 bg-muted/30 rounded" />;
+  const w = 120, h = 24;
+  const points = data.map((v, i) => {
+    const x = (i / (data.length - 1)) * w;
+    const y = h - Math.min(v, maxVal) / maxVal * h;
+    return `${x},${y}`;
+  }).join(" ");
+  return (
+    <svg width={w} height={h} className="block">
+      <polyline fill="none" stroke={color} strokeWidth="1.5" points={points} />
+    </svg>
+  );
+}
+
+// Object class bar chart
+function ClassBarChart({ entities }: { entities: { class: string; age: number }[] }) {
+  const counts = { car: 0, motorcycle: 0, person: 0 };
+  entities.filter(e => e.age >= 1).forEach(e => {
+    if (e.class in counts) counts[e.class as keyof typeof counts]++;
+  });
+  const max = Math.max(1, ...Object.values(counts));
+  const colors: Record<string, string> = { car: "#22c55e", motorcycle: "#f59e0b", person: "#3b82f6" };
+  return (
+    <div className="space-y-1.5">
+      {Object.entries(counts).map(([cls, count]) => (
+        <div key={cls} className="flex items-center gap-2">
+          <span className="text-xs text-muted-foreground w-16 truncate">{cls}</span>
+          <div className="flex-1 h-3 bg-muted/30 rounded-full overflow-hidden">
+            <div className="h-full rounded-full transition-all duration-300" style={{ width: `${(count / max) * 100}%`, backgroundColor: colors[cls] }} />
+          </div>
+          <span className="text-xs font-mono w-4 text-right">{count}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function VideoAnalysisPage() {
   const [selectedClip, setSelectedClip] = useState<VideoClip | null>(null);
   const [videoReady, setVideoReady] = useState(false);
@@ -38,6 +77,25 @@ export default function VideoAnalysisPage() {
   // Use the worker-based detection hook
   const detection: UseDetectionWorkerReturn = useDetectionWorker(envMode);
   const { isReady, isAnalyzing, state, entities, evidence, changeGrid, fps, incidents } = detection;
+
+  // Track speed history for sparklines
+  const speedHistoryRef = useRef<Record<number, number[]>>({});
+  const confHistoryRef = useRef<number[]>([]);
+
+  useEffect(() => {
+    if (!isAnalyzing || entities.length === 0) return;
+    const newHistory = { ...speedHistoryRef.current };
+    entities.filter(e => e.age >= 1).forEach(e => {
+      const speed = Math.round(Math.abs(e.speed) * 10);
+      if (!newHistory[e.id]) newHistory[e.id] = [];
+      newHistory[e.id] = [...newHistory[e.id].slice(-19), speed];
+    });
+    speedHistoryRef.current = newHistory;
+    // Track confidence
+    if (evidence.length > 0) {
+      confHistoryRef.current = [...confHistoryRef.current.slice(-19), evidence[0].confidence * 100];
+    }
+  }, [entities, evidence, isAnalyzing]);
 
   // Fallback: force videoReady after 5s if events don't fire
   useEffect(() => {
@@ -351,11 +409,16 @@ export default function VideoAnalysisPage() {
                     </div>
                   ))}
                 </div>
-                <div className="mt-2 text-xs text-muted-foreground">Mode: {envMode}</div>
+                <div className="mt-2 text-xs text-muted-foreground">Mode: {envMode} | FPS: {fps}</div>
               </div>
 
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2"><Zap size={16} /> Change Detection</h3>
+                <h3 className="font-semibold mb-3 flex items-center gap-2"><BarChart3 size={16} /> Object Distribution</h3>
+                <ClassBarChart entities={entities} />
+              </div>
+
+              <div className="bg-card p-4 rounded-xl border border-border">
+                <h3 className="font-semibold mb-3 flex items-center gap-2"><Zap size={16} /> Motion Heatmap</h3>
                 <div className="grid gap-px" style={{ gridTemplateColumns: `repeat(${GRID_COLS}, 1fr)` }}>
                   {changeGrid.map((v, i) => (
                     <div key={i} className="aspect-square rounded-sm" style={{
@@ -365,27 +428,52 @@ export default function VideoAnalysisPage() {
                     }} />
                   ))}
                 </div>
+                <div className="flex justify-between text-[10px] text-muted-foreground mt-1">
+                  <span className="text-green-500">Low motion</span>
+                  <span className="text-red-500">High motion</span>
+                </div>
               </div>
 
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3 flex items-center gap-2"><AlertTriangle size={16} /> Vehicle ESP</h3>
+                <h3 className="font-semibold mb-3 flex items-center gap-2"><TrendingUp size={16} /> Confidence Trend</h3>
+                <MiniSparkline
+                  data={confHistoryRef.current}
+                  color={confHistoryRef.current.length > 0 ? "#ef4444" : "#6b7280"}
+                  maxVal={100}
+                />
+                <div className="text-[10px] text-muted-foreground mt-1">
+                  {confHistoryRef.current.length > 0
+                    ? `Current: ${confHistoryRef.current[confHistoryRef.current.length - 1].toFixed(0)}%`
+                    : "No data yet"}
+                </div>
+              </div>
+
+              <div className="bg-card p-4 rounded-xl border border-border">
+                <h3 className="font-semibold mb-3 flex items-center gap-2"><Activity size={16} /> Vehicle ESP</h3>
                 <div className="space-y-2 max-h-60 overflow-y-auto">
                   {entities.filter(e => e.age >= 1).length === 0 ? (
-                    <p className="text-sm text-muted-foreground">{isAnalyzing ? "Scanning..." : "Start"}</p>
+                    <p className="text-sm text-muted-foreground">{isAnalyzing ? "Scanning..." : "Start analysis"}</p>
                   ) : entities.filter(e => e.age >= 1).map(b => {
                     const accelLabel = b.acceleration < -0.3 ? "BRAKE" : b.acceleration > 0.3 ? "ACC" : "CRUISE";
                     const accelColor = b.acceleration < -0.3 ? "text-red-400" : b.acceleration > 0.3 ? "text-green-400" : "text-gray-400";
+                    const clsColor = b.class === "car" ? "text-green-400" : b.class === "motorcycle" ? "text-yellow-400" : "text-blue-400";
+                    const sparkData = speedHistoryRef.current[b.id] || [];
                     return (
                       <div key={b.id} className="p-2 bg-background rounded text-xs">
                         <div className="flex items-center justify-between">
-                          <span className={`font-medium ${b.class === "car" ? "text-green-400" : b.class === "motorcycle" ? "text-yellow-400" : "text-blue-400"}`}>{b.class} #{b.id}</span>
+                          <span className={`font-medium ${clsColor}`}>{b.class} #{b.id}</span>
                           <span className={accelColor}>{accelLabel}</span>
                         </div>
-                        <div className="flex gap-2 text-muted-foreground flex-wrap">
-                          <span>{Math.round(b.speed * 10)}km/h</span>
+                        <div className="flex gap-2 text-muted-foreground flex-wrap mt-1">
+                          <span>{Math.round(Math.abs(b.speed) * 10)}km/h</span>
                           <span>a:{b.acceleration.toFixed(2)}</span>
                           <span>&theta;:{Math.round(b.heading * 180 / Math.PI)}&deg;</span>
                         </div>
+                        {sparkData.length > 1 && (
+                          <div className="mt-1">
+                            <MiniSparkline data={sparkData} color={clsColor === "text-green-400" ? "#22c55e" : clsColor === "text-yellow-400" ? "#f59e0b" : "#3b82f6"} />
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -393,24 +481,26 @@ export default function VideoAnalysisPage() {
               </div>
 
               <div className="bg-card p-4 rounded-xl border border-border">
-                <h3 className="font-semibold mb-3">Incidents</h3>
-                {incidents.length === 0 ? (
-                  <p className="text-sm text-muted-foreground">{isAnalyzing ? "Monitoring..." : "None"}</p>
-                ) : incidents.map((inc, i) => (
-                  <div key={i} className={`p-3 rounded-lg border-l-4 mb-2 ${inc.severity === "critical" ? "border-red-500 bg-red-500/10" : "border-orange-500 bg-orange-500/10"}`}>
-                    <div className="flex items-center gap-2">
-                      <AlertTriangle size={14} className="text-red-500" />
-                      <span className="text-sm font-medium capitalize">{inc.type.replace(/_/g, " ")}</span>
+                <h3 className="font-semibold mb-3">Incidents ({incidents.length})</h3>
+                <div className="max-h-48 overflow-y-auto space-y-2">
+                  {incidents.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">{isAnalyzing ? "Monitoring..." : "None"}</p>
+                  ) : incidents.map((inc, i) => (
+                    <div key={i} className={`p-3 rounded-lg border-l-4 ${inc.severity === "critical" ? "border-red-500 bg-red-500/10" : "border-orange-500 bg-orange-500/10"}`}>
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle size={14} className="text-red-500" />
+                        <span className="text-sm font-medium capitalize">{inc.type.replace(/_/g, " ")}</span>
+                      </div>
+                      <div className="flex gap-3 mt-1 text-xs text-muted-foreground">
+                        <span>{(inc.confidence * 100).toFixed(0)}%</span>
+                        <span className="flex items-center gap-1"><Clock size={10} />{new Date(inc.timestamp).toLocaleTimeString()}</span>
+                      </div>
+                      <Link href="/ambulance" className="mt-1 inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                        <Navigation size={10} /> Ambulance Dashboard
+                      </Link>
                     </div>
-                    <div className="flex gap-3 mt-1 text-xs text-muted-foreground">
-                      <span>{(inc.confidence * 100).toFixed(0)}%</span>
-                      <span className="flex items-center gap-1"><Clock size={10} />{new Date(inc.timestamp).toLocaleTimeString()}</span>
-                    </div>
-                    <Link href="/ambulance" className="mt-1 inline-flex items-center gap-1 text-xs text-primary hover:underline">
-                      <Navigation size={10} /> Ambulance Dashboard
-                    </Link>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
             </div>
           </div>
