@@ -24,16 +24,32 @@ let prevFrameData: Uint8ClampedArray | null = null;
 const GRID_COLS = 10, GRID_ROWS = 8;
 let pixelsPerMeter = 20;
 
+// Track entities that were recently lost (disappeared from detection)
+interface LostEntity {
+  id: number;
+  class: string;
+  lastX: number;
+  lastY: number;
+  lastSpeed: number;
+  lastHeading: number;
+  lostAtFrame: number;
+  wasMoving: boolean;
+}
+const lostEntities: LostEntity[] = [];
+const MAX_LOST_AGE = 15;
+const MAX_LOST_ENTITIES = 50;
+let previousEntityIds = new Set<number>();
+
 function updatePPM(mode: EnvMode) {
   const lanes = { isolated: 2, traffic: 3, marketplace: 1 };
   pixelsPerMeter = Math.max(8, Math.min(35, (320 * 0.35) / (lanes[mode] * 3.5)));
 }
 
 function getModeThreshold(mode: EnvMode): number {
-  return mode === "isolated" ? 0.35 : mode === "traffic" ? 0.60 : 0.50;
+  return mode === "isolated" ? 0.30 : mode === "traffic" ? 0.45 : 0.45; // lowered all thresholds
 }
 function getRequiredFrames(mode: EnvMode): number {
-  return mode === "isolated" ? 2 : mode === "traffic" ? 4 : 3;
+  return mode === "isolated" ? 2 : mode === "traffic" ? 3 : 3; // lowered from 4 for traffic
 }
 
 interface ConfirmationEntry { key: string; firstSeen: number; lastSeen: number; signalHistory: number[] }
@@ -128,6 +144,47 @@ self.onmessage = async (e: MessageEvent) => {
       const entities = tracker.update(pixelDets, frameNumber);
       const validEntities = entities.filter(e => e.age >= 1);
 
+      // Detect entities that disappeared since last frame
+      const currentIds = new Set(validEntities.map(e => e.id));
+      for (const prevId of Array.from(previousEntityIds)) {
+        if (!currentIds.has(prevId)) {
+          // This entity disappeared — find its last known state from frame memory
+          const history = frameMemory.getHistory();
+          for (let i = history.length - 1; i >= 0; i--) {
+            const snapshot = history[i];
+            const ent = snapshot.entities.find(e => e.id === prevId);
+            if (ent) {
+              const speed = Math.sqrt(ent.speed ** 2);
+              console.log(`[Worker] Entity DISAPPEARED: ${ent.class}#${prevId} was at (${ent.x.toFixed(0)},${ent.y.toFixed(0)}) speed=${speed.toFixed(1)}px/f`);
+              lostEntities.push({
+                id: prevId,
+                class: ent.class,
+                lastX: ent.x,
+                lastY: ent.y,
+                lastSpeed: speed,
+                lastHeading: ent.heading,
+                lostAtFrame: frameNumber,
+                wasMoving: speed > 0.5,
+              });
+              break;
+            }
+          }
+        }
+      }
+      previousEntityIds = currentIds;
+
+      // Clean old lost entities
+      for (let i = lostEntities.length - 1; i >= 0; i--) {
+        if (frameNumber - lostEntities[i].lostAtFrame > MAX_LOST_AGE) {
+          lostEntities.splice(i, 1);
+        }
+      }
+
+      // Limit array size to prevent memory issues
+      while (lostEntities.length > MAX_LOST_ENTITIES) {
+        lostEntities.shift();
+      }
+
       // Speed in km/h
       for (const entity of validEntities) {
         if (entity.positions.length >= 2) {
@@ -148,7 +205,16 @@ self.onmessage = async (e: MessageEvent) => {
       });
 
       const changeGrid = computeChangeGrid(imageData);
-      const rawEvidence = detectAccidents(validEntities, envMode);
+      const rawEvidence = detectAccidents(validEntities, envMode, lostEntities);
+
+      // Debug logging
+      if (validEntities.length > 0) {
+        const entitySummary = validEntities.map(e => `${e.class}#${e.id}(spd=${(e as any).speedKmh ?? 0}km/h age=${e.age})`).join(", ");
+        console.log(`[Worker] F${frameNumber}: ${validEntities.length} entities [${entitySummary}] lost=${lostEntities.length}`);
+      }
+      if (rawEvidence.length > 0) {
+        console.log(`[Worker] F${frameNumber}: ${rawEvidence.length} raw evidence`);
+      }
 
       const confirmedEvidence: AccidentEvidence[] = [];
       for (const ev of rawEvidence) {
@@ -203,6 +269,8 @@ self.onmessage = async (e: MessageEvent) => {
       tracker.reset();
       frameMemory.clear();
       confirmBuffer.clear();
+      lostEntities.length = 0;
+      previousEntityIds.clear();
       prevFrameData = null;
       frameCount = 0;
       break;

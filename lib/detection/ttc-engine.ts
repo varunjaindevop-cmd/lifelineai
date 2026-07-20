@@ -85,17 +85,26 @@ function calcIoU(a: TrackedEntity, b: TrackedEntity): number {
 
 function hasDecelerated(entity: TrackedEntity): boolean {
   if (entity.speedHistory.length < 3) return false;
-  const recent = entity.speedHistory.slice(0, 2);
-  const older = entity.speedHistory.slice(2, Math.min(5, entity.speedHistory.length));
-  if (older.length === 0) return false;
-  const avgRecent = recent.reduce((a, b) => a + b, 0) / recent.length;
-  const avgOlder = older.reduce((a, b) => a + b, 0) / older.length;
-  return avgOlder > 0.3 && avgRecent < avgOlder * 0.65;
+  // Use more lenient thresholds for COCO-SSD noise tolerance
+  // Look at the MAX speed in recent history vs the MAX in older history
+  const recent = entity.speedHistory.slice(0, 3);
+  const older = entity.speedHistory.slice(3, Math.min(8, entity.speedHistory.length));
+  if (older.length === 0) {
+    // Fallback: just check if recent speeds are declining
+    return recent[0] < recent[1] * 0.7 && recent[1] > 0.2;
+  }
+  const maxRecent = Math.max(...recent);
+  const maxOlder = Math.max(...older);
+  // Deceleration: older speeds were higher, now they're lower
+  // Use max instead of avg to be noise-tolerant
+  return maxOlder > 0.2 && maxRecent < maxOlder * 0.7;
 }
 
 function wasFast(entity: TrackedEntity): boolean {
   if (entity.speedHistory.length < 2) return false;
-  return entity.speedHistory[0] > 1.0 || entity.speedHistory[1] > 1.0;
+  // Lowered threshold: COCO-SSD speed estimates are often lower than reality
+  return entity.speedHistory[0] > 0.5 || entity.speedHistory[1] > 0.5 ||
+    (entity.speedHistory.length >= 3 && entity.speedHistory[2] > 0.5);
 }
 
 function angleDiff(a: number, b: number): number {
@@ -104,11 +113,16 @@ function angleDiff(a: number, b: number): number {
 }
 
 function isStationary(entity: TrackedEntity): boolean {
-  return entity.speed < 0.3 && entity.speedHistory.slice(0, 3).every(s => s < 0.5);
+  // Noise-tolerant: check if the entity is currently slow AND
+  // at least 2 of the last 3 speed readings are low
+  if (entity.speed > 0.5) return false; // still moving fast
+  const recent3 = entity.speedHistory.slice(0, 3);
+  const slowCount = recent3.filter(s => s < 0.6).length;
+  return slowCount >= 2; // majority of recent readings are slow
 }
 
 function isPassing(a: TrackedEntity, b: TrackedEntity): boolean {
-  if (a.speed < 0.6 || b.speed < 0.6) return false;
+  if (a.speed < 0.4 || b.speed < 0.4) return false;
   const headingDiff = angleDiff(a.heading, b.heading);
   if (headingDiff < Math.PI * 0.25) return true;
   if (!hasDecelerated(a) && !hasDecelerated(b)) return true;
@@ -250,7 +264,7 @@ function detectBikeCrash(pairs: PersonBikePair[], envMode: EnvMode): AccidentEvi
 
     // Require at least 2 signals
     const passedSignals = signals.filter(s => s.passed).length;
-    if (passedSignals < 2 || confidence < 0.40) continue;
+    if (passedSignals < 2 || confidence < 0.35) continue;
 
     console.log(`[TTC] BIKE CRASH: bike#${bike.id} person#${person.id} conf=${confidence.toFixed(3)} signals=${passedSignals}/4 fell=${bikeNowFallen} stopped=${bikeNowStopped} lying=${personLying} separated=${personSeparated}`);
 
@@ -332,27 +346,28 @@ function detectVehicleCollision(entities: TrackedEntity[], envMode: EnvMode): Ac
       const iou = calcIoU(a, b);
 
       if (envMode === "traffic") {
-        // Traffic: strict overlap + both decelerated
-        if (iou < 0.15) continue;
-        if (!hasDecelerated(a) || !hasDecelerated(b)) continue;
-        if (d > cr * 1.5) continue;
+        // Traffic: overlap + at least one decelerated + close proximity
+        // Relaxed: require EITHER both decelerated OR one decelerated + very close
+        if (iou < 0.08) continue; // lowered from 0.15
+        const aDecel = hasDecelerated(a);
+        const bDecel = hasDecelerated(b);
+        if (!aDecel && !bDecel) continue; // at least one must have decelerated
+        if (d > cr * 2.0) continue; // relaxed from 1.5
         if (isPassing(a, b)) continue;
 
         const distBoost = Math.max(distancePriority(a), distancePriority(b));
-        const confidence = Math.min(0.95,
-          (0.4 * Math.min(iou * 3, 1) + 0.3 * 1.0 + 0.3 * (d < cr * 0.8 ? 1 : 0.5)) *
-          (0.7 + 0.3 * distBoost)
-        );
+        let confidence = (0.35 * Math.min(iou * 3, 1) + 0.35 * ((aDecel ? 1 : 0) + (bDecel ? 1 : 0)) / 2 + 0.30 * (d < cr * 1.0 ? 1 : 0.5));
+        confidence *= (0.7 + 0.3 * distBoost);
 
         evidence.push({
           type: "collision",
-          confidence,
+          confidence: Math.min(0.95, confidence),
           objects: [a.id, b.id],
-          details: `Traffic crash: iou=${iou.toFixed(3)} d=${d.toFixed(0)}px`,
+          details: `Traffic crash: iou=${iou.toFixed(3)} d=${d.toFixed(0)}px aDecel=${aDecel} bDecel=${bDecel}`,
           signals: [
-            { name: "overlap", value: iou, weight: 0.4, passed: iou > 0.15 },
-            { name: "both_decel", value: 1, weight: 0.3, passed: true },
-            { name: "proximity", value: d < cr * 0.8 ? 1 : 0.5, weight: 0.3, passed: true },
+            { name: "overlap", value: iou, weight: 0.35, passed: iou > 0.08 },
+            { name: "deceleration", value: (aDecel ? 1 : 0) + (bDecel ? 1 : 0), weight: 0.35, passed: aDecel || bDecel },
+            { name: "proximity", value: d < cr * 1.0 ? 1 : 0.5, weight: 0.30, passed: d < cr * 2.0 },
           ],
           sceneContext: "traffic",
         });
@@ -370,7 +385,7 @@ function detectVehicleCollision(entities: TrackedEntity[], envMode: EnvMode): Ac
         confidence *= (0.7 + 0.3 * distBoost);
 
         const passedCount = [overlap > 0.03, deceleration > 0, proximity > 0].filter(Boolean).length;
-        const minScore = envMode === "isolated" ? 0.35 : 0.50;
+        const minScore = envMode === "isolated" ? 0.30 : 0.40; // lowered
 
         if (confidence >= minScore && passedCount >= 2) {
           evidence.push({
@@ -458,14 +473,14 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
 
     // Check: was fast recently, now stopped
     const recentSpeed = Math.max(...v.speedHistory.slice(0, 3));
-    const isNowStopped = v.speed < 0.3;
-    const wasMoving = recentSpeed > 0.8;
+    const isNowStopped = v.speed < 0.5; // relaxed from 0.3
+    const wasMoving = recentSpeed > 0.4; // relaxed from 0.8
 
     if (!wasMoving || !isNowStopped) continue;
 
     // Find nearby entities (person or vehicle)
     const nearby = [...vehicles, ...persons].filter(e =>
-      e.id !== v.id && e.age >= 1 && dist(v, e) < combinedR(v, e) * 3
+      e.id !== v.id && e.age >= 1 && dist(v, e) < combinedR(v, e) * 4 // relaxed from 3
     );
 
     for (const n of nearby) {
@@ -498,7 +513,7 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
 
       confidence *= (0.7 + 0.3 * distancePriority(v));
 
-      if (confidence >= 0.45) {
+      if (confidence >= 0.40) {
         console.log(`[TTC] MOTION ANOMALY: ${v.class}#${v.id} stopped near ${n.class}#${n.id} conf=${confidence.toFixed(3)}`);
         evidence.push({
           type: "collision",
@@ -517,9 +532,9 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
     if (!isNearCamera(p)) continue;
     if (p.speedHistory.length < 4) continue;
 
-    const wasMoving = Math.max(...p.speedHistory.slice(0, 3)) > 0.5;
-    const isNowStopped = p.speed < 0.2;
-    const stoppedFrames = p.speedHistory.slice(0, 5).filter(s => s < 0.3).length;
+    const wasMoving = Math.max(...p.speedHistory.slice(0, 3)) > 0.3; // relaxed from 0.5
+    const isNowStopped = p.speed < 0.35; // relaxed from 0.2
+    const stoppedFrames = p.speedHistory.slice(0, 5).filter(s => s < 0.4).length; // relaxed from 0.3
 
     if (wasMoving && isNowStopped && stoppedFrames >= 2) {
       // Check if person's position dropped (fell down)
@@ -542,7 +557,7 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
 
       confidence *= (0.7 + 0.3 * distancePriority(p));
 
-      if (confidence >= 0.45) {
+      if (confidence >= 0.40) {
         console.log(`[TTC] PERSON STOPPED: #${p.id} was moving, now stopped conf=${confidence.toFixed(3)}`);
         evidence.push({
           type: "person_fall",
@@ -550,6 +565,94 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
           objects: [p.id],
           details: `Person stopped suddenly (was moving, now stationary for ${stoppedFrames} frames)`,
           signals,
+          sceneContext: envMode,
+        });
+      }
+    }
+  }
+
+  return evidence;
+}
+
+// ========== LOST ENTITY DETECTION ==========
+// When a tracked entity disappears, check if it was in an accident.
+// This catches objects that COCO-SSD stops detecting (fallen bike, lying person).
+
+export interface LostEntityData {
+  id: number;
+  class: string;
+  lastX: number;
+  lastY: number;
+  lastSpeed: number;
+  lastHeading: number;
+  lostAtFrame: number;
+  wasMoving: boolean;
+}
+
+function detectLostEntityAccidents(
+  lostEntities: LostEntityData[],
+  currentEntities: TrackedEntity[],
+  envMode: EnvMode
+): AccidentEvidence[] {
+  const evidence: AccidentEvidence[] = [];
+
+  for (const lost of lostEntities) {
+    // Relaxed: don't require wasMoving — an entity that suddenly vanishes is suspicious regardless
+    // But weight it higher if it was moving
+
+    console.log(`[TTC] CHECKING LOST ENTITY: ${lost.class}#${lost.id} was ${lost.lastSpeed.toFixed(1)}px/f at (${lost.lastX.toFixed(0)},${lost.lastY.toFixed(0)})`);
+
+    // Find nearby current entities (broadened radius)
+    const nearby = currentEntities.filter(e => {
+      const dx = e.kalman.getState().x - lost.lastX;
+      const dy = e.kalman.getState().y - lost.lastY;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      return d < 300; // relaxed from 200
+    });
+
+    console.log(`[TTC] LOST ENTITY ${lost.id}: found ${nearby.length} nearby entities`);
+
+    for (const n of nearby) {
+      // Check if the nearby entity also stopped or slowed down
+      const nSlowed = n.speed < 0.6 || hasDecelerated(n); // relaxed
+      if (!nSlowed) continue;
+
+      let confidence = lost.wasMoving ? 0.60 : 0.45; // higher if was moving
+      confidence *= (0.7 + 0.3 * distancePriority(n));
+
+      console.log(`[TTC] LOST ENTITY ALERT: ${lost.class}#${lost.id} disappeared near ${n.class}#${n.id} conf=${confidence.toFixed(3)}`);
+
+      evidence.push({
+        type: "collision",
+        confidence: Math.min(0.85, confidence),
+        objects: [lost.id, n.id],
+        details: `Lost entity: ${lost.class}#${lost.id} disappeared near ${n.class}#${n.id} (was ${lost.lastSpeed.toFixed(1)}px/f)`,
+        signals: [
+          { name: "entity_lost", value: 1, weight: 0.35, passed: true },
+          { name: "was_moving", value: lost.wasMoving ? 1 : 0, weight: 0.30, passed: lost.wasMoving },
+          { name: "nearby_stopped", value: nSlowed ? 1 : 0, weight: 0.35, passed: nSlowed },
+        ],
+        sceneContext: envMode,
+      });
+    }
+
+    // Also fire if entity vanished while near camera and was moving (no need for nearby entity)
+    if (lost.wasMoving && lost.lastY > 0.35) { // near camera (bottom 65%)
+      const hasNearby = nearby.some(e => e.speed < 0.6);
+      if (!hasNearby) {
+        // Entity vanished while moving near camera — suspicious on its own
+        let confidence = 0.40;
+        confidence *= (0.7 + 0.3 * (lost.lastY > 0.7 ? 1.0 : lost.lastY > 0.5 ? 0.8 : 0.5));
+        evidence.push({
+          type: "collision",
+          confidence: Math.min(0.75, confidence),
+          objects: [lost.id],
+          details: `Entity vanished: ${lost.class}#${lost.id} was moving near camera, disappeared`,
+          signals: [
+            { name: "entity_lost", value: 1, weight: 0.40, passed: true },
+            { name: "was_moving", value: 1, weight: 0.30, passed: true },
+            { name: "near_camera", value: 1, weight: 0.30, passed: true },
+          ],
           sceneContext: envMode,
         });
       }
@@ -669,28 +772,35 @@ function detectIsolatedAnomalies(entities: TrackedEntity[]): AccidentEvidence[] 
   return evidence;
 }
 
-export function detectAccidents(entities: TrackedEntity[], envMode: EnvMode): AccidentEvidence[] {
+export function detectAccidents(
+  entities: TrackedEntity[],
+  envMode: EnvMode,
+  lostEntities: LostEntityData[] = []
+): AccidentEvidence[] {
   let evidence: AccidentEvidence[] = [];
 
-  // 1. Motion-based anomalies (works even when objects aren't detected properly)
+  // 1. Lost entity detection (entity disappeared near another entity)
+  evidence.push(...detectLostEntityAccidents(lostEntities, entities, envMode));
+
+  // 2. Motion-based anomalies (works even when objects aren't detected properly)
   evidence.push(...detectMotionAnomalies(entities, envMode));
 
-  // 2. Isolated-mode specific: thrown vehicles, person recovery, speed spikes
+  // 3. Isolated-mode specific: thrown vehicles, person recovery, speed spikes
   if (envMode === "isolated") {
     evidence.push(...detectIsolatedAnomalies(entities));
   }
 
-  // 3. Person-bike crash detection
+  // 4. Person-bike crash detection
   const pairs = findPersonBikePairs(entities);
   evidence.push(...detectBikeCrash(pairs, envMode));
 
-  // 4. Vehicle collision (near-camera only)
+  // 5. Vehicle collision (near-camera only)
   evidence.push(...detectVehicleCollision(entities, envMode));
 
-  // 5. Vehicle fall (near-camera only)
+  // 6. Vehicle fall (near-camera only)
   evidence.push(...detectVehicleFall(entities, envMode));
 
-  // 6. Person fall (near-camera only)
+  // 7. Person fall (near-camera only)
   evidence.push(...detectPersonFall(entities, envMode));
 
   // Deduplicate: keep highest confidence per object set
@@ -717,9 +827,9 @@ export function getModeConfig(mode: EnvMode) {
 }
 
 const MODE_CONFIG: Record<EnvMode, { minScore: number; minSignals: number; cooldownMs: number }> = {
-  isolated: { minScore: 0.35, minSignals: 2, cooldownMs: 3000 },
-  traffic: { minScore: 0.55, minSignals: 2, cooldownMs: 8000 },
-  marketplace: { minScore: 0.50, minSignals: 3, cooldownMs: 8000 },
+  isolated: { minScore: 0.30, minSignals: 2, cooldownMs: 3000 },
+  traffic: { minScore: 0.45, minSignals: 2, cooldownMs: 6000 },
+  marketplace: { minScore: 0.40, minSignals: 2, cooldownMs: 6000 },
 };
 
 export { isNearCamera, distancePriority, isPassing, hasDecelerated, dist, combinedR, calcIoU };

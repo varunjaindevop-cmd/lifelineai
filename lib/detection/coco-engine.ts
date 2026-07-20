@@ -81,7 +81,7 @@ export async function detectWithCoco(imageData: ImageData): Promise<Detection[]>
   for (const pred of predictions) {
     const sageClass = COCO_TO_SAGE[pred.class];
     if (!sageClass || !RELEVANT_CLASSES.has(pred.class)) continue;
-    if (pred.score < 0.3) continue; // minimum confidence
+    if (pred.score < 0.15) continue; // low threshold to catch fallen/unusual objects
 
     // pred.bbox is [x, y, width, height] in pixels
     const [bx, by, bw, bh] = pred.bbox;
