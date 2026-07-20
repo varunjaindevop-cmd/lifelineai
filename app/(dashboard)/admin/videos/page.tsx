@@ -175,7 +175,7 @@ export default function VideoAnalysisPage() {
     });
   }, [incidents.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Draw frame overlay on canvas (only UI rendering, no detection)
+  // Draw frame overlay on canvas - uses refs to avoid re-creation
   const drawFrame = useCallback(() => {
     const canvas = canvasRef.current;
     const video = videoRef.current;
@@ -185,6 +185,8 @@ export default function VideoAnalysisPage() {
 
     const videoW = video.videoWidth || 640;
     const videoH = video.videoHeight || 480;
+    const currentEntities = entitiesRef.current;
+    const currentEvidence = evidenceRef.current;
 
     if (!canvasSizedRef.current || canvas.width !== videoW || canvas.height !== videoH) {
       canvas.width = videoW;
@@ -194,9 +196,9 @@ export default function VideoAnalysisPage() {
     ctx.clearRect(0, 0, videoW, videoH);
 
     // Draw entities from worker results
-    for (const entity of entities) {
+    for (const entity of currentEntities) {
       if (entity.age < 1) continue;
-      const isInvolved = evidence.some(e => e.objects.includes(entity.id));
+      const isInvolved = currentEvidence.some(e => e.objects.includes(entity.id));
       const baseColor = entity.class === "car" ? "#22c55e" : entity.class === "motorcycle" ? "#f59e0b" : "#3b82f6";
       const color = isInvolved ? "#ef4444" : baseColor;
       const cx = entity.x, cy = entity.y;
@@ -267,20 +269,31 @@ export default function VideoAnalysisPage() {
     ctx.fillStyle = "#fff";
     ctx.font = "11px Arial";
     const modeLabel = envMode === "traffic" ? "TRAFFIC" : envMode === "marketplace" ? "MARKETPLACE" : "ISOLATED";
-    ctx.fillText(`${modeLabel} | Objects: ${entities.filter(e => e.age >= 1).length} | FPS: ${fps}`, 8, barY + 14);
-  }, [entities, evidence, envMode, fps]);
+    ctx.fillText(`${modeLabel} | Objects: ${currentEntities.filter(e => e.age >= 1).length} | FPS: ${fps}`, 8, barY + 14);
+  }, [envMode, fps]);
 
-  // RAF loop for canvas drawing (lightweight, on main thread)
+  // Store drawing data in refs to avoid recreating drawFrame
+  const entitiesRef = useRef(entities);
+  const evidenceRef = useRef(evidence);
+  entitiesRef.current = entities;
+  evidenceRef.current = evidence;
+
+  // RAF loop for canvas drawing - uses refs to stay stable
   useEffect(() => {
     if (!isAnalyzing) return;
     let rafId: number;
-    const draw = () => {
-      drawFrame();
+    let lastDraw = 0;
+    const draw = (timestamp: number) => {
+      // Throttle drawing to 15 FPS max (66ms intervals)
+      if (timestamp - lastDraw > 66) {
+        lastDraw = timestamp;
+        drawFrame();
+      }
       rafId = requestAnimationFrame(draw);
     };
     rafId = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(rafId);
-  }, [isAnalyzing, drawFrame]);
+  }, [isAnalyzing]); // Only depends on isAnalyzing, not drawFrame
 
   const startAnalysis = useCallback(() => {
     if (!videoRef.current || !selectedClip) return;
