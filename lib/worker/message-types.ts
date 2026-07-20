@@ -39,28 +39,24 @@ export type WorkerOutput =
     }
   | { type: "ERROR"; message: string };
 
-// Serializable entity for postMessage
+// Serializable entity for postMessage — minimal for overlay, extras for admin page
 export interface SerializedEntity {
   id: number;
-  class: string;
-  confidence: number;
+  cls: string;
+  conf: number;
   x: number;
   y: number;
-  vx: number;
-  vy: number;
-  ax: number;
-  ay: number;
-  speed: number; // km/h
-  heading: number;
-  acceleration: number;
   w: number;
   h: number;
+  speed: number;
+  heading: number;
+  // backward compat
+  class: string;
+  confidence: number;
   age: number;
   confirmedFrames: number;
+  acceleration: number;
   positions: { x: number; y: number }[];
-  speedHistory: number[];
-  headingHistory: number[];
-  aspectHistory: number[];
 }
 
 export interface SerializedEvidence {

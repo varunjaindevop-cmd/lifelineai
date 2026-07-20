@@ -222,24 +222,27 @@ self.onmessage = async (e: MessageEvent) => {
       }
       cleanConfirmBuffer(frameNumber);
 
-      // Serialize ALL entities for ESP — raw position (fresh) or predicted position (stale)
-      const serializedEntities = entities.map(e => {
-        // rawX/rawY: fresh detection pos OR predicted pos (set by tracker.predict)
-        const k = e.kalman.getState();
-        return {
-          id: e.id, class: e.class, confidence: e.confidence,
-          x: e.rawX, y: e.rawY,
-          vx: k.vx, vy: k.vy, ax: k.ax, ay: k.ay,
+      // Serialize entities — raw detection coordinates only, zero smoothing
+      const serializedEntities = entities
+        .filter(e => e.age >= 1) // only show entities confirmed in at least 1 frame
+        .map(e => ({
+          id: e.id,
+          cls: e.class,
+          conf: e.confidence,
+          x: e.rawX,
+          y: e.rawY,
+          w: e.rawW,
+          h: e.rawH,
           speed: (e as any).speedKmh ?? 0,
-          heading: e.heading, acceleration: e.acceleration,
-          w: e.rawW, h: e.rawH, age: e.age, confirmedFrames: e.confirmedFrames,
-          isStale: e.isStale,
+          heading: e.heading,
+          // backward compat for admin page
+          class: e.class,
+          confidence: e.confidence,
+          age: e.age,
+          confirmedFrames: e.confirmedFrames,
+          acceleration: e.acceleration,
           positions: [...e.positions],
-          speedHistory: [...e.speedHistory],
-          headingHistory: [...e.headingHistory],
-          aspectHistory: [...e.aspectHistory],
-        };
-      });
+        }));
 
       self.postMessage({
         type: "RESULTS",

@@ -152,10 +152,15 @@ export default function DebugPage() {
               />
               <DetectionOverlay
                 videoRef={videoRef}
-                entities={entities}
-                evidence={evidence}
-                isAnalyzing={isAnalyzing}
-                fps={fps}
+                entities={entities.map((e: any) => ({
+                  id: e.id, cls: e.class ?? e.cls, conf: e.confidence ?? e.conf,
+                  x: e.x, y: e.y, w: e.w, h: e.h,
+                  speed: e.speed ?? 0, heading: e.heading ?? 0,
+                }))}
+                alerts={evidence.map((ev: any) => ({
+                  objs: ev.objects, conf: ev.confidence, type: ev.type,
+                }))}
+                active={isAnalyzing}
               />
               {!videoReady && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/50">
