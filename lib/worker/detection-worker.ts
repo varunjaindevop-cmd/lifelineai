@@ -222,10 +222,10 @@ self.onmessage = async (e: MessageEvent) => {
       }
       cleanConfirmBuffer(frameNumber);
 
-      const serializedEntities = validEntities.map(e => {
+      // Serialize ALL entities for ESP boxes (including brand-new age=0)
+      // Detection pipeline uses validEntities (age>=1) but overlay shows everything
+      const serializedEntities = entities.map(e => {
         const k = e.kalman.getState();
-        // Filter: only send near-camera entities to UI
-        // Traffic: bottom 45% only. Isolated/Marketplace: bottom 65%
         const normalizedY = k.y / (bitmap.height || 480);
         const nearThreshold = envMode === "traffic" ? 0.55 : 0.35;
         const isNear = normalizedY > nearThreshold;
@@ -240,7 +240,7 @@ self.onmessage = async (e: MessageEvent) => {
           speedHistory: [...e.speedHistory],
           headingHistory: [...e.headingHistory],
           aspectHistory: [...e.aspectHistory],
-          isNear, // flag for overlay to decide whether to draw
+          isNear,
         };
       });
 

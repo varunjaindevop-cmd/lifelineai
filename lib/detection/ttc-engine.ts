@@ -482,12 +482,21 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
       if (!wasMoving || !isNowStopped) continue;
 
       const nearby = [...vehicles, ...persons].filter(e =>
-        e.id !== v.id && e.age >= 1 && dist(v, e) < combinedR(v, e) * 4
+        e.id !== v.id && e.age >= 1 && dist(v, e) < combinedR(v, e) * 3
       );
 
       for (const n of nearby) {
+        // CRITICAL: nearby entity must have also been moving recently
+        // A person just standing there is a bystander, not a collision partner
+        const nWasMoving = n.speedHistory.length >= 3
+          ? Math.max(...n.speedHistory.slice(0, 3)) > 0.3
+          : false;
         const nSlow = n.speed < 0.5;
         if (!nSlow) continue;
+        // If the nearby entity was NEVER moving, it's a bystander — skip
+        // Exception: if it's a vehicle that decelerated (it was part of the collision)
+        const nDecelerated = hasDecelerated(n);
+        if (!nWasMoving && !nDecelerated) continue;
 
         let wasApproaching = false;
         if (v.positions.length >= 3 && n.positions.length >= 3) {
@@ -497,19 +506,20 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
           const prevBy = n.positions[n.positions.length - 3].y;
           const prevD = Math.sqrt((prevAx - prevBx) ** 2 + (prevAy - prevBy) ** 2);
           const curD = dist(v, n);
-          wasApproaching = prevD > curD + 2;
+          wasApproaching = prevD > curD + 5;
         }
+        // Both must have been approaching each other — not just one driving past
+        if (!wasApproaching) continue;
 
         let confidence = 0.50;
         const signals: EvidenceSignal[] = [
           { name: "sudden_stop", value: 1, weight: 0.35, passed: true },
-          { name: "nearby_stopped", value: nSlow ? 1 : 0, weight: 0.25, passed: nSlow },
-          { name: "was_approaching", value: wasApproaching ? 1 : 0, weight: 0.20, passed: wasApproaching },
+          { name: "both_moved", value: 1, weight: 0.25, passed: true },
+          { name: "was_approaching", value: 1, weight: 0.20, passed: true },
           { name: "near_camera", value: distancePriority(v), weight: 0.20, passed: distancePriority(v) > 0.5 },
         ];
 
-        if (wasApproaching) confidence += 0.15;
-        if (n.class === "person") confidence += 0.10;
+        confidence *= (0.7 + 0.3 * distancePriority(v));
 
         confidence *= (0.7 + 0.3 * distancePriority(v));
 
@@ -770,20 +780,18 @@ function detectHeatmapCollision(entities: TrackedEntity[], changeGrid: number[])
   const GRID_ROWS = 8;
   const avgChange = changeGrid.reduce((a, b) => a + b, 0) / changeGrid.length;
 
-  // Find cells with significant change — lower threshold for collision detection
+  // Find cells with significant change
   const hotCells: number[] = [];
   for (let i = 0; i < changeGrid.length; i++) {
-    // Any cell with change > 10% OR > 2x average is suspicious
-    if (changeGrid[i] > 0.08 || changeGrid[i] > avgChange * 1.5) {
+    if (changeGrid[i] > 0.10 || changeGrid[i] > avgChange * 1.5) {
       hotCells.push(i);
     }
   }
 
-  // Find clusters of hot cells (adjacent = collision event, not random noise)
+  // Find clusters of hot cells
   const clusters: number[][] = [];
   let currentCluster = hotCells.length > 0 ? [hotCells[0]] : [];
   for (let i = 1; i < hotCells.length; i++) {
-    // Adjacent if within 2 cells (horizontal or vertical)
     const prevCell = hotCells[i - 1];
     const curCell = hotCells[i];
     const prevRow = Math.floor(prevCell / GRID_COLS);
@@ -801,13 +809,12 @@ function detectHeatmapCollision(entities: TrackedEntity[], changeGrid: number[])
   if (currentCluster.length >= 1) clusters.push(currentCluster);
 
   for (const cluster of clusters) {
-    // Calculate cluster center in normalized coordinates
     const avgCell = cluster.reduce((a, b) => a + b, 0) / cluster.length;
     const gridX = (avgCell % GRID_COLS) / GRID_COLS;
     const gridY = Math.floor(avgCell / GRID_COLS) / GRID_ROWS;
     const maxChange = Math.max(...cluster.map(i => changeGrid[i]));
 
-    // Check if any near-camera entity is near this heatmap spike
+    // Find entities near this heatmap spike
     const nearEntities = entities.filter(e => {
       const k = e.kalman.getState();
       const eNormX = k.x / 640;
@@ -817,9 +824,29 @@ function detectHeatmapCollision(entities: TrackedEntity[], changeGrid: number[])
       return Math.sqrt(dx * dx + dy * dy) < 0.3 && isNearCamera(e);
     });
 
-    if (nearEntities.length === 0) continue;
+    if (nearEntities.length < 2) continue;
 
-    // Check entity states — require at least one entity that was MOVING FAST before stopping
+    // CRITICAL: require at least 2 entities in COLLISION PROXIMITY to each other
+    // A car passing a standing person is NOT a collision — they must be close together
+    let hasCollisionPair = false;
+    let collisionPairDist = Infinity;
+    for (let i = 0; i < nearEntities.length; i++) {
+      for (let j = i + 1; j < nearEntities.length; j++) {
+        const d = dist(nearEntities[i], nearEntities[j]);
+        const cr = combinedR(nearEntities[i], nearEntities[j]);
+        if (d < cr * 2.5) { // within collision distance
+          hasCollisionPair = true;
+          collisionPairDist = d;
+          break;
+        }
+      }
+      if (hasCollisionPair) break;
+    }
+
+    // No collision pair = just objects near the same heatmap spike (e.g., car passing person)
+    if (!hasCollisionPair) continue;
+
+    // Check entity states on the collision pair
     const movingCount = nearEntities.filter(e => wasFast(e)).length;
     const decelCount = nearEntities.filter(e => hasDecelerated(e)).length;
     const deflectedCount = nearEntities.filter(e => {
@@ -832,42 +859,31 @@ function detectHeatmapCollision(entities: TrackedEntity[], changeGrid: number[])
     }).length;
     const stoppedCount = nearEntities.filter(e => e.speed < 0.3).length;
 
-    // Require at least 2 entities OR one entity that was fast and now decelerated/stopped
-    // Prevents false alerts from a standing person near a heatmap spike
-    if (nearEntities.length < 2 && movingCount === 0 && decelCount === 0) continue;
-
     let confidence = 0.35;
-    // Heatmap spike strength
     confidence += 0.15 * Math.min(maxChange * 4, 1);
-    // Cluster size (more hot cells = bigger impact)
     confidence += 0.10 * Math.min(cluster.length / 3, 1);
-    // Moving entities near spike
     if (movingCount >= 1) confidence += 0.10;
-    // Deceleration after spike
-    if (decelCount >= 1) confidence += 0.10;
-    // Direction change (deflection)
+    if (decelCount >= 1) confidence += 0.15;
     if (deflectedCount >= 1) confidence += 0.15;
-    // Stopped after moving
     if (stoppedCount >= 1 && movingCount >= 1) confidence += 0.10;
 
     confidence *= (0.7 + 0.3 * distancePriority(nearEntities[0]));
 
     const signals: EvidenceSignal[] = [
-      { name: "heatmap_spike", value: maxChange, weight: 0.25, passed: maxChange > 0.08 },
-      { name: "entities_near", value: nearEntities.length, weight: 0.20, passed: nearEntities.length >= 1 },
-      { name: "moving_before", value: movingCount, weight: 0.15, passed: movingCount >= 1 },
+      { name: "heatmap_spike", value: maxChange, weight: 0.25, passed: maxChange > 0.10 },
+      { name: "collision_proximity", value: collisionPairDist, weight: 0.25, passed: true },
+      { name: "entities_near", value: nearEntities.length, weight: 0.15, passed: nearEntities.length >= 2 },
       { name: "deceleration", value: decelCount, weight: 0.15, passed: decelCount >= 1 },
-      { name: "deflection", value: deflectedCount, weight: 0.15, passed: deflectedCount >= 1 },
-      { name: "stopped", value: stoppedCount, weight: 0.10, passed: stoppedCount >= 1 },
+      { name: "deflection", value: deflectedCount, weight: 0.20, passed: deflectedCount >= 1 },
     ];
 
-    if (confidence >= 0.45) {
-      console.log(`[TTC] HEATMAP COLLISION: ${nearEntities.length} entities, spike=${maxChange.toFixed(3)}, cluster=${cluster.length}, conf=${confidence.toFixed(3)}`);
+    if (confidence >= 0.50) {
+      console.log(`[TTC] HEATMAP COLLISION: spike=${maxChange.toFixed(3)} pairDist=${collisionPairDist.toFixed(0)} conf=${confidence.toFixed(3)}`);
       evidence.push({
         type: "collision",
         confidence: Math.min(0.85, confidence),
         objects: nearEntities.map(e => e.id),
-        details: `Heatmap: ${cluster.length} hot cells, spike=${maxChange.toFixed(3)}, moving=${movingCount}, decel=${decelCount}, deflect=${deflectedCount}`,
+        details: `Heatmap: spike=${maxChange.toFixed(3)}, pairDist=${collisionPairDist.toFixed(0)}, decel=${decelCount}, deflect=${deflectedCount}`,
         signals,
         sceneContext: "isolated",
       });

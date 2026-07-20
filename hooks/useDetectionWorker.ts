@@ -128,7 +128,7 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
     }
 
     const now = performance.now();
-    if (now - lastFrameTimeRef.current < 200) {
+    if (now - lastFrameTimeRef.current < 100) {
       rafRef.current = requestAnimationFrame(runDetection);
       return;
     }

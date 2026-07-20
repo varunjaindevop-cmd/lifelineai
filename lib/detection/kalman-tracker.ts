@@ -128,7 +128,7 @@ export class MultiObjectTracker {
     // Match detections to existing entities by class + proximity
     for (const entity of Array.from(this.entities.values())) {
       let bestDet = -1;
-      let bestDist = 60;
+      let bestDist = 100; // widened from 60 — COCO-SSD boxes shift between frames
 
       for (let i = 0; i < detections.length; i++) {
         if (matched.has(i)) continue;
