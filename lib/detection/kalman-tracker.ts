@@ -60,6 +60,13 @@ export class KalmanTracker {
   getAcceleration(): number { return Math.sqrt(this.state.ax ** 2 + this.state.ay ** 2); }
   getState(): KalmanState { return { ...this.state }; }
 
+  predict(dt: number = 1): { x: number; y: number } {
+    return {
+      x: this.state.x + this.state.vx * dt + 0.5 * this.state.ax * dt * dt,
+      y: this.state.y + this.state.vy * dt + 0.5 * this.state.ay * dt * dt,
+    };
+  }
+
   private eye(n: number): number[][] {
     const m: number[][] = [];
     for (let i = 0; i < n; i++) { m[i] = []; for (let j = 0; j < n; j++) m[i][j] = i === j ? 1 : 0; }
