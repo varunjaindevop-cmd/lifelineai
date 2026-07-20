@@ -28,37 +28,35 @@ function generateDemoDetections(frame: number, width: number, height: number): D
   const t = frame * 0.05;
   const dets: Detection[] = [];
 
-  // Moving car from left to right
-  const carX = (0.15 + (t * 0.03) % 0.7);
-  const carY = 0.5 + Math.sin(t * 0.5) * 0.05;
-  const carW = 0.08, carH = 0.06;
+  // Vehicle moving left-to-right across the road
+  const carX = 0.1 + ((t * 0.02) % 0.8);
+  const carY = 0.45 + Math.sin(t * 0.3) * 0.03;
+  const carW = 0.07, carH = 0.05;
   dets.push({
     bbox: [carX - carW/2, carY - carH/2, carX + carW/2, carY + carH/2],
-    class: "car", classId: 1, confidence: 0.85 + Math.random() * 0.1,
+    class: "car", classId: 1, confidence: 0.82 + Math.random() * 0.1,
     cx: carX, cy: carY, width: carW, height: carH,
   });
 
-  // Stationary person
-  const personX = 0.7 + Math.sin(t * 0.1) * 0.02;
-  const personY = 0.65;
-  const personW = 0.03, personH = 0.08;
+  // Person standing near the right side of the road
+  const personX = 0.68 + Math.sin(t * 0.08) * 0.015;
+  const personY = 0.55;
+  const personW = 0.025, personH = 0.07;
   dets.push({
     bbox: [personX - personW/2, personY - personH/2, personX + personW/2, personY + personH/2],
-    class: "person", classId: 0, confidence: 0.78 + Math.random() * 0.1,
+    class: "person", classId: 0, confidence: 0.75 + Math.random() * 0.1,
     cx: personX, cy: personY, width: personW, height: personH,
   });
 
-  // Motorcycle (appears after frame 30)
-  if (frame > 30) {
-    const motoX = 0.8 - ((t * 0.02) % 0.3);
-    const motoY = 0.45;
-    const motoW = 0.04, motoH = 0.05;
-    dets.push({
-      bbox: [motoX - motoW/2, motoY - motoH/2, motoX + motoW/2, motoY + motoH/2],
-      class: "motorcycle", classId: 2, confidence: 0.72 + Math.random() * 0.1,
-      cx: motoX, cy: motoY, width: motoW, height: motoH,
-    });
-  }
+  // Motorcycle approaching from the right
+  const motoX = 0.85 - ((t * 0.015) % 0.5);
+  const motoY = 0.42;
+  const motoW = 0.035, motoH = 0.045;
+  dets.push({
+    bbox: [motoX - motoW/2, motoY - motoH/2, motoX + motoW/2, motoY + motoH/2],
+    class: "motorcycle", classId: 2, confidence: 0.7 + Math.random() * 0.1,
+    cx: motoX, cy: motoY, width: motoW, height: motoH,
+  });
 
   return dets;
 }

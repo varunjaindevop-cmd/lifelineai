@@ -7,6 +7,7 @@ export interface DetectionState {
   isReady: boolean;
   isAnalyzing: boolean;
   state: string;
+  backend: string; // "onnx" or "demo"
   entities: SerializedEntity[];
   evidence: SerializedEvidence[];
   changeGrid: number[];
@@ -27,15 +28,20 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const rafRef = useRef<number>(0);
   const lastFrameTimeRef = useRef(0);
-  const fpsCounterRef = useRef({ frames: 0, lastTime: 0 });
-  const lastIncidentFrameRef = useRef(-1); // prevent duplicate incidents
+  const fpsFramesRef = useRef(0);
+  const fpsLastTimeRef = useRef(0);
+  const lastIncidentFrameRef = useRef(-1);
 
   const [state, setState] = useState<DetectionState>({
-    isReady: false, isAnalyzing: false, state: "monitoring",
+    isReady: false, isAnalyzing: false, state: "monitoring", backend: "unknown",
     entities: [], evidence: [], changeGrid: new Array(80).fill(0),
     fps: 0, detectionCount: 0, error: null,
   });
   const [incidents, setIncidents] = useState<Array<{ type: string; severity: string; confidence: number; timestamp: string }>>([]);
+
+  // Keep refs for FPS calculation inside RAF loop
+  const backendRef = useRef("unknown");
+  const fpsDisplayRef = useRef(0);
 
   // Initialize worker
   useEffect(() => {
@@ -47,24 +53,27 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
       switch (msg.type) {
         case "READY":
           console.log("[SAGE] Worker ready, sending INIT...");
-          worker.postMessage({ type: "INIT", envMode: initialMode });
+          worker.postMessage({ type: "INIT", modelPath: "/models/best.onnx" });
           break;
         case "MODEL_LOADED":
           console.log(`[SAGE] Model loaded (backend: ${msg.backend})`);
-          setState(prev => ({ ...prev, isReady: true, error: null }));
+          backendRef.current = msg.backend;
+          setState(prev => ({ ...prev, isReady: true, backend: msg.backend, error: null }));
           break;
         case "MODEL_ERROR":
           console.error("[SAGE] Model error:", msg.error);
-          setState(prev => ({ ...prev, error: msg.error }));
+          setState(prev => ({ ...prev, error: msg.error, backend: "error" }));
           break;
         case "RESULTS": {
-          // FPS
-          fpsCounterRef.current.frames++;
+          // FPS — compute from wall-clock time between RESULTS messages
+          fpsFramesRef.current++;
           const now = Date.now();
-          let fps = 0;
-          if (now - fpsCounterRef.current.lastTime > 1000) {
-            fps = Math.round((fpsCounterRef.current.frames * 1000) / (now - fpsCounterRef.current.lastTime));
-            fpsCounterRef.current = { frames: 0, lastTime: now };
+          let fps = fpsDisplayRef.current;
+          if (now - fpsLastTimeRef.current >= 1000) {
+            fps = Math.round((fpsFramesRef.current * 1000) / (now - fpsLastTimeRef.current));
+            fpsFramesRef.current = 0;
+            fpsLastTimeRef.current = now;
+            fpsDisplayRef.current = fps;
           }
 
           setState(prev => ({
@@ -74,10 +83,9 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
             changeGrid: msg.changeGrid,
             state: msg.state,
             detectionCount: msg.detectionCount,
-            ...(fps > 0 ? { fps } : {}),
+            fps,
           }));
 
-          // Only create incident when state is "alert" AND we haven't already for this frame
           if (msg.state === "alert" && msg.evidence.length > 0 && msg.frame !== lastIncidentFrameRef.current) {
             lastIncidentFrameRef.current = msg.frame;
             const top = msg.evidence[0];
@@ -103,7 +111,7 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
     return () => worker.terminate();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Detection loop: capture frames → send to worker
+  // Detection loop
   const runDetection = useCallback(() => {
     const video = videoRef.current;
     const worker = workerRef.current;
@@ -114,19 +122,20 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
     }
 
     const now = performance.now();
-    if (now - lastFrameTimeRef.current < 250) { // ~4 FPS
+    if (now - lastFrameTimeRef.current < 200) {
       rafRef.current = requestAnimationFrame(runDetection);
       return;
     }
     lastFrameTimeRef.current = now;
 
-    createImageBitmap(video, {
-      resizeWidth: video.videoWidth || 640,
-      resizeHeight: video.videoHeight || 480,
-      resizeQuality: "low",
-    }).then(bitmap => {
-      worker.postMessage({ type: "FRAME", bitmap, frame: Math.floor(now / 250) }, [bitmap as unknown as Transferable]);
-    }).catch(() => {});
+    const vw = video.videoWidth || 640;
+    const vh = video.videoHeight || 480;
+    createImageBitmap(video, { resizeWidth: vw, resizeHeight: vh, resizeQuality: "low" })
+      .then((bitmap) => {
+        const frameNum = Math.floor(now);
+        worker.postMessage({ type: "FRAME", bitmap, frame: frameNum }, [bitmap as unknown as Transferable]);
+      })
+      .catch(() => {});
 
     rafRef.current = requestAnimationFrame(runDetection);
   }, []);
@@ -136,9 +145,11 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
     videoRef.current = video;
     lastFrameTimeRef.current = 0;
     lastIncidentFrameRef.current = -1;
-    fpsCounterRef.current = { frames: 0, lastTime: Date.now() };
+    fpsFramesRef.current = 0;
+    fpsLastTimeRef.current = Date.now();
+    fpsDisplayRef.current = 0;
     setIncidents([]);
-    setState(prev => ({ ...prev, isAnalyzing: true, entities: [], evidence: [], state: "monitoring", error: null }));
+    setState(prev => ({ ...prev, isAnalyzing: true, entities: [], evidence: [], state: "monitoring", fps: 0, error: null }));
     rafRef.current = requestAnimationFrame(runDetection);
   }, [runDetection]);
 
@@ -146,7 +157,7 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
     cancelAnimationFrame(rafRef.current);
     workerRef.current?.postMessage({ type: "STOP" });
     videoRef.current = null;
-    setState(prev => ({ ...prev, isAnalyzing: false, state: "monitoring" }));
+    setState(prev => ({ ...prev, isAnalyzing: false, state: "monitoring", fps: 0 }));
   }, []);
 
   const setMode = useCallback((mode: EnvMode) => {

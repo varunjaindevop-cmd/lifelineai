@@ -61,7 +61,7 @@ export default function VideoAnalysisPage() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const supabase = createClient();
   const detection: UseDetectionWorkerReturn = useDetectionWorker(envMode);
-  const { isReady, isAnalyzing, state, entities, evidence, changeGrid, fps, incidents } = detection;
+  const { isReady, isAnalyzing, state, entities, evidence, changeGrid, fps, incidents, backend } = detection;
   const speedHistoryRef = useRef<Record<number, number[]>>({});
   const confHistoryRef = useRef<number[]>([]);
 
@@ -135,7 +135,7 @@ export default function VideoAnalysisPage() {
     createIncident({ ...latest, latitude: LAT + (Math.random() - 0.5) * 0.01, longitude: LNG + (Math.random() - 0.5) * 0.01 });
   }, [incidents.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Canvas drawing — sized to video display dimensions via CSS, pixel coords via getBoundingClientRect
+  // Canvas drawing — handles object-contain letterboxing correctly
   const drawFrame = useCallback(() => {
     const canvas = canvasRef.current;
     const video = videoRef.current;
@@ -143,38 +143,67 @@ export default function VideoAnalysisPage() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Size canvas to match the video's CSS display size (not intrinsic size)
-    const rect = video.getBoundingClientRect();
-    const displayW = Math.round(rect.width);
-    const displayH = Math.round(rect.height);
-    if (canvas.width !== displayW || canvas.height !== displayH) {
-      canvas.width = displayW;
-      canvas.height = displayH;
-    }
-
     const currentEntities = entitiesRef.current;
     const currentEvidence = evidenceRef.current;
 
+    // The canvas fills the container div (which wraps the video element).
+    // The video has w-full h-auto, so the element IS the right size.
+    // But object-contain may letterbox inside the element if aspect ratios differ.
+    // We compute the actual visible video rect inside the element.
+    const elemRect = video.getBoundingClientRect();
+    const elemW = elemRect.width;
+    const elemH = elemRect.height;
+
+    // Set canvas to match the element exactly
+    if (canvas.width !== Math.round(elemW) || canvas.height !== Math.round(elemH)) {
+      canvas.width = Math.round(elemW);
+      canvas.height = Math.round(elemH);
+    }
+    const displayW = canvas.width;
+    const displayH = canvas.height;
+
     ctx.clearRect(0, 0, displayW, displayH);
 
-    // Scale factor: display coords vs video intrinsic coords
     const videoW = video.videoWidth || 640;
     const videoH = video.videoHeight || 480;
-    const scaleX = displayW / videoW;
-    const scaleY = displayH / videoH;
+
+    // Compute the actual visible video area inside the element (object-contain)
+    const elemAspect = elemW / elemH;
+    const vidAspect = videoW / videoH;
+    let offsetX = 0, offsetY = 0, drawW = elemW, drawH = elemH;
+    if (vidAspect > elemAspect) {
+      // Video is wider than container — height fills, width letterboxes
+      drawW = elemH * vidAspect;
+      offsetX = (elemW - drawW) / 2;
+    } else {
+      // Video is taller than container — width fills, height letterboxes
+      drawH = elemW / vidAspect;
+      offsetY = (elemH - drawH) / 2;
+    }
+
+    // Scale from video intrinsic pixels to the actual visible video area
+    const scaleX = drawW / videoW;
+    const scaleY = drawH / videoH;
 
     for (const entity of currentEntities) {
       if (entity.age < 1) continue;
       const isInvolved = currentEvidence.some(e => e.objects.includes(entity.id));
-      const baseColor = entity.class === "car" ? "#22c55e" : entity.class === "motorcycle" ? "#f59e0b" : "#3b82f6";
+      const baseColor = entity.class === "car" ? "#22c55e"
+        : entity.class === "motorcycle" ? "#f59e0b"
+        : entity.class === "bus" ? "#8b5cf6"
+        : entity.class === "truck" ? "#ec4899"
+        : entity.class === "bicycle" ? "#06b6d4"
+        : entity.class === "fallen_person" ? "#ef4444"
+        : "#3b82f6";
       const color = isInvolved ? "#ef4444" : baseColor;
 
-      // Convert entity coords (in video intrinsic pixels) to display pixels
-      const bx = (entity.x - entity.w / 2) * scaleX;
-      const by = (entity.y - entity.h / 2) * scaleY;
+      // Entity coords are in video intrinsic pixel space (from Kalman tracker)
+      const bx = offsetX + (entity.x - entity.w / 2) * scaleX;
+      const by = offsetY + (entity.y - entity.h / 2) * scaleY;
       const bw = entity.w * scaleX;
       const bh = entity.h * scaleY;
 
+      // Bounding box
       ctx.strokeStyle = color;
       ctx.lineWidth = isInvolved ? 3 : 2;
       ctx.strokeRect(bx, by, bw, bh);
@@ -182,20 +211,36 @@ export default function VideoAnalysisPage() {
       // Corner markers
       const cl = Math.min(8, bw * 0.15, bh * 0.15);
       ctx.lineWidth = 3;
-      [[bx, by + cl, bx, by, bx + cl, by], [bx + bw - cl, by, bx + bw, by, bx + bw, by + cl],
-       [bx, by + bh - cl, bx, by + bh, bx + cl, by + bh], [bx + bw - cl, by + bh, bx + bw, by + bh, bx + bw, by + bh - cl]]
-        .forEach(([x1, y1, x2, y2, x3, y3]) => { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.lineTo(x3, y3); ctx.stroke(); });
+      const corners: [number, number, number, number, number, number][] = [
+        [bx, by + cl, bx, by, bx + cl, by],
+        [bx + bw - cl, by, bx + bw, by, bx + bw, by + cl],
+        [bx, by + bh - cl, bx, by + bh, bx + cl, by + bh],
+        [bx + bw - cl, by + bh, bx + bw, by + bh, bx + bw, by + bh - cl],
+      ];
+      for (const [x1, y1, x2, y2, x3, y3] of corners) {
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.lineTo(x3, y3);
+        ctx.stroke();
+      }
 
       // Trail
-      if (entity.positions.length > 1) {
-        ctx.beginPath(); ctx.strokeStyle = `${color}66`; ctx.lineWidth = 1;
+      if (entity.positions && entity.positions.length > 1) {
+        ctx.beginPath();
+        ctx.strokeStyle = `${color}66`;
+        ctx.lineWidth = 1;
         const trail = entity.positions.slice(-5);
-        trail.forEach((p, i) => { i === 0 ? ctx.moveTo(p.x * scaleX, p.y * scaleY) : ctx.lineTo(p.x * scaleX, p.y * scaleY); });
+        trail.forEach((p, i) => {
+          const tx = offsetX + p.x * scaleX;
+          const ty = offsetY + p.y * scaleY;
+          i === 0 ? ctx.moveTo(tx, ty) : ctx.lineTo(tx, ty);
+        });
         ctx.stroke();
       }
 
       // Label
-      const speedKmh = Math.round(entity.speed * 10);
+      const speedKmh = Math.round(Math.abs(entity.speed) * 10);
       const accelLabel = entity.acceleration < -0.3 ? " BRAKE" : entity.acceleration > 0.3 ? " ACC" : "";
       const label = `#${entity.id} ${entity.class} ${speedKmh}km/h${accelLabel}`;
       ctx.font = `bold ${Math.max(10, 10 * scaleX)}px monospace`;
@@ -213,13 +258,18 @@ export default function VideoAnalysisPage() {
     ctx.fillStyle = "#fff";
     ctx.font = `${Math.max(11, 11 * scaleX)}px Arial`;
     const modeLabel = envMode === "traffic" ? "TRAFFIC" : envMode === "marketplace" ? "MARKETPLACE" : "ISOLATED";
-    ctx.fillText(`${modeLabel} | Objects: ${currentEntities.filter(e => e.age >= 1).length} | FPS: ${fps}`, 8, barY + 14);
-  }, [envMode, fps]);
+    const backendLabel = currentBackendRef.current === "demo" ? " [DEMO]" : "";
+    ctx.fillText(`${modeLabel}${backendLabel} | Objects: ${currentEntities.filter(e => e.age >= 1).length} | FPS: ${currentFpsRef.current}`, 8, barY + 14);
+  }, [envMode]);
 
   const entitiesRef = useRef(entities);
   const evidenceRef = useRef(evidence);
+  const currentFpsRef = useRef(fps);
+  const currentBackendRef = useRef(backend);
   entitiesRef.current = entities;
   evidenceRef.current = evidence;
+  currentFpsRef.current = fps;
+  currentBackendRef.current = backend;
 
   useEffect(() => {
     if (!isAnalyzing) return;
@@ -292,6 +342,9 @@ export default function VideoAnalysisPage() {
                     <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
                     <span className="text-sm font-medium bg-black/60 px-2 py-1 rounded">Tracking {entities.length} objects | {fps} FPS</span>
                   </div>}
+                  {backend === "demo" && isAnalyzing && <div className="absolute top-4 right-4">
+                    <span className="text-sm font-bold bg-yellow-500/90 text-black px-3 py-1 rounded">DEMO MODE - No ONNX model loaded</span>
+                  </div>}
                 </div>
                 <div className="p-4 border-t border-border flex items-center gap-3 flex-wrap">
                   {!isAnalyzing ? (
@@ -326,7 +379,7 @@ export default function VideoAnalysisPage() {
                     </div>
                   ))}
                 </div>
-                <div className="mt-2 text-xs text-muted-foreground">Mode: {envMode} | FPS: {fps}</div>
+                <div className="mt-2 text-xs text-muted-foreground">Mode: {envMode} | Backend: {backend} | FPS: {fps}</div>
               </div>
 
               <div className="bg-card p-4 rounded-xl border border-border">
