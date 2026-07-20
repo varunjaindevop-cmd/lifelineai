@@ -7,7 +7,7 @@
  * Class mapping: 0 person, 1 car, 2 motorcycle, 3 bus, 4 truck, 5 bicycle, 6 fallen_person
  */
 
-import * as ort from "onnxruntime-web";
+import * as ort from "onnxruntime-web/wasm";
 
 // ── Class mapping ────────────────────────────────────────────────
 const CLASS_NAMES: Record<number, string> = {
@@ -43,29 +43,19 @@ let session: ort.InferenceSession | null = null;
 let loading = false;
 
 /**
- * Load the ONNX model. WebGL preferred, WASM fallback.
+ * Load the ONNX model via WASM backend.
  */
 export async function loadModel(modelPath = "/models/best.onnx"): Promise<void> {
   if (session || loading) return;
   loading = true;
 
   try {
-    // Try WebGL first, fall back to WASM
-    let backend: string;
-    try {
-      const backends = (ort.env as any).backends;
-      if (backends?.webgl?.init) await backends.webgl.init();
-      backend = "webgl";
-    } catch {
-      backend = "wasm";
-    }
-
     session = await ort.InferenceSession.create(modelPath, {
-      executionProviders: [backend, "wasm"],
+      executionProviders: ["wasm"],
       graphOptimizationLevel: "all",
     });
 
-    console.log(`[ONNXEngine] Loaded model from ${modelPath} (backend: ${backend})`);
+    console.log(`[ONNXEngine] Loaded model from ${modelPath} (wasm)`);
   } finally {
     loading = false;
   }
