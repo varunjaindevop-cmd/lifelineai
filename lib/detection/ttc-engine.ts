@@ -217,7 +217,13 @@ function detectBikeCrash(pairs: PersonBikePair[], envMode: EnvMode): AccidentEvi
     }
 
     // Only detect if near camera
-    if (!isNearCamera(bike) && !isNearCamera(person)) continue;
+    // Traffic mode: BOTH bike AND person must be near camera (strict)
+    // Other modes: at least one must be near camera
+    if (envMode === "traffic") {
+      if (!isNearCamera(bike) || !isNearCamera(person)) continue;
+    } else {
+      if (!isNearCamera(bike) && !isNearCamera(person)) continue;
+    }
 
     // Score the evidence
     let confidence = 0;
@@ -289,6 +295,8 @@ function detectVehicleFall(entities: TrackedEntity[], envMode: EnvMode): Acciden
   for (const entity of entities) {
     if (entity.age < 2) continue;
     if (entity.class !== "motorcycle" && entity.class !== "car") continue;
+    // Traffic mode: only motorcycles can "fall" (cars don't fall in traffic)
+    if (envMode === "traffic" && entity.class === "car") continue;
     if (!isNearCamera(entity)) continue;
     if (entity.aspectHistory.length < 2) continue;
 
@@ -329,6 +337,10 @@ function detectVehicleFall(entities: TrackedEntity[], envMode: EnvMode): Acciden
 // ========== COLLISION DETECTION ==========
 
 function detectVehicleCollision(entities: TrackedEntity[], envMode: EnvMode): AccidentEvidence[] {
+  // Traffic mode: NO vehicle-to-vehicle collision alerts.
+  // Cars braking near each other is normal traffic. Only bike/person falls matter.
+  if (envMode === "traffic") return [];
+
   const evidence: AccidentEvidence[] = [];
   const candidates = entities.filter(e =>
     e.age >= 1 &&
@@ -345,62 +357,34 @@ function detectVehicleCollision(entities: TrackedEntity[], envMode: EnvMode): Ac
       const cr = combinedR(a, b);
       const iou = calcIoU(a, b);
 
-      if (envMode === "traffic") {
-        // Traffic: overlap + at least one decelerated + close proximity
-        // Relaxed: require EITHER both decelerated OR one decelerated + very close
-        if (iou < 0.08) continue; // lowered from 0.15
-        const aDecel = hasDecelerated(a);
-        const bDecel = hasDecelerated(b);
-        if (!aDecel && !bDecel) continue; // at least one must have decelerated
-        if (d > cr * 2.0) continue; // relaxed from 1.5
-        if (isPassing(a, b)) continue;
+      // Isolated/Marketplace: 5-signal scoring
+      if (isPassing(a, b)) continue;
+      if (d > cr * 3.5) continue;
 
-        const distBoost = Math.max(distancePriority(a), distancePriority(b));
-        let confidence = (0.35 * Math.min(iou * 3, 1) + 0.35 * ((aDecel ? 1 : 0) + (bDecel ? 1 : 0)) / 2 + 0.30 * (d < cr * 1.0 ? 1 : 0.5));
-        confidence *= (0.7 + 0.3 * distBoost);
+      const overlap = Math.min(iou * 4, 1.0);
+      const deceleration = (hasDecelerated(a) ? 0.5 : 0) + (hasDecelerated(b) ? 0.5 : 0);
+      const proximity = d < cr * 0.8 ? 1.0 : d < cr * 1.5 ? 0.7 : d < cr * 2.5 ? 0.3 : 0;
 
+      let confidence = 0.30 * overlap + 0.25 * deceleration + 0.20 * proximity;
+      const distBoost = Math.max(distancePriority(a), distancePriority(b));
+      confidence *= (0.7 + 0.3 * distBoost);
+
+      const passedCount = [overlap > 0.03, deceleration > 0, proximity > 0].filter(Boolean).length;
+      const minScore = envMode === "isolated" ? 0.30 : 0.40;
+
+      if (confidence >= minScore && passedCount >= 2) {
         evidence.push({
           type: "collision",
           confidence: Math.min(0.95, confidence),
           objects: [a.id, b.id],
-          details: `Traffic crash: iou=${iou.toFixed(3)} d=${d.toFixed(0)}px aDecel=${aDecel} bDecel=${bDecel}`,
+          details: `${envMode}: signals=${passedCount}/3 d=${d.toFixed(0)}px`,
           signals: [
-            { name: "overlap", value: iou, weight: 0.35, passed: iou > 0.08 },
-            { name: "deceleration", value: (aDecel ? 1 : 0) + (bDecel ? 1 : 0), weight: 0.35, passed: aDecel || bDecel },
-            { name: "proximity", value: d < cr * 1.0 ? 1 : 0.5, weight: 0.30, passed: d < cr * 2.0 },
+            { name: "overlap", value: overlap, weight: 0.30, passed: overlap > 0.03 },
+            { name: "deceleration", value: deceleration, weight: 0.25, passed: deceleration > 0 },
+            { name: "proximity", value: proximity, weight: 0.20, passed: proximity > 0 },
           ],
-          sceneContext: "traffic",
+          sceneContext: envMode,
         });
-      } else {
-        // Isolated/Marketplace: 5-signal scoring
-        if (isPassing(a, b)) continue;
-        if (d > cr * 3.5) continue;
-
-        const overlap = Math.min(iou * 4, 1.0);
-        const deceleration = (hasDecelerated(a) ? 0.5 : 0) + (hasDecelerated(b) ? 0.5 : 0);
-        const proximity = d < cr * 0.8 ? 1.0 : d < cr * 1.5 ? 0.7 : d < cr * 2.5 ? 0.3 : 0;
-
-        let confidence = 0.30 * overlap + 0.25 * deceleration + 0.20 * proximity;
-        const distBoost = Math.max(distancePriority(a), distancePriority(b));
-        confidence *= (0.7 + 0.3 * distBoost);
-
-        const passedCount = [overlap > 0.03, deceleration > 0, proximity > 0].filter(Boolean).length;
-        const minScore = envMode === "isolated" ? 0.30 : 0.40; // lowered
-
-        if (confidence >= minScore && passedCount >= 2) {
-          evidence.push({
-            type: "collision",
-            confidence: Math.min(0.95, confidence),
-            objects: [a.id, b.id],
-            details: `${envMode}: signals=${passedCount}/3 d=${d.toFixed(0)}px`,
-            signals: [
-              { name: "overlap", value: overlap, weight: 0.30, passed: overlap > 0.03 },
-              { name: "deceleration", value: deceleration, weight: 0.25, passed: deceleration > 0 },
-              { name: "proximity", value: proximity, weight: 0.20, passed: proximity > 0 },
-            ],
-            sceneContext: envMode,
-          });
-        }
       }
     }
   }
@@ -463,78 +447,149 @@ function detectPersonFall(entities: TrackedEntity[], envMode: EnvMode): Accident
 function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): AccidentEvidence[] {
   const evidence: AccidentEvidence[] = [];
 
-  // 1. Sudden stop near another entity — vehicle was moving, suddenly stopped close to something
   const vehicles = entities.filter(e => e.age >= 2 && ["car", "truck", "bus", "motorcycle"].includes(e.class));
   const persons = entities.filter(e => e.age >= 2 && e.class === "person");
+  const bikes = entities.filter(e => e.age >= 2 && (e.class === "motorcycle" || e.class === "bicycle"));
 
-  for (const v of vehicles) {
-    if (!isNearCamera(v)) continue;
-    if (v.speedHistory.length < 4) continue;
+  // 1. Sudden stop near another entity — ONLY for isolated/marketplace
+  // Traffic mode: car braking near another car is NORMAL
+  if (envMode !== "traffic") {
+    for (const v of vehicles) {
+      if (!isNearCamera(v)) continue;
+      if (v.speedHistory.length < 4) continue;
 
-    // Check: was fast recently, now stopped
-    const recentSpeed = Math.max(...v.speedHistory.slice(0, 3));
-    const isNowStopped = v.speed < 0.5; // relaxed from 0.3
-    const wasMoving = recentSpeed > 0.4; // relaxed from 0.8
+      const recentSpeed = Math.max(...v.speedHistory.slice(0, 3));
+      const isNowStopped = v.speed < 0.5;
+      const wasMoving = recentSpeed > 0.4;
 
-    if (!wasMoving || !isNowStopped) continue;
+      if (!wasMoving || !isNowStopped) continue;
 
-    // Find nearby entities (person or vehicle)
-    const nearby = [...vehicles, ...persons].filter(e =>
-      e.id !== v.id && e.age >= 1 && dist(v, e) < combinedR(v, e) * 4 // relaxed from 3
-    );
+      const nearby = [...vehicles, ...persons].filter(e =>
+        e.id !== v.id && e.age >= 1 && dist(v, e) < combinedR(v, e) * 4
+      );
 
-    for (const n of nearby) {
-      // The nearby entity should also be stopped or slow
-      const nSlow = n.speed < 0.5;
-      if (!nSlow) continue;
+      for (const n of nearby) {
+        const nSlow = n.speed < 0.5;
+        if (!nSlow) continue;
 
-      // Check they were approaching before
-      let wasApproaching = false;
-      if (v.positions.length >= 3 && n.positions.length >= 3) {
-        const prevAx = v.positions[v.positions.length - 3].x;
-        const prevAy = v.positions[v.positions.length - 3].y;
-        const prevBx = n.positions[n.positions.length - 3].x;
-        const prevBy = n.positions[n.positions.length - 3].y;
-        const prevD = Math.sqrt((prevAx - prevBx) ** 2 + (prevAy - prevBy) ** 2);
-        const curD = dist(v, n);
-        wasApproaching = prevD > curD + 2;
+        let wasApproaching = false;
+        if (v.positions.length >= 3 && n.positions.length >= 3) {
+          const prevAx = v.positions[v.positions.length - 3].x;
+          const prevAy = v.positions[v.positions.length - 3].y;
+          const prevBx = n.positions[n.positions.length - 3].x;
+          const prevBy = n.positions[n.positions.length - 3].y;
+          const prevD = Math.sqrt((prevAx - prevBx) ** 2 + (prevAy - prevBy) ** 2);
+          const curD = dist(v, n);
+          wasApproaching = prevD > curD + 2;
+        }
+
+        let confidence = 0.50;
+        const signals: EvidenceSignal[] = [
+          { name: "sudden_stop", value: 1, weight: 0.35, passed: true },
+          { name: "nearby_stopped", value: nSlow ? 1 : 0, weight: 0.25, passed: nSlow },
+          { name: "was_approaching", value: wasApproaching ? 1 : 0, weight: 0.20, passed: wasApproaching },
+          { name: "near_camera", value: distancePriority(v), weight: 0.20, passed: distancePriority(v) > 0.5 },
+        ];
+
+        if (wasApproaching) confidence += 0.15;
+        if (n.class === "person") confidence += 0.10;
+
+        confidence *= (0.7 + 0.3 * distancePriority(v));
+
+        if (confidence >= 0.40) {
+          console.log(`[TTC] MOTION ANOMALY: ${v.class}#${v.id} stopped near ${n.class}#${n.id} conf=${confidence.toFixed(3)}`);
+          evidence.push({
+            type: "collision",
+            confidence: Math.min(0.9, confidence),
+            objects: [v.id, n.id],
+            details: `Motion: ${v.class} stopped near ${n.class} (was ${recentSpeed.toFixed(1)}px/f)`,
+            signals,
+            sceneContext: envMode,
+          });
+        }
+      }
+    }
+  }
+
+  // 2. Traffic mode: bike fall detection (bike stopped suddenly + person near)
+  if (envMode === "traffic") {
+    for (const bike of bikes) {
+      if (!isNearCamera(bike)) continue;
+      if (bike.speedHistory.length < 3) continue;
+
+      const recentSpeed = Math.max(...bike.speedHistory.slice(0, 3));
+      const wasMoving = recentSpeed > 0.3;
+      const bikeNowStopped = bike.speed < 0.4;
+      const bikeDecelerated = hasDecelerated(bike);
+
+      // Check if bike fell (AR flip)
+      const bikeAR = bike.aspectHistory.length > 0
+        ? bike.aspectHistory[bike.aspectHistory.length - 1]
+        : 0.5;
+      const bikeWasUpright = bike.aspectHistory.length >= 3
+        ? (bike.aspectHistory[0] + bike.aspectHistory[1]) / 2 < 0.8
+        : false;
+      const bikeNowFallen = bikeAR > 1.0;
+
+      if (!wasMoving || (!bikeNowStopped && !bikeDecelerated && !bikeNowFallen)) continue;
+
+      // Find associated person nearby
+      const nearbyPerson = persons.find(p =>
+        isNearCamera(p) && dist(bike, p) < combinedR(bike, p) * 5
+      );
+
+      let confidence = 0;
+      const signals: EvidenceSignal[] = [];
+
+      if (bikeNowFallen && bikeWasUpright) {
+        confidence += 0.40;
+        signals.push({ name: "bike_fell", value: 1, weight: 0.40, passed: true });
+      } else {
+        signals.push({ name: "bike_fell", value: 0, weight: 0.40, passed: false });
       }
 
-      let confidence = 0.50;
-      const signals: EvidenceSignal[] = [
-        { name: "sudden_stop", value: 1, weight: 0.35, passed: true },
-        { name: "nearby_stopped", value: nSlow ? 1 : 0, weight: 0.25, passed: nSlow },
-        { name: "was_approaching", value: wasApproaching ? 1 : 0, weight: 0.20, passed: wasApproaching },
-        { name: "near_camera", value: distancePriority(v), weight: 0.20, passed: distancePriority(v) > 0.5 },
-      ];
+      if (wasMoving && bikeNowStopped) {
+        confidence += 0.30;
+        signals.push({ name: "bike_stopped", value: 1, weight: 0.30, passed: true });
+      } else if (bikeDecelerated) {
+        confidence += 0.15;
+        signals.push({ name: "bike_stopped", value: 0.5, weight: 0.30, passed: false });
+      } else {
+        signals.push({ name: "bike_stopped", value: 0, weight: 0.30, passed: false });
+      }
 
-      if (wasApproaching) confidence += 0.15;
-      if (n.class === "person") confidence += 0.10; // person nearby = more serious
+      if (nearbyPerson) {
+        confidence += 0.30;
+        signals.push({ name: "person_near", value: 1, weight: 0.30, passed: true });
+      } else {
+        signals.push({ name: "person_near", value: 0, weight: 0.30, passed: false });
+      }
 
-      confidence *= (0.7 + 0.3 * distancePriority(v));
+      confidence *= (0.7 + 0.3 * distancePriority(bike));
 
-      if (confidence >= 0.40) {
-        console.log(`[TTC] MOTION ANOMALY: ${v.class}#${v.id} stopped near ${n.class}#${n.id} conf=${confidence.toFixed(3)}`);
+      const passedCount = signals.filter(s => s.passed).length;
+      if (passedCount >= 2 && confidence >= 0.45) {
+        console.log(`[TTC] TRAFFIC BIKE FALL: bike#${bike.id} conf=${confidence.toFixed(3)} fallen=${bikeNowFallen} stopped=${bikeNowStopped} person=${!!nearbyPerson}`);
         evidence.push({
-          type: "collision",
+          type: "bike_crash",
           confidence: Math.min(0.9, confidence),
-          objects: [v.id, n.id],
-          details: `Motion: ${v.class} stopped near ${n.class} (was ${recentSpeed.toFixed(1)}px/f)`,
+          objects: nearbyPerson ? [bike.id, nearbyPerson.id] : [bike.id],
+          details: `Traffic bike fall: fallen=${bikeNowFallen} stopped=${bikeNowStopped} person=${!!nearbyPerson}`,
           signals,
-          sceneContext: envMode,
+          sceneContext: "traffic",
         });
       }
     }
   }
 
-  // 2. Person suddenly stopped on road (possible fall even if AR hasn't changed yet)
+  // 3. Person suddenly stopped on road — ALL modes (person fall is always suspicious)
   for (const p of persons) {
     if (!isNearCamera(p)) continue;
     if (p.speedHistory.length < 4) continue;
 
-    const wasMoving = Math.max(...p.speedHistory.slice(0, 3)) > 0.3; // relaxed from 0.5
-    const isNowStopped = p.speed < 0.35; // relaxed from 0.2
-    const stoppedFrames = p.speedHistory.slice(0, 5).filter(s => s < 0.4).length; // relaxed from 0.3
+    const wasMoving = Math.max(...p.speedHistory.slice(0, 3)) > 0.3;
+    const isNowStopped = p.speed < 0.35;
+    const stoppedFrames = p.speedHistory.slice(0, 5).filter(s => s < 0.4).length;
 
     if (wasMoving && isNowStopped && stoppedFrames >= 2) {
       // Check if person's position dropped (fell down)
@@ -542,17 +597,27 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
       if (p.positions.length >= 3) {
         const prevY = p.positions[p.positions.length - 3].y;
         const curY = p.positions[p.positions.length - 1].y;
-        positionDropped = curY > prevY + 2; // moved down in frame = closer to ground
+        positionDropped = curY > prevY + 2;
       }
+
+      // Check if person's AR changed (lying down)
+      const personAR = p.aspectHistory.length > 0
+        ? p.aspectHistory[p.aspectHistory.length - 1]
+        : 0.5;
+      const personLying = personAR > 0.85;
+
+      // Traffic mode: require position drop OR lying down (more strict)
+      if (envMode === "traffic" && !positionDropped && !personLying) continue;
 
       let confidence = 0.45;
       if (positionDropped) confidence += 0.15;
+      if (personLying) confidence += 0.10;
 
       const signals: EvidenceSignal[] = [
         { name: "was_moving", value: 1, weight: 0.3, passed: true },
         { name: "now_stopped", value: 1, weight: 0.3, passed: true },
-        { name: "position_dropped", value: positionDropped ? 1 : 0, weight: 0.25, passed: positionDropped },
-        { name: "sustained_stop", value: stoppedFrames >= 3 ? 1 : 0, weight: 0.15, passed: stoppedFrames >= 3 },
+        { name: "position_dropped", value: positionDropped ? 1 : 0, weight: 0.2, passed: positionDropped },
+        { name: "person_lying", value: personLying ? 1 : 0, weight: 0.2, passed: personLying },
       ];
 
       confidence *= (0.7 + 0.3 * distancePriority(p));
@@ -563,7 +628,7 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
           type: "person_fall",
           confidence: Math.min(0.85, confidence),
           objects: [p.id],
-          details: `Person stopped suddenly (was moving, now stationary for ${stoppedFrames} frames)`,
+          details: `Person stopped suddenly (was moving, now stationary for ${stoppedFrames} frames, lying=${personLying})`,
           signals,
           sceneContext: envMode,
         });
@@ -597,8 +662,8 @@ function detectLostEntityAccidents(
   const evidence: AccidentEvidence[] = [];
 
   for (const lost of lostEntities) {
-    // Relaxed: don't require wasMoving — an entity that suddenly vanishes is suspicious regardless
-    // But weight it higher if it was moving
+    // Traffic mode: only care about bikes and persons disappearing (not cars)
+    if (envMode === "traffic" && lost.class !== "motorcycle" && lost.class !== "bicycle" && lost.class !== "person") continue;
 
     console.log(`[TTC] CHECKING LOST ENTITY: ${lost.class}#${lost.id} was ${lost.lastSpeed.toFixed(1)}px/f at (${lost.lastX.toFixed(0)},${lost.lastY.toFixed(0)})`);
 
@@ -613,6 +678,9 @@ function detectLostEntityAccidents(
     console.log(`[TTC] LOST ENTITY ${lost.id}: found ${nearby.length} nearby entities`);
 
     for (const n of nearby) {
+      // Traffic mode: require nearby entity to be a person (bike fell + person nearby)
+      if (envMode === "traffic" && lost.class !== "person" && n.class !== "person") continue;
+
       // Check if the nearby entity also stopped or slowed down
       const nSlowed = n.speed < 0.6 || hasDecelerated(n); // relaxed
       if (!nSlowed) continue;
@@ -637,24 +705,28 @@ function detectLostEntityAccidents(
     }
 
     // Also fire if entity vanished while near camera and was moving (no need for nearby entity)
+    // Traffic mode: only for bikes/persons, not vehicles
     if (lost.wasMoving && lost.lastY > 0.35) { // near camera (bottom 65%)
-      const hasNearby = nearby.some(e => e.speed < 0.6);
-      if (!hasNearby) {
-        // Entity vanished while moving near camera — suspicious on its own
-        let confidence = 0.40;
-        confidence *= (0.7 + 0.3 * (lost.lastY > 0.7 ? 1.0 : lost.lastY > 0.5 ? 0.8 : 0.5));
-        evidence.push({
-          type: "collision",
-          confidence: Math.min(0.75, confidence),
-          objects: [lost.id],
-          details: `Entity vanished: ${lost.class}#${lost.id} was moving near camera, disappeared`,
-          signals: [
-            { name: "entity_lost", value: 1, weight: 0.40, passed: true },
-            { name: "was_moving", value: 1, weight: 0.30, passed: true },
-            { name: "near_camera", value: 1, weight: 0.30, passed: true },
-          ],
-          sceneContext: envMode,
-        });
+      const isTrafficRelevant = envMode !== "traffic" || lost.class === "motorcycle" || lost.class === "bicycle" || lost.class === "person";
+      if (isTrafficRelevant) {
+        const hasNearby = nearby.some(e => e.speed < 0.6);
+        if (!hasNearby) {
+          // Entity vanished while moving near camera — suspicious on its own
+          let confidence = 0.40;
+          confidence *= (0.7 + 0.3 * (lost.lastY > 0.7 ? 1.0 : lost.lastY > 0.5 ? 0.8 : 0.5));
+          evidence.push({
+            type: "collision",
+            confidence: Math.min(0.75, confidence),
+            objects: [lost.id],
+            details: `Entity vanished: ${lost.class}#${lost.id} was moving near camera, disappeared`,
+            signals: [
+              { name: "entity_lost", value: 1, weight: 0.40, passed: true },
+              { name: "was_moving", value: 1, weight: 0.30, passed: true },
+              { name: "near_camera", value: 1, weight: 0.30, passed: true },
+            ],
+            sceneContext: envMode,
+          });
+        }
       }
     }
   }
