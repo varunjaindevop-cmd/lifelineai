@@ -215,110 +215,82 @@ function scoreIsolated(a: TrackedEntity, b: TrackedEntity): { score: number; rea
   const d = dist(a, b);
   const cr = combinedR(a, b);
 
-  // === HARD PROXIMITY FILTER ===
-  // Objects must be VERY close to even consider collision
-  // A person standing 2 car-widths away from a turning car is NOT a collision
-  if (d > cr * 1.3) return null;
+  // Must be within reasonable range
+  if (d > cr * 2.0) return null;
 
   let score = 0;
   const reasons: string[] = [];
 
-  // === CLOSING SPEED CHECK ===
-  // Distance must be actively decreasing (objects approaching each other)
-  const closing = closingSpeed(a, b);
-  if (closing <= 0) {
-    // Not getting closer = not a collision scenario
-    return null;
-  }
-  reasons.push(`closing_${closing.toFixed(1)}`);
-
-  // === ANTI-FALSE-POSITIVE: Direction check ===
+  // Anti-false-positive: direction check
   const relation = getDirectionRelation(a, b);
-
-  // Reject passing and diverging immediately
   if (relation === "passing") return null;
   if (relation === "diverging") return null;
 
-  // === STATIONARY PERSON PROTECTION ===
-  // If one entity is a stationary person and the other is a moving vehicle,
-  // require MUCH stronger evidence (actual touching)
+  // Stationary person protection: if one is a stationary person, require overlap
   const aIsStationaryPerson = a.class === "person" && isStationary(a);
   const bIsStationaryPerson = b.class === "person" && isStationary(b);
   const hasStationaryPerson = aIsStationaryPerson || bIsStationaryPerson;
 
-  // === SIGNAL 1: Overlap (REQUIRED for stationary person scenarios) ===
+  // Signal 1: Overlap (+0.4)
   const overlap = isOverlapping(a, b);
-  if (hasStationaryPerson && !overlap) {
-    // Stationary person + no overlap = just a car passing by
-    return null;
-  }
+  if (hasStationaryPerson && !overlap) return null; // Stationary person + no overlap = passing
   if (overlap) {
-    score += 0.35;
+    score += 0.4;
     reasons.push("overlap");
   }
 
-  // === SIGNAL 2: Touching proximity (REQUIRED for alert) ===
-  // Must be physically very close - touching or nearly touching
-  const touching = d < cr * 0.4;
-  const veryClose = d < cr * 0.6;
+  // Signal 2: Proximity (+0.3 for touching, +0.15 for close)
+  const touching = d < cr * 0.7;
+  const close = d < cr * 1.2;
   if (touching) {
     score += 0.3;
     reasons.push("touching");
-  } else if (veryClose) {
+  } else if (close) {
     score += 0.15;
-    reasons.push("very_close");
-  } else {
-    // Too far apart for collision
-    return null;
+    reasons.push("close");
   }
 
-  // === SIGNAL 3: Direction convergence ===
+  // Signal 3: Direction (+0.2)
   if (relation === "converging") {
     score += 0.2;
     reasons.push("converging");
   } else if (relation === "crossing") {
     score += 0.1;
     reasons.push("crossing");
-  } else {
-    return null;
+  } else if (relation === "one_stopped" || relation === "both_stopped") {
+    score += 0.05;
+    reasons.push("stopped");
   }
 
-  // === SIGNAL 4: Deceleration (at least one must decelerate) ===
+  // Signal 4: Deceleration (+0.2 each, max 0.3)
   const aDecel = hasDecelerated(a);
   const bDecel = hasDecelerated(b);
   if (aDecel && bDecel) {
-    score += 0.5;
+    score += 0.3;
     reasons.push("both_decel");
   } else if (aDecel || bDecel) {
-    score += 0.3;
+    score += 0.2;
     reasons.push(aDecel ? "A_decel" : "B_decel");
-  } else {
-    // No deceleration at all - likely just passing
-    return null;
   }
 
-  // === SIGNAL 5: Sustained approach (must have been approaching) ===
-  if (sustainedApproach(a, b, 3)) {
-    score += 0.15;
+  // Signal 5: Sustained approach (+0.1)
+  if (sustainedApproach(a, b, 2)) {
+    score += 0.1;
     reasons.push("approaching");
   }
 
-  // === STRONG PENALTY: Similar heading (passing behavior) ===
+  // Penalties
   if (a.speed > 1 && b.speed > 1 && angleDiff(a.heading, b.heading) < Math.PI * 0.3) {
-    score -= 0.6;
+    score -= 0.4;
     reasons.push("PENALTY_similar_heading");
   }
-
-  // === STRONG PENALTY: One object much faster (likely just passing) ===
   const speedRatio = Math.max(a.speed, 0.1) / Math.max(b.speed, 0.1);
   if (speedRatio > 3 || speedRatio < 0.33) {
-    score -= 0.3;
+    score -= 0.2;
     reasons.push("PENALTY_speed_mismatch");
   }
 
-  // Minimum threshold - must have strong evidence
-  if (score < 0.7) return null;
-
+  if (score < 0.5) return null;
   return { score: Math.min(score, 1), reason: reasons.join("+") };
 }
 
