@@ -188,12 +188,13 @@ self.onmessage = async (e: MessageEvent) => {
         lostEntities.shift();
       }
 
-      // Speed in km/h
+      // Speed in km/h — use raw detection positions for accuracy
       for (const entity of freshEntities) {
+        // Use raw positions for speed (stored when matched to detection)
+        const lastRaw = { x: entity.rawX, y: entity.rawY };
         if (entity.positions.length >= 2) {
-          const last = entity.positions[entity.positions.length - 1];
-          const prev = entity.positions[entity.positions.length - 2];
-          const pixelDist = Math.sqrt((last.x - prev.x) ** 2 + (last.y - prev.y) ** 2);
+          const prevPos = entity.positions[entity.positions.length - 2];
+          const pixelDist = Math.sqrt((lastRaw.x - prevPos.x) ** 2 + (lastRaw.y - prevPos.y) ** 2);
           (entity as any).speedKmh = Math.round((pixelDist / pixelsPerMeter) * 3 * 3.6);
         } else { (entity as any).speedKmh = 0; }
       }
@@ -222,25 +223,27 @@ self.onmessage = async (e: MessageEvent) => {
       }
       cleanConfirmBuffer(frameNumber);
 
-      // Serialize ALL entities for ESP boxes — but mark stale ones
+      // Serialize ALL entities for ESP — use raw detection position (zero lag)
       const serializedEntities = entities.map(e => {
         const k = e.kalman.getState();
-        const normalizedY = k.y / (bitmap.height || 480);
-        const nearThreshold = envMode === "traffic" ? 0.55 : 0.35;
-        const isNear = normalizedY > nearThreshold;
+        // Use raw detection position for ESP rendering — no Kalman lag
+        const displayX = e.isStale ? k.x : e.rawX;
+        const displayY = e.isStale ? k.y : e.rawY;
+        const displayW = e.isStale ? e.w : e.rawW;
+        const displayH = e.isStale ? e.h : e.rawH;
 
         return {
           id: e.id, class: e.class, confidence: e.confidence,
-          x: k.x, y: k.y, vx: k.vx, vy: k.vy, ax: k.ax, ay: k.ay,
+          x: displayX, y: displayY,
+          vx: k.vx, vy: k.vy, ax: k.ax, ay: k.ay,
           speed: (e as any).speedKmh ?? 0,
           heading: e.heading, acceleration: e.acceleration,
-          w: e.w, h: e.h, age: e.age, confirmedFrames: e.confirmedFrames,
+          w: displayW, h: displayH, age: e.age, confirmedFrames: e.confirmedFrames,
           isStale: e.isStale,
           positions: [...e.positions],
           speedHistory: [...e.speedHistory],
           headingHistory: [...e.headingHistory],
           aspectHistory: [...e.aspectHistory],
-          isNear,
         };
       });
 

@@ -14,7 +14,7 @@ export class KalmanTracker {
   private Q: number;
   private R: number;
 
-  constructor(initialX: number, initialY: number, processNoise = 0.03, measurementNoise = 0.1) {
+  constructor(initialX: number, initialY: number, processNoise = 0.08, measurementNoise = 0.05) {
     this.Q = processNoise;
     this.R = measurementNoise;
     this.state = {
@@ -84,8 +84,12 @@ export interface TrackedEntity {
   w: number; h: number;
   bbox: [number, number, number, number];
   confirmedFrames: number;
-  isStale: boolean;       // true = not matched to a detection this frame
-  lastMatchedFrame: number; // last frame COCO-SSD actually saw this object
+  isStale: boolean;
+  lastMatchedFrame: number;
+  rawX: number;           // raw detection X (no Kalman lag)
+  rawY: number;           // raw detection Y (no Kalman lag)
+  rawW: number;           // raw detection width
+  rawH: number;           // raw detection height
 }
 
 // Two-wheeled vehicles can be misclassified between motorcycle/bicycle by COCO-SSD
@@ -130,6 +134,10 @@ export class MultiObjectTracker {
 
       if (bestDet >= 0) {
         const det = detections[bestDet];
+        entity.rawX = det.cx;
+        entity.rawY = det.cy;
+        entity.rawW = det.w;
+        entity.rawH = det.h;
         entity.kalman.update(det.cx, det.cy);
         entity.w = det.w;
         entity.h = det.h;
@@ -180,6 +188,7 @@ export class MultiObjectTracker {
         bbox: [det.cx - det.w / 2, det.cy - det.h / 2, det.cx + det.w / 2, det.cy + det.h / 2],
         isStale: false,
         lastMatchedFrame: frame,
+        rawX: det.cx, rawY: det.cy, rawW: det.w, rawH: det.h,
       });
     }
 
