@@ -139,14 +139,14 @@ async function processFrame(bitmap: ImageBitmap, frameNumber: number) {
     else consecutiveAnomaly = 0;
 
     let newState = state;
-    if (hasCollision && consecutiveAnomaly >= 3) {
+    if (hasCollision && consecutiveAnomaly >= 4) {
       newState = "alert";
     } else if (!hasCollision) {
       newState = "monitoring";
     }
 
     if (newState === "alert" && state !== "alert" && cooldown <= 0) {
-      cooldown = 150; // 5 seconds at 30fps
+      cooldown = 300; // 10 seconds at 30fps - long cooldown to prevent false alerts
       consecutiveAnomaly = 0;
     }
 
