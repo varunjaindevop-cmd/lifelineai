@@ -224,6 +224,12 @@ self.onmessage = async (e: MessageEvent) => {
 
       const serializedEntities = validEntities.map(e => {
         const k = e.kalman.getState();
+        // Filter: only send near-camera entities to UI
+        // Traffic: bottom 45% only. Isolated/Marketplace: bottom 65%
+        const normalizedY = k.y / (bitmap.height || 480);
+        const nearThreshold = envMode === "traffic" ? 0.55 : 0.35;
+        const isNear = normalizedY > nearThreshold;
+
         return {
           id: e.id, class: e.class, confidence: e.confidence,
           x: k.x, y: k.y, vx: k.vx, vy: k.vy, ax: k.ax, ay: k.ay,
@@ -234,6 +240,7 @@ self.onmessage = async (e: MessageEvent) => {
           speedHistory: [...e.speedHistory],
           headingHistory: [...e.headingHistory],
           aspectHistory: [...e.aspectHistory],
+          isNear, // flag for overlay to decide whether to draw
         };
       });
 

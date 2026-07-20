@@ -16,6 +16,7 @@ interface Entity {
   age: number;
   confirmedFrames: number;
   positions?: { x: number; y: number }[];
+  isNear?: boolean;
 }
 
 interface Evidence {
@@ -122,9 +123,10 @@ export default function DetectionOverlay({
       }
     }
 
-    // Draw entity bounding boxes — show IMMEDIATELY when detected (age >= 0)
+    // Draw entity bounding boxes — only near-camera objects
     for (const entity of currentEntities) {
       if (entity.age < 0) continue;
+      if (entity.isNear === false) continue; // skip far objects
       const isInvolved = currentEvidence.some(e => e.objects.includes(entity.id));
       const baseColor = CLASS_COLORS[entity.class] || "#22c55e";
       const color = isInvolved ? getSeverityColor(currentEvidence.find(e => e.objects.includes(entity.id))?.confidence || 0) : baseColor;
@@ -195,7 +197,7 @@ export default function DetectionOverlay({
     ctx.fillStyle = "#fff";
     ctx.font = `${Math.max(11, 11 * scaleX)}px Arial`;
     ctx.fillText(
-      `Objects: ${currentEntities.filter(e => e.age >= 0).length} | Alerts: ${currentEvidence.length} | FPS: ${fps}`,
+      `Objects: ${currentEntities.filter(e => e.age >= 0 && e.isNear !== false).length} | Alerts: ${currentEvidence.length} | FPS: ${fps}`,
       8,
       barY + 15
     );
