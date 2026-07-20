@@ -273,10 +273,10 @@ function detectVehicleFall(entities: TrackedEntity[], envMode: EnvMode): Acciden
   const evidence: AccidentEvidence[] = [];
 
   for (const entity of entities) {
-    if (entity.age < 4) continue;
+    if (entity.age < 2) continue;
     if (entity.class !== "motorcycle" && entity.class !== "car") continue;
-    if (!isNearCamera(entity)) continue; // only near-camera
-    if (entity.aspectHistory.length < 4) continue;
+    if (!isNearCamera(entity)) continue;
+    if (entity.aspectHistory.length < 2) continue;
 
     const currentAR = entity.aspectHistory[entity.aspectHistory.length - 1];
     const prevAR = (entity.aspectHistory[0] + entity.aspectHistory[1]) / 2;
@@ -317,9 +317,9 @@ function detectVehicleFall(entities: TrackedEntity[], envMode: EnvMode): Acciden
 function detectVehicleCollision(entities: TrackedEntity[], envMode: EnvMode): AccidentEvidence[] {
   const evidence: AccidentEvidence[] = [];
   const candidates = entities.filter(e =>
-    e.age >= 2 &&
+    e.age >= 1 &&
     ["car", "truck", "bus", "motorcycle"].includes(e.class) &&
-    isNearCamera(e) // only near-camera vehicles
+    isNearCamera(e)
   );
 
   for (let i = 0; i < candidates.length; i++) {
@@ -399,9 +399,9 @@ function detectPersonFall(entities: TrackedEntity[], envMode: EnvMode): Accident
   const evidence: AccidentEvidence[] = [];
 
   for (const entity of entities) {
-    if (entity.class !== "person" || entity.age < 3) continue;
-    if (!isNearCamera(entity)) continue; // only near-camera
-    if (entity.aspectHistory.length < 3) continue;
+    if (entity.class !== "person" || entity.age < 2) continue;
+    if (!isNearCamera(entity)) continue;
+    if (entity.aspectHistory.length < 2) continue;
 
     const currentAR = entity.aspectHistory[entity.aspectHistory.length - 1];
     const prevAR = entity.aspectHistory.length >= 3
@@ -441,22 +441,143 @@ function detectPersonFall(entities: TrackedEntity[], envMode: EnvMode): Accident
   return evidence;
 }
 
+// ========== MOTION-BASED ACCIDENT DETECTION ==========
+// Works even when COCO-SSD misses objects (fallen bike, lying person).
+// Detects accidents purely from tracking data: sudden stops, proximity changes, disappearance.
+
+function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): AccidentEvidence[] {
+  const evidence: AccidentEvidence[] = [];
+
+  // 1. Sudden stop near another entity — vehicle was moving, suddenly stopped close to something
+  const vehicles = entities.filter(e => e.age >= 2 && ["car", "truck", "bus", "motorcycle"].includes(e.class));
+  const persons = entities.filter(e => e.age >= 2 && e.class === "person");
+
+  for (const v of vehicles) {
+    if (!isNearCamera(v)) continue;
+    if (v.speedHistory.length < 4) continue;
+
+    // Check: was fast recently, now stopped
+    const recentSpeed = Math.max(...v.speedHistory.slice(0, 3));
+    const isNowStopped = v.speed < 0.3;
+    const wasMoving = recentSpeed > 0.8;
+
+    if (!wasMoving || !isNowStopped) continue;
+
+    // Find nearby entities (person or vehicle)
+    const nearby = [...vehicles, ...persons].filter(e =>
+      e.id !== v.id && e.age >= 1 && dist(v, e) < combinedR(v, e) * 3
+    );
+
+    for (const n of nearby) {
+      // The nearby entity should also be stopped or slow
+      const nSlow = n.speed < 0.5;
+      if (!nSlow) continue;
+
+      // Check they were approaching before
+      let wasApproaching = false;
+      if (v.positions.length >= 3 && n.positions.length >= 3) {
+        const prevAx = v.positions[v.positions.length - 3].x;
+        const prevAy = v.positions[v.positions.length - 3].y;
+        const prevBx = n.positions[n.positions.length - 3].x;
+        const prevBy = n.positions[n.positions.length - 3].y;
+        const prevD = Math.sqrt((prevAx - prevBx) ** 2 + (prevAy - prevBy) ** 2);
+        const curD = dist(v, n);
+        wasApproaching = prevD > curD + 2;
+      }
+
+      let confidence = 0.50;
+      const signals: EvidenceSignal[] = [
+        { name: "sudden_stop", value: 1, weight: 0.35, passed: true },
+        { name: "nearby_stopped", value: nSlow ? 1 : 0, weight: 0.25, passed: nSlow },
+        { name: "was_approaching", value: wasApproaching ? 1 : 0, weight: 0.20, passed: wasApproaching },
+        { name: "near_camera", value: distancePriority(v), weight: 0.20, passed: distancePriority(v) > 0.5 },
+      ];
+
+      if (wasApproaching) confidence += 0.15;
+      if (n.class === "person") confidence += 0.10; // person nearby = more serious
+
+      confidence *= (0.7 + 0.3 * distancePriority(v));
+
+      if (confidence >= 0.45) {
+        console.log(`[TTC] MOTION ANOMALY: ${v.class}#${v.id} stopped near ${n.class}#${n.id} conf=${confidence.toFixed(3)}`);
+        evidence.push({
+          type: "collision",
+          confidence: Math.min(0.9, confidence),
+          objects: [v.id, n.id],
+          details: `Motion: ${v.class} stopped near ${n.class} (was ${recentSpeed.toFixed(1)}px/f)`,
+          signals,
+          sceneContext: envMode,
+        });
+      }
+    }
+  }
+
+  // 2. Person suddenly stopped on road (possible fall even if AR hasn't changed yet)
+  for (const p of persons) {
+    if (!isNearCamera(p)) continue;
+    if (p.speedHistory.length < 4) continue;
+
+    const wasMoving = Math.max(...p.speedHistory.slice(0, 3)) > 0.5;
+    const isNowStopped = p.speed < 0.2;
+    const stoppedFrames = p.speedHistory.slice(0, 5).filter(s => s < 0.3).length;
+
+    if (wasMoving && isNowStopped && stoppedFrames >= 2) {
+      // Check if person's position dropped (fell down)
+      let positionDropped = false;
+      if (p.positions.length >= 3) {
+        const prevY = p.positions[p.positions.length - 3].y;
+        const curY = p.positions[p.positions.length - 1].y;
+        positionDropped = curY > prevY + 2; // moved down in frame = closer to ground
+      }
+
+      let confidence = 0.45;
+      if (positionDropped) confidence += 0.15;
+
+      const signals: EvidenceSignal[] = [
+        { name: "was_moving", value: 1, weight: 0.3, passed: true },
+        { name: "now_stopped", value: 1, weight: 0.3, passed: true },
+        { name: "position_dropped", value: positionDropped ? 1 : 0, weight: 0.25, passed: positionDropped },
+        { name: "sustained_stop", value: stoppedFrames >= 3 ? 1 : 0, weight: 0.15, passed: stoppedFrames >= 3 },
+      ];
+
+      confidence *= (0.7 + 0.3 * distancePriority(p));
+
+      if (confidence >= 0.45) {
+        console.log(`[TTC] PERSON STOPPED: #${p.id} was moving, now stopped conf=${confidence.toFixed(3)}`);
+        evidence.push({
+          type: "person_fall",
+          confidence: Math.min(0.85, confidence),
+          objects: [p.id],
+          details: `Person stopped suddenly (was moving, now stationary for ${stoppedFrames} frames)`,
+          signals,
+          sceneContext: envMode,
+        });
+      }
+    }
+  }
+
+  return evidence;
+}
+
 // ========== MAIN EXPORT ==========
 
 export function detectAccidents(entities: TrackedEntity[], envMode: EnvMode): AccidentEvidence[] {
   let evidence: AccidentEvidence[] = [];
 
-  // 1. Person-bike crash detection (highest priority for traffic)
+  // 1. Motion-based anomalies (works even when objects aren't detected properly)
+  evidence.push(...detectMotionAnomalies(entities, envMode));
+
+  // 2. Person-bike crash detection
   const pairs = findPersonBikePairs(entities);
   evidence.push(...detectBikeCrash(pairs, envMode));
 
-  // 2. Vehicle collision (near-camera only)
+  // 3. Vehicle collision (near-camera only)
   evidence.push(...detectVehicleCollision(entities, envMode));
 
-  // 3. Vehicle fall (near-camera only)
+  // 4. Vehicle fall (near-camera only)
   evidence.push(...detectVehicleFall(entities, envMode));
 
-  // 4. Person fall (near-camera only)
+  // 5. Person fall (near-camera only)
   evidence.push(...detectPersonFall(entities, envMode));
 
   // Deduplicate: keep highest confidence per object set
