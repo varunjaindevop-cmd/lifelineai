@@ -43,17 +43,17 @@ function updatePPM(mode: EnvMode) {
 // Mode-specific thresholds
 function getModeThreshold(mode: EnvMode): number {
   switch (mode) {
-    case "isolated": return 0.40;
-    case "traffic": return 0.65;
-    case "marketplace": return 0.55;
+    case "isolated": return 0.35;
+    case "traffic": return 0.60;
+    case "marketplace": return 0.50;
   }
 }
 
 function getRequiredFrames(mode: EnvMode): number {
   switch (mode) {
-    case "isolated": return 3;
-    case "traffic": return 5;
-    case "marketplace": return 5;
+    case "isolated": return 2; // fast confirmation for isolated
+    case "traffic": return 4;
+    case "marketplace": return 3;
   }
 }
 
@@ -87,11 +87,16 @@ function checkConfirmation(evidence: AccidentEvidence, frame: number): boolean {
   existing.signalHistory.push(evidence.confidence);
   if (existing.signalHistory.length > 10) existing.signalHistory.shift();
 
-  if (existing.lastSeen - existing.firstSeen < requiredFrames) return false;
+  if (existing.lastSeen - existing.firstSeen < requiredFrames) {
+    console.log(`[Confirm] ${evidence.type} frames=${existing.lastSeen - existing.firstSeen}/${requiredFrames} conf=${evidence.confidence.toFixed(3)}`);
+    return false;
+  }
 
   const recent = existing.signalHistory.slice(-3);
   const avgConf = recent.reduce((a, b) => a + b, 0) / recent.length;
-  return avgConf > getModeThreshold(envMode);
+  const threshold = getModeThreshold(envMode);
+  console.log(`[Confirm] ${evidence.type} READY avg=${avgConf.toFixed(3)} threshold=${threshold} pass=${avgConf > threshold}`);
+  return avgConf > threshold;
 }
 
 function cleanConfirmBuffer(frame: number) {
