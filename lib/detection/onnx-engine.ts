@@ -6,7 +6,7 @@
  * Classes: 0 person, 1 car, 2 motorcycle, 3 bus, 4 truck, 5 bicycle, 6 fallen_person
  */
 
-import * as ort from "onnxruntime-web/wasm";
+import * as ort from "onnxruntime-web";
 
 const CLASS_NAMES: Record<number, string> = {
   0: "person",
@@ -19,7 +19,7 @@ const CLASS_NAMES: Record<number, string> = {
 };
 
 export interface Detection {
-  bbox: [number, number, number, number]; // [x1,y1,x2,y2] normalised 0‑1
+  bbox: [number, number, number, number]; // [x1,y1,x2,y2] normalised 0-1
   class: string;
   classId: number;
   confidence: number;
@@ -39,15 +39,36 @@ let loading = false;
 export async function loadModel(modelPath = "/models/best.onnx"): Promise<void> {
   if (session || loading) return;
   loading = true;
+
   console.log(`[ONNX] Loading model from ${modelPath}...`);
+  const t0 = performance.now();
+
   try {
+    // Configure WASM paths for onnxruntime-web
+    ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+
     session = await ort.InferenceSession.create(modelPath, {
       executionProviders: ["wasm"],
       graphOptimizationLevel: "all",
     });
-    console.log(`[ONNX] Model loaded. Inputs:`, session.inputNames, "Outputs:", session.outputNames);
-    const inputMeta = session.inputNames[0] ? session.inputNames[0] : "unknown";
-    console.log(`[ONNX] Input name: ${inputMeta}`);
+
+    const elapsed = (performance.now() - t0).toFixed(0);
+    console.log(
+      `[ONNX] Model loaded in ${elapsed}ms. Inputs:`,
+      session.inputNames,
+      "Outputs:",
+      session.outputNames
+    );
+
+    // Log input shape
+    if (session.inputNames[0]) {
+      const inputMeta = session.inputNames[0];
+      console.log(`[ONNX] Input name: ${inputMeta}`);
+    }
+  } catch (err: any) {
+    console.error(`[ONNX] Failed to load model from ${modelPath}:`, err.message || err);
+    session = null;
+    throw err;
   } finally {
     loading = false;
   }
@@ -57,7 +78,12 @@ export function isModelReady(): boolean {
   return session !== null;
 }
 
-function letterbox(imageData: ImageData): { tensor: ort.Tensor; ratio: number; padX: number; padY: number } {
+function letterbox(imageData: ImageData): {
+  tensor: ort.Tensor;
+  ratio: number;
+  padX: number;
+  padY: number;
+} {
   const { width: srcW, height: srcH } = imageData;
   const scale = Math.min(INPUT_SIZE / srcW, INPUT_SIZE / srcH);
   const newW = Math.round(srcW * scale);
@@ -85,7 +111,12 @@ function letterbox(imageData: ImageData): { tensor: ort.Tensor; ratio: number; p
     chw[2 * n + i] = pixels[px + 2] / 255.0;
   }
 
-  return { tensor: new ort.Tensor("float32", chw, [1, 3, INPUT_SIZE, INPUT_SIZE]), ratio: scale, padX, padY };
+  return {
+    tensor: new ort.Tensor("float32", chw, [1, 3, INPUT_SIZE, INPUT_SIZE]),
+    ratio: scale,
+    padX,
+    padY,
+  };
 }
 
 function nms(boxes: Detection[], iouThresh: number): Detection[] {
@@ -99,10 +130,13 @@ function nms(boxes: Detection[], iouThresh: number): Detection[] {
       if (suppressed.has(j) || boxes[i].classId !== boxes[j].classId) continue;
       const [x1a, y1a, x2a, y2a] = boxes[i].bbox;
       const [x1b, y1b, x2b, y2b] = boxes[j].bbox;
-      const ix1 = Math.max(x1a, x1b), iy1 = Math.max(y1a, y1b);
-      const ix2 = Math.min(x2a, x2b), iy2 = Math.min(y2a, y2b);
+      const ix1 = Math.max(x1a, x1b),
+        iy1 = Math.max(y1a, y1b);
+      const ix2 = Math.min(x2a, x2b),
+        iy2 = Math.min(y2a, y2b);
       const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
-      const areaA = (x2a - x1a) * (y2a - y1a), areaB = (x2b - x1b) * (y2b - y1b);
+      const areaA = (x2a - x1a) * (y2a - y1a),
+        areaB = (x2b - x1b) * (y2b - y1b);
       if (inter / (areaA + areaB - inter + 1e-6) > iouThresh) suppressed.add(j);
     }
   }
@@ -130,28 +164,68 @@ export async function detect(imageData: ImageData): Promise<Detection[]> {
     const w_l = raw[2 * numAnchors + a];
     const h_l = raw[3 * numAnchors + a];
 
-    let bestScore = -Infinity, bestClass = 0;
+    let bestScore = -Infinity,
+      bestClass = 0;
     for (let c = 0; c < numClasses; c++) {
       const score = raw[(4 + c) * numAnchors + a];
-      if (score > bestScore) { bestScore = score; bestClass = c; }
+      if (score > bestScore) {
+        bestScore = score;
+        bestClass = c;
+      }
     }
     if (bestScore < SCORE_THRESHOLD) continue;
 
-    const x1 = Math.max(0, Math.min(1, (cx_l - w_l / 2 - padX) / ratio / imageData.width));
-    const y1 = Math.max(0, Math.min(1, (cy_l - h_l / 2 - padY) / ratio / imageData.height));
-    const x2 = Math.max(0, Math.min(1, (cx_l + w_l / 2 - padX) / ratio / imageData.width));
-    const y2 = Math.max(0, Math.min(1, (cy_l + h_l / 2 - padY) / ratio / imageData.height));
-    const w = x2 - x1, h = y2 - y1;
+    const x1 = Math.max(
+      0,
+      Math.min(1, (cx_l - w_l / 2 - padX) / ratio / imageData.width)
+    );
+    const y1 = Math.max(
+      0,
+      Math.min(1, (cy_l - h_l / 2 - padY) / ratio / imageData.height)
+    );
+    const x2 = Math.max(
+      0,
+      Math.min(1, (cx_l + w_l / 2 - padX) / ratio / imageData.width)
+    );
+    const y2 = Math.max(
+      0,
+      Math.min(1, (cy_l + h_l / 2 - padY) / ratio / imageData.height)
+    );
+    const w = x2 - x1,
+      h = y2 - y1;
     if (w < 0.005 || h < 0.005) continue;
 
-    candidates.push({ bbox: [x1, y1, x2, y2], class: CLASS_NAMES[bestClass] || `c${bestClass}`, classId: bestClass, confidence: bestScore, cx: (x1 + x2) / 2, cy: (y1 + y2) / 2, width: w, height: h });
+    candidates.push({
+      bbox: [x1, y1, x2, y2],
+      class: CLASS_NAMES[bestClass] || `c${bestClass}`,
+      classId: bestClass,
+      confidence: bestScore,
+      cx: (x1 + x2) / 2,
+      cy: (y1 + y2) / 2,
+      width: w,
+      height: h,
+    });
   }
 
   const result = nms(candidates, IOU_THRESHOLD);
-  console.log(`[ONNX] Inference: ${(performance.now() - t0).toFixed(1)}ms, raw=${numAnchors} anchors, candidates=${candidates.length}, after NMS=${result.length}`);
+  const elapsed = (performance.now() - t0).toFixed(1);
+  console.log(
+    `[ONNX] Inference: ${elapsed}ms, raw=${numAnchors} anchors, candidates=${candidates.length}, after NMS=${result.length}`
+  );
   return result;
 }
 
-export function toPixelDetections(dets: Detection[], frameW: number, frameH: number) {
-  return dets.map(d => ({ class: d.class, cx: d.cx * frameW, cy: d.cy * frameH, w: d.width * frameW, h: d.height * frameH, confidence: d.confidence }));
+export function toPixelDetections(
+  dets: Detection[],
+  frameW: number,
+  frameH: number
+) {
+  return dets.map((d) => ({
+    class: d.class,
+    cx: d.cx * frameW,
+    cy: d.cy * frameH,
+    w: d.width * frameW,
+    h: d.height * frameH,
+    confidence: d.confidence,
+  }));
 }

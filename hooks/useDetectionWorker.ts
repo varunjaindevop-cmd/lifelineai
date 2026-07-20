@@ -125,7 +125,7 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
       resizeHeight: video.videoHeight || 480,
       resizeQuality: "low",
     }).then(bitmap => {
-      worker.postMessage({ type: "FRAME", bitmap, frameNumber: Math.floor(now / 250) }, [bitmap as unknown as Transferable]);
+      worker.postMessage({ type: "FRAME", bitmap, frame: Math.floor(now / 250) }, [bitmap as unknown as Transferable]);
     }).catch(() => {});
 
     rafRef.current = requestAnimationFrame(runDetection);

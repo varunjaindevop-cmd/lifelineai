@@ -6,8 +6,9 @@ import { createClient } from "@/lib/supabase/client";
 import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
-import { AlertTriangle, Camera, Building2 } from "lucide-react";
+import { AlertTriangle, Camera, Building2, Flame } from "lucide-react";
 import Link from "next/link";
+import { incidentToHeatPoint } from "@/lib/ai/heatmap";
 
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -60,6 +61,54 @@ function MapEvents() {
   return null;
 }
 
+function HeatmapLayer({ incidents }: { incidents: Incident[] }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (incidents.length === 0) return;
+
+    const points = incidents
+      .filter((i) => i.latitude != null && i.longitude != null)
+      .map(incidentToHeatPoint);
+
+    if (points.length === 0) return;
+
+    // Dynamically import leaflet.heat
+    import("leaflet.heat")
+      .then(() => {
+        const L = require("leaflet");
+        if (!L.heatLayer) return;
+
+        const latLngs = points.map(
+          (p) => [p.lat, p.lng, p.intensity] as [number, number, number]
+        );
+
+        const heatLayer = L.heatLayer(latLngs, {
+          radius: 30,
+          blur: 20,
+          maxZoom: 17,
+          max: 1.0,
+          gradient: {
+            0.0: "#22c55e",
+            0.3: "#eab308",
+            0.6: "#f97316",
+            0.8: "#ef4444",
+            1.0: "#7f1d1d",
+          },
+        }).addTo(map);
+
+        return () => {
+          map.removeLayer(heatLayer);
+        };
+      })
+      .catch(() => {
+        // leaflet.heat not available, skip heatmap
+      });
+  }, [incidents, map]);
+
+  return null;
+}
+
 export default function MapContent() {
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
@@ -67,6 +116,7 @@ export default function MapContent() {
   const [showCameras, setShowCameras] = useState(true);
   const [showIncidents, setShowIncidents] = useState(true);
   const [showHospitals, setShowHospitals] = useState(true);
+  const [showHeatmap, setShowHeatmap] = useState(true);
   const supabase = createClient();
 
   useEffect(() => {
@@ -184,6 +234,17 @@ export default function MapContent() {
             <Building2 size={14} />
             Hospitals ({hospitals.length})
           </button>
+          <button
+            onClick={() => setShowHeatmap(!showHeatmap)}
+            className={`px-3 py-1.5 rounded-lg text-sm flex items-center gap-2 ${
+              showHeatmap
+                ? "bg-orange-500 text-white"
+                : "bg-card border border-border text-muted-foreground"
+            }`}
+          >
+            <Flame size={14} />
+            Heatmap
+          </button>
         </div>
       </div>
 
@@ -198,6 +259,7 @@ export default function MapContent() {
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
           <MapEvents />
+          {showHeatmap && <HeatmapLayer incidents={incidents} />}
 
           {showCameras &&
             cameras.map((camera) => (

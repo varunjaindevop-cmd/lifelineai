@@ -12,6 +12,7 @@ let tracker = new MultiObjectTracker();
 let frameMemory = new FrameMemory();
 let frameCount = 0;
 let modelLoaded = false;
+let demoMode = false;
 
 // Thresholds (configurable from debug page via localStorage)
 let iouThreshold = 0.2;
@@ -21,6 +22,46 @@ let fallConfThreshold = 0.6;
 // Offscreen canvas for bitmap → ImageData conversion
 let offscreen: OffscreenCanvas | null = null;
 let offCtx: OffscreenCanvasRenderingContext2D | null = null;
+
+// ── Demo mode: synthetic detections for pipeline testing ──
+function generateDemoDetections(frame: number, width: number, height: number): Detection[] {
+  const t = frame * 0.05;
+  const dets: Detection[] = [];
+
+  // Moving car from left to right
+  const carX = (0.15 + (t * 0.03) % 0.7);
+  const carY = 0.5 + Math.sin(t * 0.5) * 0.05;
+  const carW = 0.08, carH = 0.06;
+  dets.push({
+    bbox: [carX - carW/2, carY - carH/2, carX + carW/2, carY + carH/2],
+    class: "car", classId: 1, confidence: 0.85 + Math.random() * 0.1,
+    cx: carX, cy: carY, width: carW, height: carH,
+  });
+
+  // Stationary person
+  const personX = 0.7 + Math.sin(t * 0.1) * 0.02;
+  const personY = 0.65;
+  const personW = 0.03, personH = 0.08;
+  dets.push({
+    bbox: [personX - personW/2, personY - personH/2, personX + personW/2, personY + personH/2],
+    class: "person", classId: 0, confidence: 0.78 + Math.random() * 0.1,
+    cx: personX, cy: personY, width: personW, height: personH,
+  });
+
+  // Motorcycle (appears after frame 30)
+  if (frame > 30) {
+    const motoX = 0.8 - ((t * 0.02) % 0.3);
+    const motoY = 0.45;
+    const motoW = 0.04, motoH = 0.05;
+    dets.push({
+      bbox: [motoX - motoW/2, motoY - motoH/2, motoX + motoW/2, motoY + motoH/2],
+      class: "motorcycle", classId: 2, confidence: 0.72 + Math.random() * 0.1,
+      cx: motoX, cy: motoY, width: motoW, height: motoH,
+    });
+  }
+
+  return dets;
+}
 
 // ── IoU ──
 function calcIoU(ax: number, ay: number, aw: number, ah: number, bx: number, by: number, bw: number, bh: number): number {
@@ -103,10 +144,12 @@ self.onmessage = async (e: MessageEvent) => {
       try {
         await loadModel(msg.modelPath || "/models/best.onnx");
         modelLoaded = true;
+        demoMode = false;
         console.log("[Worker] ONNX model loaded successfully");
       } catch (err: any) {
         console.warn("[Worker] Model load failed:", err.message, "— running in demo mode");
         modelLoaded = false;
+        demoMode = true;
       }
       self.postMessage({ type: "MODEL_LOADED", backend: modelLoaded ? "onnx" : "demo" } satisfies WorkerOutput);
       break;
@@ -114,7 +157,7 @@ self.onmessage = async (e: MessageEvent) => {
 
     case "FRAME": {
       const bitmap = msg.bitmap as ImageBitmap;
-      const frameNumber = msg.frame ?? frameCount;
+      const frameNumber = msg.frame ?? msg.frameNumber ?? frameCount;
       frameCount++;
 
       // Convert bitmap → ImageData
@@ -126,7 +169,7 @@ self.onmessage = async (e: MessageEvent) => {
       const imageData = offCtx!.getImageData(0, 0, bitmap.width, bitmap.height);
       bitmap.close();
 
-      // Run inference (or empty array if no model)
+      // Run inference (or demo array if no model)
       let detections: Detection[] = [];
       if (modelLoaded) {
         try {
@@ -134,6 +177,9 @@ self.onmessage = async (e: MessageEvent) => {
         } catch (err) {
           console.error("[Worker] Inference error:", err);
         }
+      } else if (demoMode) {
+        // Demo mode: generate synthetic detections for testing the pipeline
+        detections = generateDemoDetections(frameNumber, imageData.width, imageData.height);
       }
 
       // Convert to pixel space for tracker
