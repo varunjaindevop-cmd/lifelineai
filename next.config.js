@@ -1,4 +1,26 @@
 /** @type {import('next').NextConfig} */
+
+// Webpack minimizer compatible with import.meta (onnxruntime-web WebGPU backend).
+// Delegates to terser with ecma:2020 + module:true.
+class ESMCompatMinimizer {
+  async minify({ code, map, filename }) {
+    const { minify } = require('terser');
+    const result = await minify(code, {
+      ecma: 2020,
+      module: true,
+      compress: { ecma: 2020 },
+      mangle: { ecma: 2020 },
+      sourceMap: map ? { content: map, url: filename } : undefined,
+    });
+    return {
+      code: result.code,
+      map: result.map ? { mappings: result.map.mappings, sources: result.map.sources } : undefined,
+      errors: result.errors || [],
+      warnings: result.warnings || [],
+    };
+  }
+}
+
 const nextConfig = {
   images: {
     remotePatterns: [
@@ -12,26 +34,17 @@ const nextConfig = {
     serverComponentsExternalPackages: ['onnxruntime-web'],
   },
   webpack: (config, { isServer, dev }) => {
-    // Externalize onnxruntime-web on server side
     if (isServer) {
       if (!config.externals) config.externals = [];
       config.externals.push('onnxruntime-web');
     }
 
-    // Fix: onnxruntime-web uses import.meta.url which crashes Terser.
-    // Override the minimizer so Terser parses files as ES modules (ecma 2020).
+    // Swap the JS minimizer so import.meta doesn't crash the build
     if (!dev && config.optimization?.minimizer) {
-      const TerserPlugin = require('terser-webpack-plugin');
-      config.optimization.minimizer = [
-        new TerserPlugin({
-          terserOptions: {
-            ecma: 2020,
-            module: true,
-            compress: { ecma: 2020 },
-            mangle: { ecma: 2020 },
-          },
-        }),
-      ];
+      config.optimization.minimizer = config.optimization.minimizer.map((m) => {
+        if (m && m.constructor && m.constructor.name === 'CssMinimizerPlugin') return m;
+        return new ESMCompatMinimizer();
+      });
     }
 
     return config;
