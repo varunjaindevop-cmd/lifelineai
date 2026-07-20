@@ -402,43 +402,56 @@ function detectPersonFall(entities: TrackedEntity[], envMode: EnvMode): Accident
   const evidence: AccidentEvidence[] = [];
 
   for (const entity of entities) {
-    if (entity.class !== "person" || entity.age < 2) continue;
+    if (entity.class !== "person" || entity.age < 3) continue;
     if (!isNearCamera(entity)) continue;
-    if (entity.aspectHistory.length < 2) continue;
+    if (entity.aspectHistory.length < 5) continue;
 
-    const currentAR = entity.aspectHistory[entity.aspectHistory.length - 1];
-    const prevAR = entity.aspectHistory.length >= 3
-      ? (entity.aspectHistory[0] + entity.aspectHistory[1]) / 2
-      : currentAR;
-    const wasStanding = prevAR < 0.8;
-    const nowLying = currentAR > 0.9;
+    // Require SUSTAINED lying — last 3 frames must all be "lying" AR
+    // This prevents single-frame COCO-SSD jitter from triggering
+    const last3AR = entity.aspectHistory.slice(-3);
+    const allLying = last3AR.every(ar => ar > 0.9);
+    const avgLast3 = last3AR.reduce((a, b) => a + b, 0) / last3AR.length;
 
-    if (wasStanding && nowLying) {
-      const lastY = entity.positions[entity.positions.length - 1]?.y || 0;
-      const prevY = entity.positions.length >= 3 ? entity.positions[entity.positions.length - 3].y : lastY;
-      const dropped = lastY > prevY + 3;
-      const wasMoving = wasFast(entity);
-      const stationary = isStationary(entity);
+    // Previous frames should be "standing" (AR < 0.8)
+    const prevFrames = entity.aspectHistory.slice(0, Math.max(1, entity.aspectHistory.length - 3));
+    const avgPrev = prevFrames.reduce((a, b) => a + b, 0) / prevFrames.length;
+    const wasStanding = avgPrev < 0.8;
+    const nowLying = allLying && avgLast3 > 0.9;
 
-      let confidence = 0.60;
-      if (dropped) confidence += 0.1;
-      if (wasMoving && stationary) confidence += 0.1;
-      confidence *= (0.7 + 0.3 * distancePriority(entity));
+    if (!wasStanding || !nowLying) continue;
 
-      evidence.push({
-        type: "person_fall",
-        confidence: Math.min(0.9, confidence),
-        objects: [entity.id],
-        details: `Fall: AR ${prevAR.toFixed(2)}->${currentAR.toFixed(2)}`,
-        signals: [
-          { name: "aspect_ratio", value: currentAR, weight: 0.4, passed: nowLying },
-          { name: "position_drop", value: dropped ? 1 : 0, weight: 0.3, passed: dropped },
-          { name: "was_moving", value: wasMoving ? 1 : 0, weight: 0.2, passed: wasMoving && stationary },
-          { name: "sustained", value: entity.confirmedFrames >= 2 ? 1 : 0, weight: 0.1, passed: entity.confirmedFrames >= 2 },
-        ],
-        sceneContext: envMode,
-      });
+    // Must have position drop (person actually moved downward in frame)
+    let positionDropped = false;
+    if (entity.positions.length >= 5) {
+      const prevY = entity.positions[entity.positions.length - 5].y;
+      const curY = entity.positions[entity.positions.length - 1].y;
+      positionDropped = curY > prevY + 3;
     }
+
+    const wasMoving = wasFast(entity);
+    const stationary = isStationary(entity);
+
+    // Isolated: require position drop OR (wasMoving AND now stopped)
+    if (envMode === "isolated" && !positionDropped && !(wasMoving && stationary)) continue;
+
+    let confidence = 0.55;
+    if (positionDropped) confidence += 0.15;
+    if (wasMoving && stationary) confidence += 0.10;
+    confidence *= (0.7 + 0.3 * distancePriority(entity));
+
+    evidence.push({
+      type: "person_fall",
+      confidence: Math.min(0.9, confidence),
+      objects: [entity.id],
+      details: `Fall: AR avg${avgPrev.toFixed(2)}->${avgLast3.toFixed(2)} dropped=${positionDropped}`,
+      signals: [
+        { name: "sustained_lying", value: 1, weight: 0.35, passed: true },
+        { name: "was_standing", value: 1, weight: 0.20, passed: true },
+        { name: "position_drop", value: positionDropped ? 1 : 0, weight: 0.25, passed: positionDropped },
+        { name: "was_moving", value: wasMoving ? 1 : 0, weight: 0.20, passed: wasMoving && stationary },
+      ],
+      sceneContext: envMode,
+    });
   }
 
   return evidence;
@@ -589,7 +602,7 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
   // 3. Person suddenly stopped on road — ALL modes (person fall is always suspicious)
   for (const p of persons) {
     if (!isNearCamera(p)) continue;
-    if (p.speedHistory.length < 4) continue;
+    if (p.speedHistory.length < 5) continue;
 
     const wasMoving = Math.max(...p.speedHistory.slice(0, 3)) > 0.3;
     const isNowStopped = p.speed < 0.35;
@@ -598,19 +611,22 @@ function detectMotionAnomalies(entities: TrackedEntity[], envMode: EnvMode): Acc
     if (wasMoving && isNowStopped && stoppedFrames >= 2) {
       // Check if person's position dropped (fell down)
       let positionDropped = false;
-      if (p.positions.length >= 3) {
-        const prevY = p.positions[p.positions.length - 3].y;
+      if (p.positions.length >= 5) {
+        const prevY = p.positions[p.positions.length - 5].y;
         const curY = p.positions[p.positions.length - 1].y;
-        positionDropped = curY > prevY + 2;
+        positionDropped = curY > prevY + 3;
       }
 
-      // Check if person's AR changed (lying down)
-      const personAR = p.aspectHistory.length > 0
-        ? p.aspectHistory[p.aspectHistory.length - 1]
+      // Check if person's AR changed (lying down) — require sustained
+      const last3AR = p.aspectHistory.slice(-3);
+      const avgLast3AR = last3AR.length >= 3
+        ? last3AR.reduce((a, b) => a + b, 0) / last3AR.length
         : 0.5;
-      const personLying = personAR > 0.85;
+      const personLying = avgLast3AR > 0.85;
 
-      // Traffic mode: require position drop OR lying down (more strict)
+      // Isolated mode: require BOTH position drop AND lying down (prevent standing person false alerts)
+      if (envMode === "isolated" && (!positionDropped || !personLying)) continue;
+      // Traffic mode: require position drop OR lying down
       if (envMode === "traffic" && !positionDropped && !personLying) continue;
 
       let confidence = 0.45;
@@ -666,8 +682,10 @@ function detectLostEntityAccidents(
   const evidence: AccidentEvidence[] = [];
 
   for (const lost of lostEntities) {
-    // Traffic mode: only care about bikes and persons disappearing (not cars)
+    // Traffic mode: only care about bikes and persons disappearing
     if (envMode === "traffic" && lost.class !== "motorcycle" && lost.class !== "bicycle" && lost.class !== "person") continue;
+    // Isolated: require entity was moving FAST to prevent false alerts from slow/stationary objects
+    if (envMode === "isolated" && lost.lastSpeed < 0.5) continue;
 
     console.log(`[TTC] CHECKING LOST ENTITY: ${lost.class}#${lost.id} was ${lost.lastSpeed.toFixed(1)}px/f at (${lost.lastX.toFixed(0)},${lost.lastY.toFixed(0)})`);
 
@@ -708,9 +726,11 @@ function detectLostEntityAccidents(
       });
     }
 
-    // Also fire if entity vanished while near camera and was moving (no need for nearby entity)
-    // Traffic mode: only for bikes/persons, not vehicles
-    if (lost.wasMoving && lost.lastY > 0.35) { // near camera (bottom 65%)
+    // Also fire if entity vanished while near camera and was moving fast
+    // Isolated: require high speed (>0.8) to prevent false alerts from slow objects
+    if (lost.wasMoving && lost.lastY > 0.35) {
+      const minSpeed = envMode === "isolated" ? 0.8 : 0.3;
+      if (lost.lastSpeed < minSpeed) continue;
       const isTrafficRelevant = envMode !== "traffic" || lost.class === "motorcycle" || lost.class === "bicycle" || lost.class === "person";
       if (isTrafficRelevant) {
         const hasNearby = nearby.some(e => e.speed < 0.6);
@@ -799,7 +819,7 @@ function detectHeatmapCollision(entities: TrackedEntity[], changeGrid: number[])
 
     if (nearEntities.length === 0) continue;
 
-    // Check entity states
+    // Check entity states — require at least one entity that was MOVING FAST before stopping
     const movingCount = nearEntities.filter(e => wasFast(e)).length;
     const decelCount = nearEntities.filter(e => hasDecelerated(e)).length;
     const deflectedCount = nearEntities.filter(e => {
@@ -811,6 +831,10 @@ function detectHeatmapCollision(entities: TrackedEntity[], changeGrid: number[])
       return (change * 180) / Math.PI > 25;
     }).length;
     const stoppedCount = nearEntities.filter(e => e.speed < 0.3).length;
+
+    // Require at least 2 entities OR one entity that was fast and now decelerated/stopped
+    // Prevents false alerts from a standing person near a heatmap spike
+    if (nearEntities.length < 2 && movingCount === 0 && decelCount === 0) continue;
 
     let confidence = 0.35;
     // Heatmap spike strength
@@ -938,11 +962,15 @@ function detectIsolatedAnomalies(entities: TrackedEntity[]): AccidentEvidence[] 
 
     if (!wasMoving || !isNowStopped) continue;
 
-    // Must be near another entity
+    // Must be near another entity that was ALSO moving (not just a standing person)
     const nearby = [...vehicles, ...persons].filter(e =>
       e.id !== v.id && e.age >= 1 && dist(v, e) < combinedR(v, e) * 4
     );
     if (nearby.length === 0) continue;
+
+    // At least one nearby entity should have been moving too (collision partner, not bystander)
+    const nearbyWasMoving = nearby.some(n => wasFast(n) || hasDecelerated(n) || n.speed < 0.3);
+    if (!nearbyWasMoving) continue;
 
     let confidence = 0.55;
     confidence *= (0.7 + 0.3 * distancePriority(v));
@@ -967,7 +995,7 @@ function detectIsolatedAnomalies(entities: TrackedEntity[]): AccidentEvidence[] 
     if (v.headingHistory.length < 5 || v.speedHistory.length < 5) continue;
 
     const recentSpeed = Math.max(...v.speedHistory.slice(0, 2));
-    if (recentSpeed < 0.5) continue; // must have been moving
+    if (recentSpeed < 0.8) continue; // must have been moving FAST
 
     // Calculate heading change over last 5 frames
     const currentHeading = v.headingHistory[v.headingHistory.length - 1];
@@ -1250,28 +1278,37 @@ function detectTrafficAccidents(
     });
   }
 
-  // 4. Lost entity — only bikes/persons (lost bike near stopped person, or vice versa)
+  // 4. Lost entity — bike/person disappeared while moving near camera
+  // This is the KEY detector for traffic: when COCO-SSD stops seeing a fallen bike,
+  // the entity disappears. A moving bike vanishing = likely fell.
   for (const lost of lostEntities) {
     if (lost.class !== "motorcycle" && lost.class !== "bicycle" && lost.class !== "person") continue;
-    if (lost.lastY < 0.55) continue; // must be in bottom 45% (near camera in traffic)
+    if (lost.lastY < 0.55) continue; // must be in bottom 45% (near camera)
 
-    const nearby = currentEntities(entities, lost.lastX, lost.lastY, 200);
-    for (const n of nearby) {
-      if (n.class !== "person" && lost.class !== "person") continue; // one must be a person
-      if (n.speed > 0.6 && !hasDecelerated(n)) continue;
+    // STANDALONE bike/person disappearance: if it was moving and vanished near camera, alert
+    // Don't require nearby stopped entity — the disappearance IS the evidence
+    if (lost.wasMoving) {
+      let confidence = 0.55;
+      // Closer to bottom of frame = more confident
+      confidence *= (0.7 + 0.3 * (lost.lastY > 0.7 ? 1.0 : lost.lastY > 0.6 ? 0.8 : 0.5));
+      // Faster before disappearance = more confident
+      if (lost.lastSpeed > 0.8) confidence += 0.10;
 
-      let confidence = lost.wasMoving ? 0.60 : 0.45;
-      confidence *= (0.7 + 0.3 * distancePriority(n));
+      // Check if any person is nearby (optional boost)
+      const nearby = currentEntities(entities, lost.lastX, lost.lastY, 250);
+      const nearbyPerson = nearby.find(n => n.class === "person");
+      if (nearbyPerson) confidence += 0.10;
 
+      console.log(`[TTC] TRAFFIC LOST: ${lost.class}#${lost.id} was ${lost.lastSpeed.toFixed(1)}px/f at y=${lost.lastY.toFixed(2)} conf=${confidence.toFixed(3)}`);
       evidence.push({
-        type: "collision",
+        type: lost.class === "person" ? "person_fall" : "bike_crash",
         confidence: Math.min(0.85, confidence),
-        objects: [lost.id, n.id],
-        details: `Lost: ${lost.class}#${lost.id} near ${n.class}#${n.id} (was ${lost.lastSpeed.toFixed(1)}px/f)`,
+        objects: nearbyPerson ? [lost.id, nearbyPerson.id] : [lost.id],
+        details: `Lost ${lost.class}: was moving at ${(lost.lastSpeed * 3.6).toFixed(0)}km/h, disappeared near camera`,
         signals: [
-          { name: "entity_lost", value: 1, weight: 0.35, passed: true },
-          { name: "was_moving", value: lost.wasMoving ? 1 : 0, weight: 0.30, passed: lost.wasMoving },
-          { name: "nearby_stopped", value: 1, weight: 0.35, passed: true },
+          { name: "entity_lost", value: 1, weight: 0.40, passed: true },
+          { name: "was_moving", value: 1, weight: 0.30, passed: true },
+          { name: "near_camera", value: 1, weight: 0.30, passed: true },
         ],
         sceneContext: "traffic",
       });
