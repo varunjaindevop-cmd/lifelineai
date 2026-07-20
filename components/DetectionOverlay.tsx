@@ -123,10 +123,11 @@ export default function DetectionOverlay({
       }
     }
 
-    // Draw entity bounding boxes — ALL detected objects, skip stale
+    // Draw entity bounding boxes — ALL detected objects, stale ones get faded
     for (const entity of currentEntities) {
       if (entity.age < 0) continue;
-      if (entity.isStale) continue; // skip stale entities
+
+      const isStale = entity.isStale;
       const isInvolved = currentEvidence.some(e => e.objects.includes(entity.id));
       const baseColor = CLASS_COLORS[entity.class] || "#22c55e";
       const color = isInvolved ? getSeverityColor(currentEvidence.find(e => e.objects.includes(entity.id))?.confidence || 0) : baseColor;
@@ -136,9 +137,10 @@ export default function DetectionOverlay({
       const bw = entity.w * scaleX;
       const bh = entity.h * scaleY;
 
-      // Bounding box
+      // Bounding box — faded for stale entities
+      ctx.globalAlpha = isStale ? 0.5 : 1.0;
       ctx.strokeStyle = color;
-      ctx.lineWidth = isInvolved ? 3 : 2;
+      ctx.lineWidth = isStale ? 1 : (isInvolved ? 3 : 2);
       ctx.strokeRect(bx, by, bw, bh);
 
       // Corner markers
@@ -187,6 +189,8 @@ export default function DetectionOverlay({
       ctx.fillRect(bx + tw + 12, by - 20, ctx.measureText(idLabel).width + 8, 18);
       ctx.fillStyle = "#facc15";
       ctx.fillText(idLabel, bx + tw + 16, by - 6);
+
+      ctx.globalAlpha = 1.0; // reset for next entity
     }
 
     // Bottom status bar
@@ -197,7 +201,7 @@ export default function DetectionOverlay({
     ctx.fillStyle = "#fff";
     ctx.font = `${Math.max(11, 11 * scaleX)}px Arial`;
     ctx.fillText(
-      `Objects: ${currentEntities.filter(e => e.age >= 0 && !e.isStale).length} | Alerts: ${currentEvidence.length} | FPS: ${fps}`,
+      `Objects: ${currentEntities.filter(e => e.age >= 0).length} | Alerts: ${currentEvidence.length} | FPS: ${fps}`,
       8,
       barY + 15
     );

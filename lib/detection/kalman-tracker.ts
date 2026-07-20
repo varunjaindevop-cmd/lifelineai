@@ -108,9 +108,13 @@ export class MultiObjectTracker {
   update(detections: { class: string; cx: number; cy: number; w: number; h: number; confidence: number }[], frame: number): TrackedEntity[] {
     const matched = new Set<number>();
 
-    // First pass: mark ALL existing entities as stale
+    // First pass: mark ALL existing entities as stale + predict their next position
     for (const entity of this.entities.values()) {
       entity.isStale = true;
+      // Predict forward so the position stays current between detections
+      const predicted = entity.kalman.predict(1);
+      entity.rawX = predicted.x;
+      entity.rawY = predicted.y;
     }
 
     // Match detections to existing entities by class family + proximity

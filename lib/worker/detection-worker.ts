@@ -223,22 +223,17 @@ self.onmessage = async (e: MessageEvent) => {
       }
       cleanConfirmBuffer(frameNumber);
 
-      // Serialize ALL entities for ESP — use raw detection position (zero lag)
+      // Serialize ALL entities for ESP — raw position (fresh) or predicted position (stale)
       const serializedEntities = entities.map(e => {
+        // rawX/rawY: fresh detection pos OR predicted pos (set by tracker.predict)
         const k = e.kalman.getState();
-        // Use raw detection position for ESP rendering — no Kalman lag
-        const displayX = e.isStale ? k.x : e.rawX;
-        const displayY = e.isStale ? k.y : e.rawY;
-        const displayW = e.isStale ? e.w : e.rawW;
-        const displayH = e.isStale ? e.h : e.rawH;
-
         return {
           id: e.id, class: e.class, confidence: e.confidence,
-          x: displayX, y: displayY,
+          x: e.rawX, y: e.rawY,
           vx: k.vx, vy: k.vy, ax: k.ax, ay: k.ay,
           speed: (e as any).speedKmh ?? 0,
           heading: e.heading, acceleration: e.acceleration,
-          w: displayW, h: displayH, age: e.age, confirmedFrames: e.confirmedFrames,
+          w: e.rawW, h: e.rawH, age: e.age, confirmedFrames: e.confirmedFrames,
           isStale: e.isStale,
           positions: [...e.positions],
           speedHistory: [...e.speedHistory],
