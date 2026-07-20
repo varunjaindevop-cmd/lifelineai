@@ -1,5 +1,4 @@
 // Role-based alert routing for Sage
-import { AnomalyResult } from "../ai/types";
 
 export type IncidentType =
   | "vehicle_collision"

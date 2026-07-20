@@ -22,29 +22,30 @@ export interface UseDetectionWorkerReturn extends DetectionState {
   incidents: Array<{ type: string; severity: string; confidence: number; timestamp: string }>;
 }
 
-const COCO_MAP: Record<string, string> = {
-  car: "car", truck: "car", bus: "car",
-  motorcycle: "motorcycle", motorbike: "motorcycle", bicycle: "motorcycle",
-  person: "person",
-};
-
 export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetectionWorkerReturn {
   const workerRef = useRef<Worker | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const modelRef = useRef<any>(null);
   const rafRef = useRef<number>(0);
-  const lastDetectTimeRef = useRef(0);
+  const lastFrameTimeRef = useRef(0);
   const fpsCounterRef = useRef({ frames: 0, lastTime: 0 });
-  const modeRef = useRef<EnvMode>(initialMode);
+  const modelPathRef = useRef("/models/best.onnx");
 
   const [state, setState] = useState<DetectionState>({
-    isReady: false, isAnalyzing: false, state: "monitoring",
-    entities: [], evidence: [], changeGrid: new Array(80).fill(0),
-    fps: 0, detectionCount: 0, error: null,
+    isReady: false,
+    isAnalyzing: false,
+    state: "monitoring",
+    entities: [],
+    evidence: [],
+    changeGrid: new Array(80).fill(0),
+    fps: 0,
+    detectionCount: 0,
+    error: null,
   });
-  const [incidents, setIncidents] = useState<Array<{ type: string; severity: string; confidence: number; timestamp: string }>>([]);
+  const [incidents, setIncidents] = useState<
+    Array<{ type: string; severity: string; confidence: number; timestamp: string }>
+  >([]);
 
-  // Initialize worker
+  // ── Initialize worker + load ONNX model ──
   useEffect(() => {
     const worker = new Worker(
       new URL("@/lib/worker/detection-worker.ts", import.meta.url),
@@ -55,148 +56,183 @@ export function useDetectionWorker(initialMode: EnvMode = "isolated"): UseDetect
       const msg = e.data;
       switch (msg.type) {
         case "READY":
-          worker.postMessage({ type: "INIT", envMode: initialMode });
+          // Send init with model path
+          worker.postMessage({
+            type: "INIT",
+            envMode: initialMode,
+            modelPath: modelPathRef.current,
+          });
           break;
+
         case "MODEL_LOADED":
-          // Worker ready (model loads on main thread)
+          setState((prev) => ({ ...prev, isReady: true, error: null }));
           break;
+
+        case "MODEL_ERROR":
+          setState((prev) => ({
+            ...prev,
+            error: `Model load failed: ${msg.error}`,
+          }));
+          break;
+
         case "RESULTS": {
-          // Calculate FPS
+          // FPS calculation
           fpsCounterRef.current.frames++;
           const now = Date.now();
           let fps = 0;
           if (now - fpsCounterRef.current.lastTime > 1000) {
-            fps = Math.round(fpsCounterRef.current.frames * 1000 / (now - fpsCounterRef.current.lastTime));
+            fps = Math.round(
+              (fpsCounterRef.current.frames * 1000) /
+                (now - fpsCounterRef.current.lastTime)
+            );
             fpsCounterRef.current.frames = 0;
             fpsCounterRef.current.lastTime = now;
           }
 
-          setState(prev => ({
-            ...prev, entities: msg.entities, evidence: msg.evidence,
-            changeGrid: msg.changeGrid, state: msg.state,
+          setState((prev) => ({
+            ...prev,
+            entities: msg.entities,
+            evidence: msg.evidence,
+            changeGrid: msg.changeGrid,
+            state: msg.state,
             detectionCount: msg.detectionCount,
             ...(fps > 0 ? { fps } : {}),
           }));
 
-          if (msg.state === "alert" && msg.evidence.length > 0) {
+          // Fire incident if alert state with evidence
+          if (msg.evidence.length > 0) {
             const top = msg.evidence[0];
-            const severity = top.confidence > 0.8 ? "critical" : "major";
-            let incidentType = "vehicle_collision";
-            if (top.type === "person_fall") incidentType = "pedestrian_collision";
-            else if (top.type === "bike_off_track") incidentType = "vehicle_collision";
+            const severity =
+              top.confidence > 0.8 ? "critical" : top.confidence > 0.6 ? "major" : "minor";
 
-            setIncidents(prev => [...prev, {
-              type: incidentType, severity,
-              confidence: top.confidence, timestamp: new Date().toISOString(),
-            }]);
+            let incidentType = "vehicle_collision";
+            if (top.type === "person_fall") incidentType = "pedestrian_fall";
+
+            setIncidents((prev) => [
+              ...prev,
+              {
+                type: incidentType,
+                severity,
+                confidence: top.confidence,
+                timestamp: new Date().toISOString(),
+              },
+            ]);
           }
           break;
         }
+
         case "ERROR":
-          console.error("[SAGE] Worker:", msg.message);
+          console.error("[SAGE Worker]", msg.message);
           break;
       }
     };
 
     worker.onerror = (err) => {
-      console.error("[SAGE] Worker crashed:", err);
+      console.error("[SAGE Worker] crashed:", err);
+      setState((prev) => ({ ...prev, error: "Worker crashed" }));
     };
 
     workerRef.current = worker;
-
-    // Load TF.js lazily - don't block initial render
-    const loadModel = async () => {
-      try {
-        const [tf, cocoSsd] = await Promise.all([
-          import("@tensorflow/tfjs"),
-          import("@tensorflow-models/coco-ssd"),
-        ]);
-        await tf.ready();
-        modelRef.current = await cocoSsd.load({ base: "lite_mobilenet_v2" });
-        setState(prev => ({ ...prev, isReady: true, error: null }));
-      } catch (e) {
-        console.error("Model load failed:", e);
-        setState(prev => ({ ...prev, error: "AI model failed to load" }));
-      }
-    };
-    // Delay model loading to not block initial render
-    setTimeout(loadModel, 100);
-
     return () => worker.terminate();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Detection loop
+  // ── Detection loop: capture frames → send to worker ──
   const runDetection = useCallback(() => {
     const video = videoRef.current;
     const worker = workerRef.current;
-    const model = modelRef.current;
-    if (!model || !video || !worker) return;
-    if (video.paused || video.ended) return;
-
-    const now = Date.now();
-    // Throttle detection to every 300ms (~3 FPS)
-    if (now - lastDetectTimeRef.current < 300) {
+    if (!video || !worker) return;
+    if (video.paused || video.ended || video.readyState < 2) {
       rafRef.current = requestAnimationFrame(runDetection);
       return;
     }
-    lastDetectTimeRef.current = now;
 
-    // Create ImageBitmap for change detection in worker
+    const now = performance.now();
+    // Throttle to ~4 FPS (250ms between frames)
+    if (now - lastFrameTimeRef.current < 250) {
+      rafRef.current = requestAnimationFrame(runDetection);
+      return;
+    }
+    lastFrameTimeRef.current = now;
+
+    // Capture frame as ImageBitmap (zero-copy transfer to worker)
     createImageBitmap(video, {
       resizeWidth: video.videoWidth || 640,
       resizeHeight: video.videoHeight || 480,
-    }).then(bitmap => {
-      // Run TF.js inference on main thread
-      return model.detect(video).then((preds: any[]) => {
-        const filtered = preds
-          .filter((p: any) => p.class in COCO_MAP && p.score > 0.25)
-          .map((p: any) => {
-            const [x, y, w, h] = p.bbox;
-            return { class: COCO_MAP[p.class], cx: x + w / 2, cy: y + h / 2, w, h, confidence: p.score };
-          });
-
-        // Send detections + bitmap to worker for tracking + change detection
-        worker.postMessage({
-          type: "DETECTIONS",
-          detections: filtered,
-          frame: Math.floor(now / 500),
-          bitmap,
-        }, [bitmap as unknown as Transferable]);
-      }).catch(() => bitmap.close());
-    }).catch(() => {});
+      resizeQuality: "low",
+    })
+      .then((bitmap) => {
+        worker.postMessage(
+          {
+            type: "FRAME",
+            bitmap,
+            frameNumber: Math.floor(now / 250),
+          },
+          [bitmap as unknown as Transferable]
+        );
+      })
+      .catch(() => {});
 
     rafRef.current = requestAnimationFrame(runDetection);
   }, []);
 
-  const startAnalysis = useCallback((video: HTMLVideoElement) => {
-    if (!modelRef.current) {
-      setState(prev => ({ ...prev, error: "AI model still loading..." }));
-      return;
-    }
-    videoRef.current = video;
-    lastDetectTimeRef.current = 0;
-    fpsCounterRef.current = { frames: 0, lastTime: Date.now() };
-    setIncidents([]);
-    setState(prev => ({
-      ...prev, isAnalyzing: true, entities: [], evidence: [],
-      state: "monitoring", error: null,
-    }));
-    rafRef.current = requestAnimationFrame(runDetection);
-  }, [runDetection]);
+  // ── Public API ──
+  const startAnalysis = useCallback(
+    (video: HTMLVideoElement) => {
+      videoRef.current = video;
+      lastFrameTimeRef.current = 0;
+      fpsCounterRef.current = { frames: 0, lastTime: Date.now() };
+      setIncidents([]);
+      setState((prev) => ({
+        ...prev,
+        isAnalyzing: true,
+        entities: [],
+        evidence: [],
+        state: "monitoring",
+        error: null,
+      }));
+      rafRef.current = requestAnimationFrame(runDetection);
+    },
+    [runDetection]
+  );
 
   const stopAnalysis = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
     workerRef.current?.postMessage({ type: "STOP" });
     videoRef.current = null;
-    setState(prev => ({ ...prev, isAnalyzing: false, state: "monitoring" }));
+    setState((prev) => ({
+      ...prev,
+      isAnalyzing: false,
+      state: "monitoring",
+    }));
   }, []);
 
   const setMode = useCallback((mode: EnvMode) => {
-    modeRef.current = mode;
     workerRef.current?.postMessage({ type: "SET_MODE", envMode: mode });
   }, []);
 
+  // Send thresholds from localStorage to worker
+  const syncThresholds = useCallback(() => {
+    try {
+      const raw = localStorage.getItem("sage_debug_thresholds");
+      if (raw && workerRef.current) {
+        const t = JSON.parse(raw);
+        workerRef.current.postMessage({ type: "SET_THRESHOLDS", ...t });
+      }
+    } catch {}
+  }, []);
+
+  // Sync thresholds on mount and periodically
+  useEffect(() => {
+    syncThresholds();
+    const id = setInterval(syncThresholds, 5000);
+    return () => clearInterval(id);
+  }, [syncThresholds]);
+
   return {
-    ...state, startAnalysis, stopAnalysis, setMode, incidents,
+    ...state,
+    startAnalysis,
+    stopAnalysis,
+    setMode,
+    incidents,
   };
 }

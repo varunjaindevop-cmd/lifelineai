@@ -1,128 +1,137 @@
-import { DetectionState, AnomalyResult } from "./types";
+/**
+ * Detection State Machine — gates alert generation.
+ *
+ * States:
+ *   monitoring → watching → confirming → alert → (cooldown) → monitoring
+ *
+ * Thresholds:
+ *   monitoring → watching : one event with confidence > 0.7
+ *   watching  → confirming: continuous event for 0.5s (real time)
+ *   confirming → alert    : continuous evidence for 1 full second
+ *   Any state → monitoring: signal lost or confidence drops
+ *
+ * Cooldown: 5 seconds after alert fires, ignore new events.
+ */
 
-interface StateTransition {
-  from: DetectionState;
-  to: DetectionState;
-  condition: (anomaly: AnomalyResult | null, frameCount: number) => boolean;
+export type DetectionState = "monitoring" | "watching" | "confirming" | "alert";
+
+export interface StateResult {
+  state: DetectionState;
+  shouldAlert: boolean;
+  alertType: string | null;
+  confidence: number;
 }
-
-const transitions: StateTransition[] = [
-  // Monitoring -> Watching: single detection signal
-  {
-    from: "monitoring",
-    to: "watching",
-    condition: (anomaly) => anomaly !== null && anomaly.confidence > 0.2,
-  },
-  // Watching -> Confirming: multiple signals persist
-  {
-    from: "watching",
-    to: "confirming",
-    condition: (anomaly) => anomaly !== null && anomaly.confidence > 0.4,
-  },
-  // Confirming -> Alert: evidence threshold met
-  {
-    from: "confirming",
-    to: "alert",
-    condition: (anomaly) => anomaly !== null && anomaly.confidence > 0.6,
-  },
-  // Watching -> Monitoring: signal decays
-  {
-    from: "watching",
-    to: "monitoring",
-    condition: (anomaly) => anomaly === null || anomaly.confidence < 0.15,
-  },
-  // Confirming -> Watching: signal weakens
-  {
-    from: "confirming",
-    to: "watching",
-    condition: (anomaly) => anomaly === null || anomaly.confidence < 0.3,
-  },
-];
 
 export class DetectionStateMachine {
   private state: DetectionState = "monitoring";
-  private frameCount: number = 0;
-  private alertCooldown: number = 0;
-  private stateStartTime: number = Date.now();
+  private watchStartTime = 0;
+  private confirmStartTime = 0;
+  private lastAlertTime = 0;
+  private lastEventType: string | null = null;
+
+  // Tunable thresholds
+  private watchThreshold = 0.7;
+  private watchDurationMs = 500;    // 0.5 seconds
+  private confirmDurationMs = 1000; // 1 second
+  private cooldownMs = 5000;        // 5 seconds
 
   getState(): DetectionState {
     return this.state;
   }
 
-  getFrameCount(): number {
-    return this.frameCount;
-  }
+  processFrame(
+    evidence: { type: string; confidence: number } | null
+  ): StateResult {
+    const now = Date.now();
+    const hasEvidence = evidence !== null && evidence.confidence > 0;
+    const confidence = evidence?.confidence ?? 0;
+    const eventType = evidence?.type ?? null;
 
-  getTimeInState(): number {
-    return Date.now() - this.stateStartTime;
-  }
-
-  // Process a frame with anomaly detection result
-  processFrame(anomaly: AnomalyResult | null): {
-    state: DetectionState;
-    shouldAlert: boolean;
-    alertType: string | null;
-    confidence: number;
-  } {
-    this.frameCount++;
-
-    // Check cooldown
-    if (this.alertCooldown > 0) {
-      this.alertCooldown--;
-      return {
-        state: this.state,
-        shouldAlert: false,
-        alertType: null,
-        confidence: 0,
-      };
+    // Cooldown check
+    if (now - this.lastAlertTime < this.cooldownMs) {
+      return { state: this.state, shouldAlert: false, alertType: null, confidence: 0 };
     }
 
-    // Try state transitions
-    let transitioned = false;
-    for (const transition of transitions) {
-      if (this.state === transition.from && transition.condition(anomaly, this.frameCount)) {
-        this.state = transition.to;
-        this.stateStartTime = Date.now();
-        transitioned = true;
+    switch (this.state) {
+      case "monitoring":
+        if (hasEvidence && confidence > this.watchThreshold) {
+          this.state = "watching";
+          this.watchStartTime = now;
+          this.lastEventType = eventType;
+        }
         break;
-      }
-    }
 
-    // Check if we should trigger an alert
-    const shouldAlert = this.state === "alert" && transitioned;
-    let alertType: string | null = null;
-    let confidence = 0;
+      case "watching":
+        if (!hasEvidence || confidence < 0.4) {
+          // Signal lost — back to monitoring
+          this.state = "monitoring";
+        } else if (now - this.watchStartTime >= this.watchDurationMs) {
+          // Held long enough — advance to confirming
+          this.state = "confirming";
+          this.confirmStartTime = now;
+          this.lastEventType = eventType;
+        }
+        // else: still watching, keep accumulating
+        break;
 
-    if (shouldAlert && anomaly) {
-      alertType = anomaly.type;
-      confidence = anomaly.confidence;
-      // Set cooldown (60 frames = ~12 seconds at 5fps)
-      this.alertCooldown = 60;
-      // Reset state after alert
-      this.state = "monitoring";
-      this.stateStartTime = Date.now();
+      case "confirming":
+        if (!hasEvidence || confidence < 0.3) {
+          // Signal lost during confirmation
+          this.state = "monitoring";
+        } else if (now - this.confirmStartTime >= this.confirmDurationMs) {
+          // Full confirmation period elapsed — fire alert
+          this.state = "alert";
+          this.lastAlertTime = now;
+          return {
+            state: this.state,
+            shouldAlert: true,
+            alertType: this.lastEventType,
+            confidence,
+          };
+        }
+        // else: still confirming, keep accumulating
+        break;
+
+      case "alert":
+        // Should not stay in alert — immediately return to monitoring
+        this.state = "monitoring";
+        break;
     }
 
     return {
       state: this.state,
-      shouldAlert,
-      alertType,
+      shouldAlert: false,
+      alertType: null,
       confidence,
     };
   }
 
   reset(): void {
     this.state = "monitoring";
-    this.frameCount = 0;
-    this.alertCooldown = 0;
-    this.stateStartTime = Date.now();
+    this.watchStartTime = 0;
+    this.confirmStartTime = 0;
+    this.lastAlertTime = 0;
+    this.lastEventType = null;
+  }
+
+  /** Override thresholds (e.g. from debug page). */
+  setThresholds(opts: {
+    watchThreshold?: number;
+    watchDurationMs?: number;
+    confirmDurationMs?: number;
+    cooldownMs?: number;
+  }) {
+    if (opts.watchThreshold !== undefined) this.watchThreshold = opts.watchThreshold;
+    if (opts.watchDurationMs !== undefined) this.watchDurationMs = opts.watchDurationMs;
+    if (opts.confirmDurationMs !== undefined) this.confirmDurationMs = opts.confirmDurationMs;
+    if (opts.cooldownMs !== undefined) this.cooldownMs = opts.cooldownMs;
   }
 }
 
 // Get severity from confidence
 export function getSeverity(confidence: number): "critical" | "major" | "minor" | "suspicious" {
-  if (confidence > 0.7) return "critical";
-  if (confidence > 0.5) return "major";
-  if (confidence > 0.3) return "minor";
+  if (confidence > 0.8) return "critical";
+  if (confidence > 0.6) return "major";
+  if (confidence > 0.4) return "minor";
   return "suspicious";
 }

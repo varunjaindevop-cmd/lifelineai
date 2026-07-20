@@ -8,6 +8,15 @@ export type WorkerInput =
   | { type: "FRAME"; bitmap: ImageBitmap; frameNumber: number }
   | { type: "SET_MODE"; envMode: EnvMode }
   | { type: "SET_PPM"; pixelsPerMeter: number }
+  | {
+      type: "SET_THRESHOLDS";
+      iouThreshold?: number;
+      speedDropPct?: number;
+      fallConfThreshold?: number;
+      confirmDurationMs?: number;
+      alertDurationMs?: number;
+      cooldownMs?: number;
+    }
   | { type: "STOP" }
   | { type: "DISPOSE" };
 
@@ -52,7 +61,7 @@ export interface SerializedEntity {
 }
 
 export interface SerializedEvidence {
-  type: "collision" | "person_fall" | "bike_off_track" | "scene_anomaly";
+  type: "collision" | "person_fall";
   confidence: number;
   objects: number[];
   details: string;

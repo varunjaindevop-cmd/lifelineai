@@ -61,7 +61,7 @@ export async function middleware(request: NextRequest) {
   const roleRoutes: Record<string, string[]> = {
     user: ["/user"],
     ambulance: ["/ambulance", "/incidents"],
-    admin: ["/admin", "/cameras", "/incidents", "/map"],
+    admin: ["/admin", "/cameras", "/incidents", "/map", "/debug"],
     police: ["/admin", "/incidents", "/map"],
     hospital: ["/hospital", "/incidents"],
   };

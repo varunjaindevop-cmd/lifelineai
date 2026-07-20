@@ -1,187 +1,169 @@
-import { Detection, TrackedObject, AnomalyResult, QualityMetrics } from "./types";
-import { analyzeQuality, getAdaptiveConfig, preprocessImage, applyCLAHE, denoise, sharpen } from "../detection/preprocess";
-import { trackObjects, createNewObjects } from "./object-tracker";
-import { detectAnomalies, estimateSceneContext, SceneContext } from "./anomaly-rules";
+/**
+ * Simplified AccidentDetector — orchestrates the detection pipeline.
+ *
+ * This is the MAIN-THREAD counterpart to the Web Worker.
+ * For the video-based pipeline, this class receives results from the worker
+ * and manages state + alert dispatch to Supabase.
+ *
+ * Deleted: TTC engine, energy analyzer, trajectory predictor, anomaly rules matrix.
+ * Kept: FrameMemory (temporal history), simple collision rules, state machine.
+ */
+
+import { FrameMemory } from "../detection/frame-memory";
 import { DetectionStateMachine, getSeverity } from "./state-machine";
+import { createIncident } from "../alerts/alert-service";
+import { encodeClip, uploadClip, FrameBuffer } from "../detection/clip-capture";
+import { createClient } from "../supabase/client";
+
+export interface Detection {
+  class: string;
+  classId: number;
+  confidence: number;
+  bbox: [number, number, number, number];
+  cx: number;
+  cy: number;
+  width: number;
+  height: number;
+}
+
+export interface TrackedObject {
+  id: number;
+  class: string;
+  confidence: number;
+  speed: number;
+  heading: number;
+  w: number;
+  h: number;
+  age: number;
+  positions: { x: number; y: number }[];
+  speedHistory: number[];
+}
+
+export interface AlertResult {
+  triggered: boolean;
+  type: string | null;
+  confidence: number;
+  severity: string;
+}
+
+export interface ProcessFrameResult {
+  detections: Detection[];
+  trackedObjects: TrackedObject[];
+  state: string;
+  alert: AlertResult | null;
+  evidenceType: string | null;
+}
 
 export class AccidentDetector {
-  private trackedObjects: TrackedObject[] = [];
   private stateMachine: DetectionStateMachine;
-  private previousFrame: ImageData | null = null;
-  private quality: QualityMetrics | null = null;
-  private adaptiveConfig: ReturnType<typeof getAdaptiveConfig> | null = null;
-  private frameCount: number = 0;
-  private pixelsPerMeter: number = 50;
-  private fps: number = 5;
+  private frameBuffer: FrameBuffer;
+  private frameCount = 0;
+  private cameraId: string;
+  private latitude: number;
+  private longitude: number;
 
-  constructor(pixelsPerMeter?: number, fps?: number) {
+  constructor(cameraId: string, latitude: number, longitude: number) {
+    this.cameraId = cameraId;
+    this.latitude = latitude;
+    this.longitude = longitude;
     this.stateMachine = new DetectionStateMachine();
-    if (pixelsPerMeter) this.pixelsPerMeter = pixelsPerMeter;
-    if (fps) this.fps = fps;
+    this.frameBuffer = new FrameBuffer(5, 15); // 5fps, 15s pre-roll
   }
 
-  // Process a single frame and return results
-  processFrame(imageData: ImageData): {
-    detections: Detection[];
-    trackedObjects: TrackedObject[];
-    quality: QualityMetrics | null;
-    adaptiveConfig: ReturnType<typeof getAdaptiveConfig> | null;
+  /**
+   * Process results from the Web Worker.
+   * The worker already did ONNX inference + Kalman tracking + collision detection.
+   * This method runs the state machine and dispatches alerts.
+   */
+  processWorkerResults(workerResults: {
+    entities: any[];
+    evidence: any[];
     state: string;
-    alert: { triggered: boolean; type: string | null; confidence: number; severity: string } | null;
-    sceneChangeScore: number;
-  } {
+  }): ProcessFrameResult {
     this.frameCount++;
 
-    // Analyze quality
-    this.quality = analyzeQuality(imageData);
-    this.adaptiveConfig = getAdaptiveConfig(this.quality);
+    const topEvidence = workerResults.evidence.length > 0 ? workerResults.evidence[0] : null;
 
-    // Preprocess image
-    let processed = imageData;
-    if (this.adaptiveConfig.enableCLAHE) {
-      processed = applyCLAHE(processed);
-    }
-    if (this.adaptiveConfig.enableDenoise) {
-      processed = denoise(processed);
-    }
-    if (this.adaptiveConfig.enableSharpen) {
-      processed = sharpen(processed);
-    }
+    // Feed evidence into state machine
+    const smResult = this.stateMachine.processFrame(
+      topEvidence
+        ? { type: topEvidence.type, confidence: topEvidence.confidence }
+        : null
+    );
 
-    // Calculate scene change score
-    let sceneChangeScore = 0;
-    if (this.previousFrame) {
-      sceneChangeScore = this.calculateSceneChange(this.previousFrame, processed);
-    }
-    this.previousFrame = processed;
-
-    // Detect objects (simplified for demo - in production use YOLO ONNX)
-    const detections = this.detectObjects(processed);
-
-    // Track objects across frames
-    const { tracked, unmatched } = trackObjects(detections, this.trackedObjects);
-    this.trackedObjects = createNewObjects(unmatched, tracked);
-
-    // Calculate speeds for vehicles
-    for (const obj of this.trackedObjects) {
-      if (obj.class === "car" || obj.class === "truck" || obj.class === "bus") {
-        const lastTwo = obj.trajectory.slice(-2);
-        if (lastTwo.length === 2) {
-          const dx = lastTwo[1].x - lastTwo[0].x;
-          const dy = lastTwo[1].y - lastTwo[0].y;
-          const pixelDist = Math.sqrt(dx * dx + dy * dy);
-          const metersPerFrame = pixelDist / this.pixelsPerMeter;
-          obj.speed = Math.round(metersPerFrame * this.fps * 3.6);
-        }
-      }
-    }
-
-    // Detect anomalies with scene context
-    const sceneContext = estimateSceneContext(this.trackedObjects);
-    const anomalies = detectAnomalies(this.trackedObjects, sceneChangeScore, sceneContext);
-    const topAnomaly = anomalies.length > 0 ? anomalies[0] : null;
-
-    // Process through state machine
-    const stateResult = this.stateMachine.processFrame(topAnomaly);
-
-    let alert = null;
-    if (stateResult.shouldAlert && stateResult.alertType) {
+    let alert: AlertResult | null = null;
+    if (smResult.shouldAlert && smResult.alertType) {
       alert = {
         triggered: true,
-        type: stateResult.alertType,
-        confidence: stateResult.confidence,
-        severity: getSeverity(stateResult.confidence),
+        type: smResult.alertType,
+        confidence: smResult.confidence,
+        severity: getSeverity(smResult.confidence),
       };
     }
 
     return {
-      detections,
-      trackedObjects: this.trackedObjects,
-      quality: this.quality,
-      adaptiveConfig: this.adaptiveConfig,
-      state: stateResult.state,
+      detections: [],
+      trackedObjects: workerResults.entities.map((e: any) => ({
+        id: e.id,
+        class: e.class,
+        confidence: e.confidence,
+        speed: e.speed,
+        heading: e.heading,
+        w: e.w,
+        h: e.h,
+        age: e.age,
+        positions: e.positions || [],
+        speedHistory: e.speedHistory || [],
+      })),
+      state: smResult.state,
       alert,
-      sceneChangeScore,
+      evidenceType: topEvidence?.type || null,
     };
   }
 
-  // Simplified object detection (simulated for demo)
-  private detectObjects(imageData: ImageData): Detection[] {
-    const detections: Detection[] = [];
-    const width = imageData.width;
-    const height = imageData.height;
+  /**
+   * Handle a triggered alert — create incident in Supabase and upload clip.
+   */
+  async handleAlert(
+    alert: AlertResult,
+    videoElement: HTMLVideoElement
+  ): Promise<string | null> {
+    if (!alert.triggered || !alert.type) return null;
 
-    // In production, this would run YOLO ONNX inference
-    // For demo, simulate detections with realistic behavior
-    const data = imageData.data;
+    // Capture clip from frame buffer
+    const preFrames = this.frameBuffer.getPreRollFrames();
+    let videoClipUrl: string | undefined;
 
-    // Analyze regions for potential objects
-    const gridSize = 64;
-    for (let y = 0; y < height; y += gridSize) {
-      for (let x = 0; x < width; x += gridSize) {
-        // Sample region brightness and motion
-        let brightness = 0;
-        let pixelCount = 0;
-
-        for (let dy = 0; dy < gridSize && y + dy < height; dy++) {
-          for (let dx = 0; dx < gridSize && x + dx < width; dx++) {
-            const idx = ((y + dy) * width + (x + dx)) * 4;
-            brightness += data[idx] * 0.299 + data[idx + 1] * 0.587 + data[idx + 2] * 0.114;
-            pixelCount++;
-          }
-        }
-        brightness /= pixelCount;
-
-        // Simulate detection based on brightness patterns
-        if (brightness > 80 && brightness < 200 && Math.random() > 0.92) {
-          const isPerson = Math.random() > 0.6;
-          const confidence = 0.4 + Math.random() * 0.5;
-          const bboxSize = isPerson ? 40 + Math.random() * 30 : 60 + Math.random() * 40;
-
-          detections.push({
-            class: isPerson ? "person" : "car",
-            classId: isPerson ? 0 : 2,
-            confidence,
-            bbox: [
-              x + Math.random() * 20,
-              y + Math.random() * 20,
-              x + bboxSize,
-              y + bboxSize * (isPerson ? 2 : 1),
-            ],
-            centerX: x + bboxSize / 2,
-            centerY: y + bboxSize / 2,
-            width: bboxSize,
-            height: bboxSize * (isPerson ? 2 : 1),
-          });
-        }
+    if (preFrames.length > 0) {
+      const clipBlob = await encodeClip(preFrames, [], 640, 480);
+      if (clipBlob) {
+        const supabase = createClient();
+        const tempId = `clip-${Date.now()}`;
+        videoClipUrl = (await uploadClip(supabase, tempId, clipBlob)) || undefined;
       }
     }
 
-    return detections;
+    // Create incident
+    const incidentId = await createIncident({
+      severity: alert.severity,
+      incidentType: alert.type,
+      latitude: this.latitude,
+      longitude: this.longitude,
+      cameraId: this.cameraId,
+      videoClipUrl,
+      detectionConfidence: alert.confidence,
+      detectionData: { source: "worker", frame: this.frameCount },
+    });
+
+    return incidentId;
   }
 
-  // Calculate frame-to-frame change
-  private calculateSceneChange(prev: ImageData, curr: ImageData): number {
-    let diff = 0;
-    const pixels = prev.data.length / 4;
-    const step = 16; // Sample every 16th pixel for speed
-
-    for (let i = 0; i < prev.data.length; i += step * 4) {
-      const prevGray = prev.data[i] * 0.299 + prev.data[i + 1] * 0.587 + prev.data[i + 2] * 0.114;
-      const currGray = curr.data[i] * 0.299 + curr.data[i + 1] * 0.587 + curr.data[i + 2] * 0.114;
-      diff += Math.abs(prevGray - currGray);
-    }
-
-    return diff / (pixels / step) / 255;
-  }
-
-  // Getters
-  getQuality(): QualityMetrics | null {
-    return this.quality;
-  }
-
-  getAdaptiveConfig() {
-    return this.adaptiveConfig;
+  /**
+   * Add a frame to the evidence buffer (called from the main thread when
+   * capturing frames from a <video> element).
+   */
+  addFrame(frame: ImageData): void {
+    this.frameBuffer.addFrame(frame);
   }
 
   getState(): string {
@@ -189,10 +171,12 @@ export class AccidentDetector {
   }
 
   reset(): void {
-    this.trackedObjects = [];
-    this.previousFrame = null;
-    this.quality = null;
     this.frameCount = 0;
     this.stateMachine.reset();
+    this.frameBuffer.clear();
+  }
+
+  getFrameBuffer(): FrameBuffer {
+    return this.frameBuffer;
   }
 }

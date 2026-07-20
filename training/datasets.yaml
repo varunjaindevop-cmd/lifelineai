@@ -1,24 +1,17 @@
-# Indian Road Accident Detection Dataset Configuration
-# Custom YOLOv8n training for SAGE accident detection system
+# SAGE Accident Detection — Unified 7-class YOLOv8n config
+# Class order MUST match the ONNX engine mapping in onnx-engine.ts
 
-# Dataset paths (relative to this file)
-# After running prepare_dataset.py, these will point to downloaded data
 train: ./data/train/images
 val: ./data/val/images
 test: ./data/test/images
 
-# Number of classes
-nc: 10
+nc: 7
 
-# Class names
 names:
-  0: car
-  1: truck
-  2: bus
-  3: motorcycle
-  4: bicycle
-  5: person
-  6: bike_fallen
-  7: person_down
-  8: vehicle_fire
-  9: debris
+  0: person
+  1: car
+  2: motorcycle
+  3: bus
+  4: truck
+  5: bicycle
+  6: fallen_person
