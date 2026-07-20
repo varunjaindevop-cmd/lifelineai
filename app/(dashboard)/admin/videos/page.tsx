@@ -69,12 +69,21 @@ export default function VideoAnalysisPage() {
     if (!isAnalyzing || entities.length === 0) return;
     const newHistory = { ...speedHistoryRef.current };
     entities.filter(e => e.age >= 1).forEach(e => {
-      const speed = Math.round(Math.abs(e.speed) * 10);
+      // speed is now in km/h from the worker
+      const speed = typeof e.speed === "number" ? Math.round(e.speed) : 0;
       if (!newHistory[e.id]) newHistory[e.id] = [];
       newHistory[e.id] = [...newHistory[e.id].slice(-19), speed];
     });
     speedHistoryRef.current = newHistory;
-    if (evidence.length > 0) confHistoryRef.current = [...confHistoryRef.current.slice(-19), evidence[0].confidence * 100];
+    // Track confidence trend from ALL evidence (not just alerts)
+    if (evidence.length > 0) {
+      confHistoryRef.current = [...confHistoryRef.current.slice(-19), evidence[0].confidence * 100];
+    } else {
+      // Show 0 confidence when no evidence (so the chart isn't empty)
+      if (confHistoryRef.current.length > 0) {
+        confHistoryRef.current = [...confHistoryRef.current.slice(-19), 0];
+      }
+    }
   }, [entities, evidence, isAnalyzing]);
 
   useEffect(() => {
@@ -239,8 +248,8 @@ export default function VideoAnalysisPage() {
         ctx.stroke();
       }
 
-      // Label
-      const speedKmh = Math.round(Math.abs(entity.speed) * 10);
+      // Label — speed is now in km/h from the worker
+      const speedKmh = typeof entity.speed === "number" ? Math.round(entity.speed) : 0;
       const accelLabel = entity.acceleration < -0.3 ? " BRAKE" : entity.acceleration > 0.3 ? " ACC" : "";
       const label = `#${entity.id} ${entity.class} ${speedKmh}km/h${accelLabel}`;
       ctx.font = `bold ${Math.max(10, 10 * scaleX)}px monospace`;
@@ -421,7 +430,7 @@ export default function VideoAnalysisPage() {
                           <span className={accelColor}>{accelLabel}</span>
                         </div>
                         <div className="flex gap-2 text-muted-foreground flex-wrap mt-1">
-                          <span>{Math.round(Math.abs(b.speed) * 10)}km/h</span>
+                          <span>{typeof b.speed === "number" ? Math.round(b.speed) : 0}km/h</span>
                           <span>a:{b.acceleration.toFixed(2)}</span>
                           <span>&theta;:{Math.round(b.heading * 180 / Math.PI)}&deg;</span>
                         </div>

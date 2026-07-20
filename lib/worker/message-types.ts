@@ -49,7 +49,7 @@ export interface SerializedEntity {
   vy: number;
   ax: number;
   ay: number;
-  speed: number;
+  speed: number; // km/h (converted from pixel speed in worker)
   heading: number;
   acceleration: number;
   w: number;
