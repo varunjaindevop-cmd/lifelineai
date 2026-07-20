@@ -1,13 +1,13 @@
-// Unified Collision Detection Engine v2
-// 5-signal scoring with calibrated sensitivity for real accident detection.
-// Isolated mode: sensitive. Traffic: conservative. Marketplace: moderate.
+// Unified Collision Detection Engine v3
+// Traffic mode: only actual crashes and bike/vehicle drops. Cars following = normal.
+// Isolated mode: sensitive to any collision. Marketplace: pedestrian-focused.
 
 import { TrackedEntity } from "./kalman-tracker";
 
 export type EnvMode = "isolated" | "traffic" | "marketplace";
 
 export interface AccidentEvidence {
-  type: "collision" | "person_fall" | "bike_off_track";
+  type: "collision" | "person_fall" | "bike_off_track" | "vehicle_fall";
   confidence: number;
   objects: number[];
   details: string;
@@ -34,11 +34,6 @@ function combinedR(a: TrackedEntity, b: TrackedEntity): number {
   return (Math.sqrt(a.w * a.h) + Math.sqrt(b.w * b.h)) / 2;
 }
 
-function isOverlapping(a: TrackedEntity, b: TrackedEntity): boolean {
-  return !(a.bbox[2] < b.bbox[0] || b.bbox[2] < a.bbox[0] ||
-           a.bbox[3] < b.bbox[1] || b.bbox[3] < a.bbox[1]);
-}
-
 function calcIoU(a: TrackedEntity, b: TrackedEntity): number {
   const ix1 = Math.max(a.bbox[0], b.bbox[0]);
   const iy1 = Math.max(a.bbox[1], b.bbox[1]);
@@ -50,11 +45,6 @@ function calcIoU(a: TrackedEntity, b: TrackedEntity): number {
   return inter / (areaA + areaB - inter + 1e-6);
 }
 
-function wasFast(entity: TrackedEntity): boolean {
-  if (entity.speedHistory.length < 2) return false;
-  return entity.speedHistory[0] > 1.0 || entity.speedHistory[1] > 1.0;
-}
-
 function hasDecelerated(entity: TrackedEntity): boolean {
   if (entity.speedHistory.length < 3) return false;
   const recent = entity.speedHistory.slice(0, 2);
@@ -63,6 +53,11 @@ function hasDecelerated(entity: TrackedEntity): boolean {
   const avgRecent = recent.reduce((a, b) => a + b, 0) / recent.length;
   const avgOlder = older.reduce((a, b) => a + b, 0) / older.length;
   return avgOlder > 0.3 && avgRecent < avgOlder * 0.65;
+}
+
+function wasFast(entity: TrackedEntity): boolean {
+  if (entity.speedHistory.length < 2) return false;
+  return entity.speedHistory[0] > 1.0 || entity.speedHistory[1] > 1.0;
 }
 
 function angleDiff(a: number, b: number): number {
@@ -82,124 +77,53 @@ function isPassing(a: TrackedEntity, b: TrackedEntity): boolean {
   return false;
 }
 
-function wasApproaching(a: TrackedEntity, b: TrackedEntity): boolean {
-  if (a.positions.length < 2 || b.positions.length < 2) return false;
-  const recentA = a.positions[a.positions.length - 1];
-  const recentB = b.positions[b.positions.length - 1];
-  const olderA = a.positions[Math.max(0, a.positions.length - 3)];
-  const olderB = b.positions[Math.max(0, b.positions.length - 3)];
-  const d1 = Math.sqrt((recentA.x - recentB.x) ** 2 + (recentA.y - recentB.y) ** 2);
-  const d2 = Math.sqrt((olderA.x - olderB.x) ** 2 + (olderA.y - olderB.y) ** 2);
-  return d2 > d1 + 0.3;
-}
+/**
+ * Detect if a vehicle has suddenly changed aspect ratio (fell over).
+ * A motorcycle/car that was upright and is now wide = fell/rolled.
+ */
+function detectVehicleFall(entity: TrackedEntity): AccidentEvidence | null {
+  if (entity.age < 4) return null;
+  if (entity.aspectHistory.length < 4) return null;
 
-// ========== MODE THRESHOLDS ==========
+  const currentAR = entity.aspectHistory[entity.aspectHistory.length - 1];
+  const prevAR = (entity.aspectHistory[0] + entity.aspectHistory[1]) / 2;
 
-interface ModeConfig {
-  minScore: number;
-  minSignals: number;
-  bothDecelerateRequired: boolean;
-  passingFilterStrict: boolean;
-  cooldownMs: number;
-}
+  // Vehicle was taller than wide (AR < 0.8), now wider than tall (AR > 1.2)
+  const wasUpright = prevAR < 0.8;
+  const nowFallen = currentAR > 1.2;
+  const significantChange = currentAR > prevAR * 1.5;
 
-const MODE_CONFIG: Record<EnvMode, ModeConfig> = {
-  isolated: {
-    minScore: 0.35,
-    minSignals: 2,
-    bothDecelerateRequired: false,
-    passingFilterStrict: false,
-    cooldownMs: 3000,
-  },
-  traffic: {
-    minScore: 0.60,
-    minSignals: 3,
-    bothDecelerateRequired: true,
-    passingFilterStrict: true,
-    cooldownMs: 8000,
-  },
-  marketplace: {
-    minScore: 0.50,
-    minSignals: 3,
-    bothDecelerateRequired: false,
-    passingFilterStrict: true,
-    cooldownMs: 8000,
-  },
-};
+  if ((wasUpright && nowFallen) || significantChange) {
+    const wasMoving = wasFast(entity);
+    const stationary = isStationary(entity);
 
-// ========== SIGNAL SCORING ==========
+    let confidence = 0.6;
+    if (wasMoving && stationary) confidence += 0.15;
+    if (significantChange) confidence += 0.1;
 
-function scoreOverlap(a: TrackedEntity, b: TrackedEntity): EvidenceSignal {
-  const iou = calcIoU(a, b);
-  const value = Math.min(iou * 4, 1.0); // 25% IoU = full score
-  return { name: "overlap", value, weight: 0.30, passed: iou > 0.03 };
-}
+    const signals: EvidenceSignal[] = [
+      { name: "aspect_flip", value: significantChange ? 1 : 0, weight: 0.4, passed: significantChange },
+      { name: "was_moving", value: wasMoving ? 1 : 0, weight: 0.3, passed: wasMoving },
+      { name: "now_stationary", value: stationary ? 1 : 0, weight: 0.3, passed: stationary },
+    ];
 
-function scoreDeceleration(a: TrackedEntity, b: TrackedEntity): EvidenceSignal {
-  const aDecel = hasDecelerated(a) ? 1 : 0;
-  const bDecel = hasDecelerated(b) ? 1 : 0;
-  const value = (aDecel + bDecel) / 2;
-  return { name: "deceleration", value, weight: 0.25, passed: value > 0 };
-}
-
-function scoreProximity(a: TrackedEntity, b: TrackedEntity): EvidenceSignal {
-  const d = dist(a, b);
-  const cr = combinedR(a, b);
-  let value: number;
-  if (d < cr * 0.8) value = 1.0;
-  else if (d < cr * 1.5) value = 0.7;
-  else if (d < cr * 2.5) value = 0.3;
-  else value = 0;
-  return { name: "proximity", value, weight: 0.20, passed: value > 0 };
-}
-
-function scoreTrajectory(a: TrackedEntity, b: TrackedEntity): EvidenceSignal {
-  if (a.positions.length < 2 || b.positions.length < 2) {
-    return { name: "trajectory", value: 0, weight: 0.15, passed: false };
+    return {
+      type: "vehicle_fall",
+      confidence: Math.min(0.9, confidence),
+      objects: [entity.id],
+      details: `${entity.class} AR ${prevAR.toFixed(2)}->${currentAR.toFixed(2)}${wasMoving ? " was_moving" : ""}`,
+      signals,
+      sceneContext: "traffic",
+    };
   }
-  const ka = a.kalman.getState();
-  const kb = b.kalman.getState();
-  let minDist = Infinity;
-  for (let t = 1; t <= 10; t++) {
-    const px_a = ka.x + ka.vx * t;
-    const py_a = ka.y + ka.vy * t;
-    const px_b = kb.x + kb.vx * t;
-    const py_b = kb.y + kb.vy * t;
-    const d = Math.sqrt((px_a - px_b) ** 2 + (py_a - py_b) ** 2);
-    if (d < minDist) minDist = d;
-  }
-  const cr = combinedR(a, b);
-  let value: number;
-  if (minDist < cr * 0.6) value = 1.0;
-  else if (minDist < cr * 1.2) value = 0.7;
-  else if (minDist < cr * 2.5) value = 0.3;
-  else value = 0;
-  return { name: "trajectory", value, weight: 0.15, passed: value > 0.2 };
-}
 
-function scoreEnergyTransfer(a: TrackedEntity, b: TrackedEntity): EvidenceSignal {
-  const MASS: Record<string, number> = { car: 1.5, truck: 3.0, bus: 4.0, motorcycle: 0.3, person: 0.08 };
-  const massA = MASS[a.class] || 1.0;
-  const massB = MASS[b.class] || 1.0;
-  const keA_now = 0.5 * massA * a.speed * a.speed;
-  const keB_now = 0.5 * massB * b.speed * b.speed;
-  const oldSpeedA = a.speedHistory.length > 2 ? a.speedHistory[Math.min(2, a.speedHistory.length - 1)] : a.speed;
-  const oldSpeedB = b.speedHistory.length > 2 ? b.speedHistory[Math.min(2, b.speedHistory.length - 1)] : b.speed;
-  const keA_prev = 0.5 * massA * oldSpeedA * oldSpeedA;
-  const keB_prev = 0.5 * massB * oldSpeedB * oldSpeedB;
-  const lossA = keA_prev - keA_now;
-  const lossB = keB_prev - keB_now;
-  const significantLoss = (lossA > 0.3 && a.speed < oldSpeedA * 0.4) ||
-                          (lossB > 0.3 && b.speed < oldSpeedB * 0.4);
-  const value = significantLoss ? Math.min(1.0, Math.max(lossA, lossB) / 2) : 0;
-  return { name: "energy_transfer", value, weight: 0.10, passed: significantLoss };
+  return null;
 }
 
 // ========== COLLISION DETECTION ==========
 
 function detectVehicleCollision(entities: TrackedEntity[], envMode: EnvMode): AccidentEvidence[] {
   const evidence: AccidentEvidence[] = [];
-  const config = MODE_CONFIG[envMode];
   const candidates = entities.filter(e => e.age >= 2 && ["car", "truck", "bus", "motorcycle"].includes(e.class));
 
   for (let i = 0; i < candidates.length; i++) {
@@ -207,59 +131,122 @@ function detectVehicleCollision(entities: TrackedEntity[], envMode: EnvMode): Ac
       const a = candidates[i];
       const b = candidates[j];
 
-      // Passing filter
-      if (config.passingFilterStrict && isPassing(a, b)) continue;
-      if (!config.passingFilterStrict && isPassing(a, b)) continue;
-
       const d = dist(a, b);
       const cr = combinedR(a, b);
-      if (d > cr * 3.5) continue;
+      const iou = calcIoU(a, b);
 
-      // Calculate all 5 signals
-      const overlap = scoreOverlap(a, b);
-      const deceleration = scoreDeceleration(a, b);
-      const proximity = scoreProximity(a, b);
-      const trajectory = scoreTrajectory(a, b);
-      const energy = scoreEnergyTransfer(a, b);
-      const signals = [overlap, deceleration, proximity, trajectory, energy];
+      if (envMode === "traffic") {
+        // ===== TRAFFIC MODE: ONLY actual crashes =====
+        // Rule 1: Must have REAL overlap (IoU > 0.15) — not just proximity
+        if (iou < 0.15) continue;
 
-      let confidence = signals.reduce((sum, s) => sum + s.value * s.weight, 0);
+        // Rule 2: BOTH must have decelerated
+        if (!hasDecelerated(a) || !hasDecelerated(b)) continue;
 
-      // Traffic mode: both must decelerate
-      if (config.bothDecelerateRequired && !hasDecelerated(a) && !hasDecelerated(b)) {
-        confidence *= 0.3;
-      }
+        // Rule 3: Must be very close (within touching distance)
+        if (d > cr * 1.5) continue;
 
-      // Boost: if overlap is high, boost confidence significantly
-      if (overlap.value > 0.5) confidence = Math.max(confidence, 0.55);
-      if (overlap.value > 0.8) confidence = Math.max(confidence, 0.70);
+        // Rule 4: Passing filter — same direction + fast = not a crash
+        if (isPassing(a, b)) continue;
 
-      // Boost: very close proximity + any movement = suspicious
-      if (proximity.value >= 1.0 && (overlap.value > 0 || trajectory.value > 0)) {
-        confidence = Math.max(confidence, 0.50);
-      }
+        // If we get here, it's a real crash: overlap + both decelerated + close
+        const confidence = Math.min(0.95,
+          0.4 * Math.min(iou * 3, 1) +  // overlap signal
+          0.3 * 1.0 +                      // both decelerated (guaranteed)
+          0.3 * (d < cr * 0.8 ? 1 : 0.5)  // proximity bonus
+        );
 
-      const passedSignals = signals.filter(s => s.passed).length;
-
-      console.log(`[TTC] pair=${a.id},${b.id} score=${confidence.toFixed(3)} signals=${passedSignals}/5 iou=${calcIoU(a,b).toFixed(3)} d=${d.toFixed(0)}px cr=${cr.toFixed(0)}px overlap=${overlap.value.toFixed(2)} decel=${deceleration.value.toFixed(2)} prox=${proximity.value.toFixed(2)} traj=${trajectory.value.toFixed(2)} energy=${energy.value.toFixed(2)}`);
-
-      if (confidence >= config.minScore && passedSignals >= config.minSignals) {
-        const modeMult = envMode === "isolated" ? 1.0 : envMode === "traffic" ? 0.85 : 0.9;
-        confidence = Math.min(0.95, confidence * modeMult);
+        console.log(`[TTC] TRAFFIC CRASH: ${a.class}#${a.id} + ${b.class}#${b.id} iou=${iou.toFixed(3)} d=${d.toFixed(0)}px both_decel=yes`);
 
         evidence.push({
           type: "collision",
           confidence,
           objects: [a.id, b.id],
-          details: `${envMode}: signals=${passedSignals}/5 d=${d.toFixed(0)}px iou=${calcIoU(a,b).toFixed(3)}`,
-          signals,
-          sceneContext: envMode,
+          details: `Traffic crash: iou=${iou.toFixed(3)} d=${d.toFixed(0)}px both decelerated`,
+          signals: [
+            { name: "overlap", value: iou, weight: 0.4, passed: iou > 0.15 },
+            { name: "both_decel", value: 1, weight: 0.3, passed: true },
+            { name: "proximity", value: d < cr * 0.8 ? 1 : 0.5, weight: 0.3, passed: true },
+          ],
+          sceneContext: "traffic",
         });
+      } else {
+        // ===== ISOLATED / MARKETPLACE: 5-signal scoring =====
+        if (isPassing(a, b)) continue;
+        if (d > cr * 3.5) continue;
+
+        const overlap = scoreOverlapSignal(iou);
+        const deceleration = (hasDecelerated(a) ? 0.5 : 0) + (hasDecelerated(b) ? 0.5 : 0);
+        const proximity = d < cr * 0.8 ? 1.0 : d < cr * 1.5 ? 0.7 : d < cr * 2.5 ? 0.3 : 0;
+        const trajectory = scoreTrajectorySignal(a, b);
+        const energy = scoreEnergySignal(a, b);
+
+        let confidence = 0.30 * overlap + 0.25 * deceleration + 0.20 * proximity + 0.15 * trajectory + 0.10 * energy;
+
+        const passedCount = [overlap > 0.03, deceleration > 0, proximity > 0, trajectory > 0.2, energy > 0].filter(Boolean).length;
+
+        const minScore = envMode === "isolated" ? 0.35 : 0.50;
+        const minSignals = envMode === "isolated" ? 2 : 3;
+
+        if (confidence >= minScore && passedCount >= minSignals) {
+          console.log(`[TTC] ${envMode.toUpperCase()} ALERT: ${a.class}#${a.id} + ${b.class}#${b.id} score=${confidence.toFixed(3)} signals=${passedCount}/5`);
+          evidence.push({
+            type: "collision",
+            confidence: Math.min(0.95, confidence),
+            objects: [a.id, b.id],
+            details: `${envMode}: signals=${passedCount}/5 d=${d.toFixed(0)}px iou=${iou.toFixed(3)}`,
+            signals: [
+              { name: "overlap", value: overlap, weight: 0.30, passed: overlap > 0.03 },
+              { name: "deceleration", value: deceleration, weight: 0.25, passed: deceleration > 0 },
+              { name: "proximity", value: proximity, weight: 0.20, passed: proximity > 0 },
+              { name: "trajectory", value: trajectory, weight: 0.15, passed: trajectory > 0.2 },
+              { name: "energy_transfer", value: energy, weight: 0.10, passed: energy > 0 },
+            ],
+            sceneContext: envMode,
+          });
+        }
       }
     }
   }
 
   return evidence;
+}
+
+function scoreOverlapSignal(iou: number): number {
+  return Math.min(iou * 4, 1.0);
+}
+
+function scoreTrajectorySignal(a: TrackedEntity, b: TrackedEntity): number {
+  if (a.positions.length < 2 || b.positions.length < 2) return 0;
+  const ka = a.kalman.getState();
+  const kb = b.kalman.getState();
+  let minDist = Infinity;
+  for (let t = 1; t <= 10; t++) {
+    const d = Math.sqrt(
+      ((ka.x + ka.vx * t) - (kb.x + kb.vx * t)) ** 2 +
+      ((ka.y + ka.vy * t) - (kb.y + kb.vy * t)) ** 2
+    );
+    if (d < minDist) minDist = d;
+  }
+  const cr = combinedR(a, b);
+  if (minDist < cr * 0.6) return 1.0;
+  if (minDist < cr * 1.2) return 0.7;
+  if (minDist < cr * 2.5) return 0.3;
+  return 0;
+}
+
+function scoreEnergySignal(a: TrackedEntity, b: TrackedEntity): number {
+  const MASS: Record<string, number> = { car: 1.5, truck: 3.0, bus: 4.0, motorcycle: 0.3, person: 0.08 };
+  const massA = MASS[a.class] || 1.0;
+  const massB = MASS[b.class] || 1.0;
+  const oldA = a.speedHistory.length > 2 ? a.speedHistory[Math.min(2, a.speedHistory.length - 1)] : a.speed;
+  const oldB = b.speedHistory.length > 2 ? b.speedHistory[Math.min(2, b.speedHistory.length - 1)] : b.speed;
+  const lossA = 0.5 * massA * oldA * oldA - 0.5 * massA * a.speed * a.speed;
+  const lossB = 0.5 * massB * oldB * oldB - 0.5 * massB * b.speed * b.speed;
+  const sigA = lossA > 0.3 && a.speed < oldA * 0.4;
+  const sigB = lossB > 0.3 && b.speed < oldB * 0.4;
+  if (!sigA && !sigB) return 0;
+  return Math.min(1.0, Math.max(lossA, lossB) / 2);
 }
 
 // ========== PERSON FALL ==========
@@ -288,19 +275,17 @@ function detectPersonFall(entities: TrackedEntity[]): AccidentEvidence[] {
       if (dropped) confidence += 0.1;
       if (wasMoving && stationary) confidence += 0.1;
 
-      const signals: EvidenceSignal[] = [
-        { name: "aspect_ratio", value: currentAR, weight: 0.4, passed: nowLying },
-        { name: "position_drop", value: dropped ? 1 : 0, weight: 0.3, passed: dropped },
-        { name: "was_moving", value: wasMoving ? 1 : 0, weight: 0.2, passed: wasMoving && stationary },
-        { name: "sustained", value: entity.confirmedFrames >= 2 ? 1 : 0, weight: 0.1, passed: entity.confirmedFrames >= 2 },
-      ];
-
       evidence.push({
         type: "person_fall",
         confidence: Math.min(0.9, confidence),
         objects: [entity.id],
         details: `Fall: AR ${prevAR.toFixed(2)}->${currentAR.toFixed(2)}`,
-        signals,
+        signals: [
+          { name: "aspect_ratio", value: currentAR, weight: 0.4, passed: nowLying },
+          { name: "position_drop", value: dropped ? 1 : 0, weight: 0.3, passed: dropped },
+          { name: "was_moving", value: wasMoving ? 1 : 0, weight: 0.2, passed: wasMoving && stationary },
+          { name: "sustained", value: entity.confirmedFrames >= 2 ? 1 : 0, weight: 0.1, passed: entity.confirmedFrames >= 2 },
+        ],
         sceneContext: "isolated",
       });
     }
@@ -308,11 +293,22 @@ function detectPersonFall(entities: TrackedEntity[]): AccidentEvidence[] {
   return evidence;
 }
 
-// ========== BIKE OFF-TRACK ==========
+// ========== BIKE OFF-TRACK / VEHICLE FALL ==========
 
-function detectBikeOffTrack(entities: TrackedEntity[]): AccidentEvidence[] {
+function detectBikeOffTrack(entities: TrackedEntity[], envMode: EnvMode): AccidentEvidence[] {
   const evidence: AccidentEvidence[] = [];
   for (const entity of entities) {
+    // Check for vehicle fall (bike/motorcycle sudden drop)
+    if (entity.class === "motorcycle" || entity.class === "car") {
+      const fall = detectVehicleFall(entity);
+      if (fall) {
+        fall.sceneContext = envMode;
+        evidence.push(fall);
+        continue;
+      }
+    }
+
+    // Bike heading change
     if (entity.class !== "motorcycle" || entity.age < 3) continue;
     if (entity.headingHistory.length < 3) continue;
 
@@ -325,17 +321,16 @@ function detectBikeOffTrack(entities: TrackedEntity[]): AccidentEvidence[] {
     const significantChange = headingChange > Math.PI * 0.3;
 
     if (wasMoving && significantChange) {
-      const signals: EvidenceSignal[] = [
-        { name: "heading_change", value: headingChange / Math.PI, weight: 0.5, passed: significantChange },
-        { name: "was_fast", value: 1, weight: 0.5, passed: wasMoving },
-      ];
       evidence.push({
         type: "bike_off_track",
         confidence: 0.7,
         objects: [entity.id],
         details: `Bike heading ${(headingChange * 180 / Math.PI).toFixed(0)} deg`,
-        signals,
-        sceneContext: "isolated",
+        signals: [
+          { name: "heading_change", value: headingChange / Math.PI, weight: 0.5, passed: significantChange },
+          { name: "was_fast", value: 1, weight: 0.5, passed: wasMoving },
+        ],
+        sceneContext: envMode,
       });
     }
   }
@@ -348,7 +343,7 @@ export function detectAccidents(entities: TrackedEntity[], envMode: EnvMode): Ac
   let evidence: AccidentEvidence[] = [];
   evidence.push(...detectVehicleCollision(entities, envMode));
   evidence.push(...detectPersonFall(entities));
-  evidence.push(...detectBikeOffTrack(entities));
+  evidence.push(...detectBikeOffTrack(entities, envMode));
 
   // Deduplicate
   const deduped: AccidentEvidence[] = [];
@@ -363,14 +358,20 @@ export function detectAccidents(entities: TrackedEntity[], envMode: EnvMode): Ac
   }
 
   if (deduped.length > 0) {
-    console.log(`[TTC] ACCIDENT DETECTED: ${deduped.length} evidence items, top confidence=${deduped[0].confidence.toFixed(3)}`);
+    console.log(`[TTC] ALERT: ${deduped.length} items, top=${deduped[0].type} conf=${deduped[0].confidence.toFixed(3)}`);
   }
 
   return deduped;
 }
 
-export function getModeConfig(mode: EnvMode): ModeConfig {
+export function getModeConfig(mode: EnvMode) {
   return MODE_CONFIG[mode];
 }
 
-export { isPassing, hasDecelerated, wasApproaching, dist, combinedR, calcIoU };
+const MODE_CONFIG: Record<EnvMode, { minScore: number; minSignals: number; cooldownMs: number }> = {
+  isolated: { minScore: 0.35, minSignals: 2, cooldownMs: 3000 },
+  traffic: { minScore: 0.55, minSignals: 2, cooldownMs: 8000 },
+  marketplace: { minScore: 0.50, minSignals: 3, cooldownMs: 8000 },
+};
+
+export { isPassing, hasDecelerated, dist, combinedR, calcIoU };

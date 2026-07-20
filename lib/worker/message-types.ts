@@ -63,7 +63,7 @@ export interface SerializedEntity {
 }
 
 export interface SerializedEvidence {
-  type: "collision" | "person_fall" | "bike_off_track";
+  type: "collision" | "person_fall" | "bike_off_track" | "vehicle_fall";
   confidence: number;
   objects: number[];
   details: string;
