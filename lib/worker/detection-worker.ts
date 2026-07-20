@@ -190,9 +190,8 @@ self.onmessage = async (e: MessageEvent) => {
 
       // Speed in km/h — use raw detection positions for accuracy
       for (const entity of freshEntities) {
-        // Use raw positions for speed (stored when matched to detection)
-        const lastRaw = { x: entity.rawX, y: entity.rawY };
         if (entity.positions.length >= 2) {
+          const lastRaw = { x: entity.rawX, y: entity.rawY };
           const prevPos = entity.positions[entity.positions.length - 2];
           const pixelDist = Math.sqrt((lastRaw.x - prevPos.x) ** 2 + (lastRaw.y - prevPos.y) ** 2);
           (entity as any).speedKmh = Math.round((pixelDist / pixelsPerMeter) * 3 * 3.6);
@@ -203,7 +202,7 @@ self.onmessage = async (e: MessageEvent) => {
         frame: frameNumber, timestamp: Date.now(),
         entities: freshEntities.map(e => ({
           id: e.id, class: e.class,
-          x: e.kalman.getState().x, y: e.kalman.getState().y,
+          x: e.rawX, y: e.rawY,
           speed: e.speed, heading: e.heading,
         })),
       });

@@ -16,7 +16,6 @@ interface Entity {
   age: number;
   confirmedFrames: number;
   positions?: { x: number; y: number }[];
-  isStale?: boolean;
 }
 
 interface Evidence {
@@ -46,11 +45,11 @@ const CLASS_COLORS: Record<string, string> = {
   fallen_person: "#ef4444",
 };
 
-function getSeverityColor(confidence: number): string {
-  if (confidence > 0.85) return "#ef4444"; // critical - red
-  if (confidence > 0.65) return "#f97316"; // major - orange
-  if (confidence > 0.45) return "#eab308"; // minor - yellow
-  return "#6b7280"; // suspicious - gray
+function severityColor(confidence: number): string {
+  if (confidence > 0.85) return "#ef4444";
+  if (confidence > 0.65) return "#f97316";
+  if (confidence > 0.45) return "#eab308";
+  return "#6b7280";
 }
 
 export default function DetectionOverlay({
@@ -61,14 +60,14 @@ export default function DetectionOverlay({
   fps = 0,
 }: DetectionOverlayProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const entitiesRef = useRef<Entity[]>([]);
-  const evidenceRef = useRef<Evidence[]>([]);
+  // Bypass React render cycle: store latest data in refs, read every frame
+  const dataRef = useRef({ entities, evidence });
   const rafRef = useRef(0);
 
-  entitiesRef.current = entities;
-  evidenceRef.current = evidence;
+  // Update ref synchronously on every props change — no render delay
+  dataRef.current = { entities, evidence };
 
-  const drawFrame = useCallback(() => {
+  const draw = useCallback(() => {
     const canvas = canvasRef.current;
     const video = videoRef.current;
     if (!canvas || !video) return;
@@ -76,84 +75,74 @@ export default function DetectionOverlay({
     if (!ctx) return;
 
     const rect = video.getBoundingClientRect();
-    const displayW = Math.round(rect.width);
-    const displayH = Math.round(rect.height);
-    if (canvas.width !== displayW || canvas.height !== displayH) {
-      canvas.width = displayW;
-      canvas.height = displayH;
+    const dw = Math.round(rect.width);
+    const dh = Math.round(rect.height);
+    if (canvas.width !== dw || canvas.height !== dh) {
+      canvas.width = dw;
+      canvas.height = dh;
     }
 
-    const currentEntities = entitiesRef.current;
-    const currentEvidence = evidenceRef.current;
+    const vw = video.videoWidth || 640;
+    const vh = video.videoHeight || 480;
+    const sx = dw / vw;
+    const sy = dh / vh;
 
-    ctx.clearRect(0, 0, displayW, displayH);
+    const { entities: ents, evidence: evs } = dataRef.current;
 
-    const videoW = video.videoWidth || 640;
-    const videoH = video.videoHeight || 480;
-    const scaleX = displayW / videoW;
-    const scaleY = displayH / videoH;
+    ctx.clearRect(0, 0, dw, dh);
 
-    // Draw evidence alerts (red overlay on involved entities)
-    for (const ev of currentEvidence) {
-      for (const objId of ev.objects) {
-        const entity = currentEntities.find(e => e.id === objId);
-        if (!entity || entity.age < 0) continue;
-
-        const bx = (entity.x - entity.w / 2) * scaleX;
-        const by = (entity.y - entity.h / 2) * scaleY;
-        const bw = entity.w * scaleX;
-        const bh = entity.h * scaleY;
-
-        // Pulsing red border for alert
-        const severityColor = getSeverityColor(ev.confidence);
-        ctx.strokeStyle = severityColor;
+    // Evidence alert overlays
+    for (const ev of evs) {
+      for (const oid of ev.objects) {
+        const ent = ents.find(e => e.id === oid);
+        if (!ent || ent.age < 1) continue;
+        const bx = (ent.x - ent.w / 2) * sx;
+        const by = (ent.y - ent.h / 2) * sy;
+        const bw = ent.w * sx;
+        const bh = ent.h * sy;
+        const sc = severityColor(ev.confidence);
+        ctx.strokeStyle = sc;
         ctx.lineWidth = 3;
         ctx.setLineDash([5, 3]);
         ctx.strokeRect(bx - 2, by - 2, bw + 4, bh + 4);
         ctx.setLineDash([]);
-
-        // Confidence badge
-        const confText = `${(ev.confidence * 100).toFixed(0)}%`;
-        ctx.font = `bold ${Math.max(10, 10 * scaleX)}px monospace`;
-        const tw = ctx.measureText(confText).width;
-        ctx.fillStyle = severityColor;
+        const ct = `${(ev.confidence * 100).toFixed(0)}%`;
+        ctx.font = `bold ${Math.max(10, 10 * sx)}px monospace`;
+        const tw = ctx.measureText(ct).width;
+        ctx.fillStyle = sc;
         ctx.fillRect(bx + bw - tw - 8, by - 18, tw + 8, 16);
         ctx.fillStyle = "#fff";
-        ctx.fillText(confText, bx + bw - tw - 4, by - 5);
+        ctx.fillText(ct, bx + bw - tw - 4, by - 5);
       }
     }
 
-    // Draw entity bounding boxes — ALL detected objects, stale ones get faded
-    for (const entity of currentEntities) {
-      if (entity.age < 0) continue;
+    // Entity ESP boxes — drawn at raw detection position (no Kalman lag)
+    for (const ent of ents) {
+      if (ent.age < 1) continue;
+      const involved = evs.some(e => e.objects.includes(ent.id));
+      const base = CLASS_COLORS[ent.class] || "#22c55e";
+      const col = involved ? severityColor(evs.find(e => e.objects.includes(ent.id))?.confidence || 0) : base;
 
-      const isStale = entity.isStale;
-      const isInvolved = currentEvidence.some(e => e.objects.includes(entity.id));
-      const baseColor = CLASS_COLORS[entity.class] || "#22c55e";
-      const color = isInvolved ? getSeverityColor(currentEvidence.find(e => e.objects.includes(entity.id))?.confidence || 0) : baseColor;
+      const bx = (ent.x - ent.w / 2) * sx;
+      const by = (ent.y - ent.h / 2) * sy;
+      const bw = ent.w * sx;
+      const bh = ent.h * sy;
 
-      const bx = (entity.x - entity.w / 2) * scaleX;
-      const by = (entity.y - entity.h / 2) * scaleY;
-      const bw = entity.w * scaleX;
-      const bh = entity.h * scaleY;
-
-      // Bounding box — faded for stale entities
-      ctx.globalAlpha = isStale ? 0.5 : 1.0;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = isStale ? 1 : (isInvolved ? 3 : 2);
+      // Main box
+      ctx.strokeStyle = col;
+      ctx.lineWidth = involved ? 3 : 2;
       ctx.strokeRect(bx, by, bw, bh);
 
-      // Corner markers
+      // Corner brackets
       const cl = Math.min(8, bw * 0.15, bh * 0.15);
       ctx.lineWidth = 3;
-      ctx.strokeStyle = color;
-      const corners: [number, number, number, number, number, number][] = [
-        [bx, by + cl, bx, by, bx + cl, by],
-        [bx + bw - cl, by, bx + bw, by, bx + bw, by + cl],
-        [bx, by + bh - cl, bx, by + bh, bx + cl, by + bh],
-        [bx + bw - cl, by + bh, bx + bw, by + bh, bx + bw, by + bh - cl],
-      ];
-      for (const [x1, y1, x2, y2, x3, y3] of corners) {
+      ctx.strokeStyle = col;
+      for (const [x1, y1, x2, y2, x3, y3] of [
+        [bx, by + cl, bx, by, bx + cl, by] as const,
+        [bx + bw - cl, by, bx + bw, by, bx + bw, by + cl] as const,
+        [bx, by + bh - cl, bx, by + bh, bx + cl, by + bh] as const,
+        [bx + bw - cl, by + bh, bx + bw, by + bh, bx + bw, by + bh - cl] as const,
+      ]) {
         ctx.beginPath();
         ctx.moveTo(x1, y1);
         ctx.lineTo(x2, y2);
@@ -161,65 +150,81 @@ export default function DetectionOverlay({
         ctx.stroke();
       }
 
-      // Track path trail
-      if (entity.positions && entity.positions.length > 1) {
+      // Heading arrow
+      if (ent.speed > 0.3) {
+        const arrowLen = Math.min(30, bw * 0.6);
+        const ax = bx + bw / 2;
+        const ay = by + bh / 2;
+        const ex = ax + Math.cos(ent.heading) * arrowLen;
+        const ey = ay + Math.sin(ent.heading) * arrowLen;
         ctx.beginPath();
-        ctx.strokeStyle = `${color}66`;
+        ctx.strokeStyle = "#facc15";
+        ctx.lineWidth = 2;
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+        // Arrowhead
+        const aSize = 5;
+        const aAngle = Math.atan2(ey - ay, ex - ax);
+        ctx.beginPath();
+        ctx.moveTo(ex, ey);
+        ctx.lineTo(ex - aSize * Math.cos(aAngle - 0.5), ey - aSize * Math.sin(aAngle - 0.5));
+        ctx.moveTo(ex, ey);
+        ctx.lineTo(ex - aSize * Math.cos(aAngle + 0.5), ey - aSize * Math.sin(aAngle + 0.5));
+        ctx.stroke();
+      }
+
+      // Track trail
+      if (ent.positions && ent.positions.length > 1) {
+        ctx.beginPath();
+        ctx.strokeStyle = `${col}66`;
         ctx.lineWidth = 1;
-        const trail = entity.positions.slice(-5);
+        const trail = ent.positions.slice(-5);
         trail.forEach((p, i) => {
-          if (i === 0) ctx.moveTo(p.x * scaleX, p.y * scaleY);
-          else ctx.lineTo(p.x * scaleX, p.y * scaleY);
+          if (i === 0) ctx.moveTo(p.x * sx, p.y * sy);
+          else ctx.lineTo(p.x * sx, p.y * sy);
         });
         ctx.stroke();
       }
 
-      // Class label + confidence above box
-      const label = `${entity.class} ${(entity.confidence * 100).toFixed(0)}%`;
-      ctx.font = `bold ${Math.max(10, 10 * scaleX)}px monospace`;
+      // Label: class + speed
+      const speedKmh = ent.speed;
+      const label = `${ent.class} ${speedKmh.toFixed(0)}km/h`;
+      ctx.font = `bold ${Math.max(10, 10 * sx)}px monospace`;
       const tw = ctx.measureText(label).width;
-      ctx.fillStyle = "rgba(0,0,0,0.8)";
+      ctx.fillStyle = "rgba(0,0,0,0.85)";
       ctx.fillRect(bx, by - 20, tw + 8, 18);
-      ctx.fillStyle = isInvolved ? getSeverityColor(0.7) : "#22c55e";
+      ctx.fillStyle = "#22c55e";
       ctx.fillText(label, bx + 4, by - 6);
 
-      // Track ID
-      const idLabel = `#${entity.id}`;
-      ctx.fillStyle = "rgba(0,0,0,0.8)";
-      ctx.fillRect(bx + tw + 12, by - 20, ctx.measureText(idLabel).width + 8, 18);
+      // ID tag
+      const idT = `#${ent.id}`;
+      ctx.fillStyle = "rgba(0,0,0,0.85)";
+      ctx.fillRect(bx + tw + 12, by - 20, ctx.measureText(idT).width + 8, 18);
       ctx.fillStyle = "#facc15";
-      ctx.fillText(idLabel, bx + tw + 16, by - 6);
-
-      ctx.globalAlpha = 1.0; // reset for next entity
+      ctx.fillText(idT, bx + tw + 16, by - 6);
     }
 
-    // Bottom status bar
-    const barH = 22;
-    const barY = displayH - barH;
+    // Status bar
     ctx.fillStyle = "rgba(0,0,0,0.75)";
-    ctx.fillRect(0, barY, displayW, barH);
+    ctx.fillRect(0, dh - 22, dw, 22);
     ctx.fillStyle = "#fff";
-    ctx.font = `${Math.max(11, 11 * scaleX)}px Arial`;
+    ctx.font = `${Math.max(11, 11 * sx)}px Arial`;
     ctx.fillText(
-      `Objects: ${currentEntities.filter(e => e.age >= 0).length} | Alerts: ${currentEvidence.length} | FPS: ${fps}`,
-      8,
-      barY + 15
+      `Objects: ${ents.filter(e => e.age >= 1).length} | Alerts: ${evs.length} | FPS: ${fps}`,
+      8, dh - 7
     );
   }, [videoRef, fps]);
 
   useEffect(() => {
     if (!isAnalyzing) return;
-    let lastDraw = 0;
-    const draw = (timestamp: number) => {
-      if (timestamp - lastDraw > 66) {
-        lastDraw = timestamp;
-        drawFrame();
-      }
-      rafRef.current = requestAnimationFrame(draw);
+    const loop = () => {
+      draw();
+      rafRef.current = requestAnimationFrame(loop);
     };
-    rafRef.current = requestAnimationFrame(draw);
+    rafRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [isAnalyzing, drawFrame]);
+  }, [isAnalyzing, draw]);
 
   return (
     <canvas

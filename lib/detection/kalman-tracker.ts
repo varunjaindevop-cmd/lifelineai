@@ -163,7 +163,7 @@ export class MultiObjectTracker {
         const ky = entity.kalman.getState().y;
         entity.bbox = [kx - det.w / 2, ky - det.h / 2, kx + det.w / 2, ky + det.h / 2];
 
-        entity.positions.push({ x: kx, y: ky });
+        entity.positions.push({ x: det.cx, y: det.cy });
         if (entity.positions.length > 30) entity.positions.shift();
 
         entity.speed = entity.kalman.getSpeed();
